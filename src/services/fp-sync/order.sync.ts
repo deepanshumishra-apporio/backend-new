@@ -1,0 +1,337 @@
+// Mirror FP order and plan objects into our tables.
+//
+// Every function here upserts on `fpId`, so the same payload can arrive twice —
+// once from the API response that created it, once from the webhook that
+// announced it — and produce one row. That is the whole point: order events
+// arrive out of band and more than once, and the mirror has to converge.
+//
+// These take an already-resolved local investment account id rather than
+// looking it up, so the caller controls the transaction boundary.
+import { db } from "../../db/client.ts";
+import {
+  MfOrderState,
+  MfPurchaseType,
+  OrderGateway,
+  OrderInitiatedBy,
+  OrderInitiatedVia,
+  PlanFrequency,
+  PlanPaymentMethod,
+  PlanPurpose,
+  PlanState,
+  RedemptionMode,
+} from "../../../generated/prisma/enums.ts";
+import {
+  fpAmount,
+  fpDate,
+  fpDateTime,
+  fpEnum,
+  fpEnumOr,
+  fpInt,
+  fpNav,
+  fpText,
+  fpUnits,
+} from "../../utils/fp-mapping.ts";
+import type {
+  FpPayoutDetail,
+  FpPurchase,
+  FpPurchasePlan,
+  FpRedemption,
+  FpRedemptionPlan,
+  FpSwitch,
+  FpSwitchPlan,
+} from "../../integrations/fp/fp.types.ts";
+
+/** FP sent a value our enums do not model yet. Loud, but never fatal. */
+function unknownValue(field: string) {
+  return (value: string) => console.warn(`[fp-sync] unmapped ${field}: "${value}"`);
+}
+
+/** Attribution and lifecycle columns shared by all three order types. */
+function orderCommon(order: FpPurchase | FpRedemption | FpSwitch) {
+  return {
+    fpOldId: fpInt(order.old_id),
+    state: fpEnumOr(MfOrderState, order.state, MfOrderState.PENDING, unknownValue("order state")),
+    gateway: fpEnumOr(OrderGateway, order.gateway, OrderGateway.CYBRILLAPOA, unknownValue("gateway")),
+    folioNumber: fpText(order.folio_number, 30),
+    sourceRefId: fpText(order.source_ref_id, 64),
+    userIp: fpText(order.user_ip, 45),
+    serverIp: fpText(order.server_ip, 45),
+    euin: fpText(order.euin, 10),
+    initiatedBy: fpEnum(OrderInitiatedBy, order.initiated_by, unknownValue("initiated_by")),
+    initiatedVia: fpEnum(OrderInitiatedVia, order.initiated_via, unknownValue("initiated_via")),
+    failureCode: fpText(order.failure_code, 60),
+    scheduledOn: fpDate(order.scheduled_on),
+    tradedOn: fpDate(order.traded_on),
+    fpCreatedAt: fpDateTime(order.created_at),
+    confirmedAt: fpDateTime(order.confirmed_at),
+    submittedAt: fpDateTime(order.submitted_at),
+    succeededAt: fpDateTime(order.succeeded_at),
+    failedAt: fpDateTime(order.failed_at),
+    reversedAt: fpDateTime(order.reversed_at),
+    cancelledAt: fpDateTime(order.cancelled_at),
+    syncedAt: new Date(),
+  };
+}
+
+/** Resolve the local folio row for an order, if that folio has been mirrored. */
+async function resolveFolioId(
+  mfInvestmentAccountId: string,
+  folioNumber: string | null,
+): Promise<string | null> {
+  if (!folioNumber) return null;
+  const folio = await db.mfFolio.findUnique({
+    where: { mfInvestmentAccountId_number: { mfInvestmentAccountId, number: folioNumber } },
+    select: { id: true },
+  });
+  return folio?.id ?? null;
+}
+
+export async function syncPurchase(
+  order: FpPurchase,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const common = orderCommon(order);
+  const mfFolioId = await resolveFolioId(mfInvestmentAccountId, common.folioNumber);
+
+  const data = {
+    ...common,
+    mfInvestmentAccountId,
+    schemeIsin: order.scheme,
+    mfFolioId,
+    type: fpEnum(MfPurchaseType, order.type, unknownValue("purchase type")),
+    amount: fpAmount(order.amount) ?? "0.00",
+    // Null until the AMC allots. Never synthesise these.
+    allottedUnits: fpUnits(order.allotted_units),
+    purchasedAmount: fpAmount(order.purchased_amount),
+    purchasedPrice: fpNav(order.purchased_price),
+    allottedNavDate: fpDate(order.allotted_nav_date),
+    retriedAt: fpDateTime(order.retried_at),
+  };
+
+  return db.mfPurchase.upsert({
+    where: { fpId: order.id },
+    update: data,
+    create: { fpId: order.id, ...data },
+    select: { id: true },
+  });
+}
+
+export async function syncRedemption(
+  order: FpRedemption,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const common = orderCommon(order);
+  const mfFolioId = await resolveFolioId(mfInvestmentAccountId, common.folioNumber);
+
+  const data = {
+    ...common,
+    mfInvestmentAccountId,
+    schemeIsin: order.scheme,
+    mfFolioId,
+    redemptionMode: fpEnumOr(
+      RedemptionMode,
+      order.redemption_mode,
+      RedemptionMode.NORMAL,
+      unknownValue("redemption_mode"),
+    ),
+    // Both null is meaningful: redeem the entire holding.
+    amount: fpAmount(order.amount),
+    units: fpUnits(order.units),
+    redeemedAmount: fpAmount(order.redeemed_amount),
+    redeemedUnits: fpUnits(order.redeemed_units),
+    redeemedPrice: fpNav(order.redeemed_price),
+    redeemedNavDate: fpDate(order.redeemed_nav_date),
+    redemptionBankAccountNumber: fpText(order.redemption_bank_account_number, 20),
+    redemptionBankAccountIfsc: fpText(order.redemption_bank_account_ifsc_code, 11),
+  };
+
+  return db.mfRedemption.upsert({
+    where: { fpId: order.id },
+    update: data,
+    create: { fpId: order.id, ...data },
+    select: { id: true },
+  });
+}
+
+export async function syncSwitch(
+  order: FpSwitch,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const common = orderCommon(order);
+  const mfFolioId = await resolveFolioId(mfInvestmentAccountId, common.folioNumber);
+
+  const data = {
+    ...common,
+    mfInvestmentAccountId,
+    mfFolioId,
+    switchOutSchemeIsin: order.switch_out_scheme,
+    switchInSchemeIsin: order.switch_in_scheme,
+    amount: fpAmount(order.amount),
+    units: fpUnits(order.units),
+    switchedOutUnits: fpUnits(order.switched_out_units),
+    switchedOutAmount: fpAmount(order.switched_out_amount),
+    switchedOutPrice: fpNav(order.switched_out_price),
+    switchedInUnits: fpUnits(order.switched_in_units),
+    switchedInAmount: fpAmount(order.switched_in_amount),
+    switchedInPrice: fpNav(order.switched_in_price),
+  };
+
+  return db.mfSwitch.upsert({
+    where: { fpId: order.id },
+    update: data,
+    create: { fpId: order.id, ...data },
+    select: { id: true },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Plans
+// ---------------------------------------------------------------------------
+
+function planCommon(plan: FpPurchasePlan | FpRedemptionPlan | FpSwitchPlan) {
+  return {
+    fpOldId: fpInt(plan.old_id),
+    state: fpEnumOr(PlanState, plan.state, PlanState.CREATED, unknownValue("plan state")),
+    gateway: fpEnumOr(OrderGateway, plan.gateway, OrderGateway.CYBRILLAPOA, unknownValue("gateway")),
+    folioNumber: fpText(plan.folio_number, 30),
+    systematic: plan.systematic,
+    frequency: fpEnumOr(
+      PlanFrequency,
+      plan.frequency,
+      PlanFrequency.MONTHLY,
+      unknownValue("plan frequency"),
+    ),
+    installmentDay: fpInt(plan.installment_day),
+    numberOfInstallments: fpInt(plan.number_of_installments) ?? 0,
+    remainingInstallments: fpInt(plan.remaining_installments),
+    autoGenerateInstallments: plan.auto_generate_installments ?? true,
+    requestedActivationDate: fpDate(plan.requested_activation_date),
+    startDate: fpDate(plan.start_date),
+    endDate: fpDate(plan.end_date),
+    nextInstallmentDate: fpDate(plan.next_installment_date),
+    previousInstallmentDate: fpDate(plan.previous_installment_date),
+    sourceRefId: fpText(plan.source_ref_id, 64),
+    userIp: fpText(plan.user_ip, 45),
+    serverIp: fpText(plan.server_ip, 45),
+    euin: fpText(plan.euin, 10),
+    initiatedBy: fpEnum(OrderInitiatedBy, plan.initiated_by, unknownValue("initiated_by")),
+    initiatedVia: fpEnum(OrderInitiatedVia, plan.initiated_via, unknownValue("initiated_via")),
+    consentEmail: fpText(plan.consent?.email, 255),
+    consentIsdCode: fpText(plan.consent?.isd_code, 4),
+    consentMobile: fpText(plan.consent?.mobile, 20),
+    autoCancelled: plan.auto_cancelled ?? null,
+    cancellationCode: fpText(plan.cancellation_code, 60),
+    cancellationScheduledOn: fpDate(plan.cancellation_scheduled_on),
+    reason: fpText(plan.reason, 500),
+    fpCreatedAt: fpDateTime(plan.created_at),
+    activatedAt: fpDateTime(plan.activated_at),
+    cancelledAt: fpDateTime(plan.cancelled_at),
+    failedAt: fpDateTime(plan.failed_at),
+    completedAt: fpDateTime(plan.completed_at),
+    syncedAt: new Date(),
+  };
+}
+
+export async function syncPurchasePlan(
+  plan: FpPurchasePlan,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  // `payment_source` is the mandate's numeric id as a string; resolve it to our
+  // row so the plan links to a real mandate rather than a loose reference.
+  const mandateFpId = fpInt(plan.payment_source);
+  const mandate =
+    mandateFpId === null
+      ? null
+      : await db.mandate.findUnique({ where: { fpId: mandateFpId }, select: { id: true } });
+
+  const data = {
+    ...planCommon(plan),
+    mfInvestmentAccountId,
+    schemeIsin: plan.scheme,
+    amount: fpAmount(plan.amount) ?? "0.00",
+    paymentMethod: fpEnum(PlanPaymentMethod, plan.payment_method, unknownValue("payment_method")),
+    paymentSourceRef: fpText(plan.payment_source, 64),
+    mandateId: mandate?.id ?? null,
+    purpose: fpEnum(PlanPurpose, plan.purpose, unknownValue("plan purpose")),
+  };
+
+  return db.mfPurchasePlan.upsert({
+    where: { fpId: plan.id },
+    update: data,
+    create: { fpId: plan.id, ...data },
+    select: { id: true },
+  });
+}
+
+export async function syncRedemptionPlan(
+  plan: FpRedemptionPlan,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const data = {
+    ...planCommon(plan),
+    mfInvestmentAccountId,
+    schemeIsin: plan.scheme,
+    amount: fpAmount(plan.amount),
+    units: fpUnits(plan.units),
+  };
+
+  return db.mfRedemptionPlan.upsert({
+    where: { fpId: plan.id },
+    update: data,
+    create: { fpId: plan.id, ...data },
+    select: { id: true },
+  });
+}
+
+export async function syncSwitchPlan(
+  plan: FpSwitchPlan,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const data = {
+    ...planCommon(plan),
+    mfInvestmentAccountId,
+    switchOutSchemeIsin: plan.switch_out_scheme,
+    switchInSchemeIsin: plan.switch_in_scheme,
+    amount: fpAmount(plan.amount),
+    units: fpUnits(plan.units),
+  };
+
+  return db.mfSwitchPlan.upsert({
+    where: { fpId: plan.id },
+    update: data,
+    create: { fpId: plan.id, ...data },
+    select: { id: true },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Payout
+// ---------------------------------------------------------------------------
+//
+// Settlement details are not mirrored: they report money collected outside FP,
+// which only happens on the RTA route. ONDC always collects through FP's own
+// Payments API.
+// ---------------------------------------------------------------------------
+
+export async function syncPayoutDetail(
+  payout: FpPayoutDetail,
+  mfRedemptionId: string,
+): Promise<{ id: string }> {
+  const data = {
+    mfRedemptionId,
+    amount: fpAmount(payout.amount),
+    utrNumber: fpText(payout.utr_number, 60),
+    bankAccountNumberMasked: fpText(payout.beneficiary_bank_account_number, 40),
+    bankIfsc: fpText(payout.beneficiary_bank_ifsc, 11),
+    bankName: fpText(payout.beneficiary_bank_account_title, 150),
+    paidAt: fpDateTime(payout.payout_processed_at),
+    syncedAt: new Date(),
+  };
+
+  return db.mfPayoutDetail.upsert({
+    where: { mfRedemptionId },
+    update: { fpId: payout.id, ...data },
+    create: { fpId: payout.id, ...data },
+    select: { id: true },
+  });
+}

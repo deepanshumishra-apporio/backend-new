@@ -1,0 +1,45 @@
+{
+  "name": "backend",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "//test": "test:unit is offline and fast; test:schema needs pglite; test:e2e talks to the live FP sandbox. `test` runs the two that need no network.",
+    "test": "bun run test:unit && bun run test:schema",
+    "test:unit": "bun test tests/unit.test.ts",
+    "test:schema": "node --test --test-isolation=none tests/investor-schema.test.mjs",
+    "//e2e": "Live end-to-end run against the FP ONDC sandbox and the configured database. Creates real objects; never point it at production.",
+    "test:e2e": "bun run tests/e2e-ondc.ts",
+    "dev": "bun run index.ts",
+    "//prisma": "Every Prisma command runs through `bunx --bun` so the CLI uses the Bun runtime (and loads .env) instead of falling back to Node.",
+    "db:generate": "bunx --bun prisma generate",
+    "db:validate": "bunx --bun prisma validate",
+    "db:format": "bunx --bun prisma format",
+    "db:studio": "bunx --bun prisma studio",
+    "//migrate": "migrate:dev creates migrations locally. Deploys run migrate:deploy only — never migrate:dev.",
+    "db:migrate": "bunx --bun prisma migrate dev",
+    "db:migrate:deploy": "bunx --bun prisma migrate deploy",
+    "db:migrate:status": "bunx --bun prisma migrate status",
+    "db:seed": "bunx --bun prisma db seed",
+    "//seed-refresh": "Re-captures the FP sandbox scheme catalogue that the seed loads. Needs FP_* credentials and network access; the seed itself needs neither.",
+    "db:seed:refresh": "bun run prisma/seed-data/refresh.ts",
+    "//docs": "Regenerates SCHEMA.md from prisma/schema.prisma. Run after any schema change.",
+    "docs:schema": "bun run scripts/docs-schema.ts"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.4.3",
+    "@types/bun": "latest",
+    "@types/express": "^5.0.6",
+    "@types/pg": "^8.21.0",
+    "prisma": "^7.9.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,3196 @@
+// Prisma schema — mutual fund platform on Fintech Primitives (FP / Cybrilla)
+//
+// ---------------------------------------------------------------------------
+// What this schema is
+// ---------------------------------------------------------------------------
+// FP is the system of record for everything regulated: investor profiles, KYC,
+// folios, orders, mandates and payments all live in FP and are reachable at
+// https://s.finprim.com with the `x-tenant-id` header. This database is
+// therefore TWO things, and the split matters:
+//
+//   1. Ours alone      — app accounts, phone-OTP challenges, onboarding
+//                        progress, audit trail. FP knows nothing about these.
+//   2. A mirror of FP  — every model carrying an `fpId`. FP owns the truth;
+//                        we keep a local projection so the app can render
+//                        lists, filter and paginate without fanning out to FP
+//                        on every request.
+//
+// Rules for the mirrored half:
+//   - `fpId` is FP's identifier and the idempotency anchor for every sync.
+//     Upsert on it; never insert blind.
+//   - `fpOldId` is FP's legacy numeric id. It is NOT redundant — the Payments
+//     and Mandates APIs address purchases and bank accounts by this integer,
+//     not by the `fpId` string.
+//   - Never invent state locally. A mirrored row changes only when FP says so
+//     (API response or webhook). Local writes belong on the "ours" side.
+//   - `syncedAt` records when we last reconciled the row with FP, so a stale
+//     projection is detectable rather than silently wrong.
+//
+// ---------------------------------------------------------------------------
+// Enum values are FP's wire strings
+// ---------------------------------------------------------------------------
+// FP-mirroring enums use value-level `@map` so the Postgres label is byte
+// identical to the JSON FP sends ("resident_individual", not
+// "RESIDENT_INDIVIDUAL"). Reading a row then matches reading an API payload,
+// which is what you want at 2am during a reconciliation. Enums that are ours
+// alone carry no @map — the absence of one tells you FP has no such concept.
+//
+// Where FP uses two different vocabularies for the same idea, this schema
+// keeps two enums rather than flattening them. `Occupation` (investor_profile)
+// and `KycOccupationType` (kyc_request) are the clearest example: FP spells
+// the same job "house_wife" in one and "housewife" in the other. Merging them
+// would silently corrupt one of the two payloads.
+//
+// ---------------------------------------------------------------------------
+// Scope: the individual investor journey
+// ---------------------------------------------------------------------------
+// Modelled now: KYC check -> digital KYC -> investor profile + contact details,
+// bank account, nominee -> MF investment account + folio defaults -> folio ->
+// lumpsum and systematic purchase, redemption, switch -> mandate + payment ->
+// holdings and returns.
+//
+// Deliberately left as seams for the later subdomains, so none of them needs a
+// destructive migration:
+//   minor  — InvestorProfile.guardian*, TaxStatus.RESIDENT_MINOR /
+//            NON_RESIDENT_MINOR_NRO, RelatedPartyContact.subject = GUARDIAN,
+//            UserInvestorProfile.relationship = GUARDIAN.
+//   joint  — MfInvestmentAccount.secondInvestor/thirdInvestor, the full
+//            HoldingPattern enum, UserInvestorProfile.relationship =
+//            JOINT_HOLDER.
+//   agent  — Partner, MfPurchase.partner/euin, MfInvestmentAccount
+//            .servicingPartner, UserRole.DISTRIBUTOR.
+//   admin  — UserRole.ADMIN / SUPPORT, AuditLog, FpWebhookEvent.
+//
+// ---------------------------------------------------------------------------
+// Numeric conventions (NEVER Float for money — binary floats cannot represent
+// decimal currency exactly and drift under accumulation):
+//   money (INR)   -> Decimal(18, 2)
+//   fund units    -> Decimal(18, 4)   FP allots to 3dp; 4 leaves headroom
+//   NAV / price   -> Decimal(12, 4)
+//   percentages   -> Decimal(6, 4)    stored as percent, 1.2500 = 1.25%
+//   allocation %  -> Decimal(5, 2)    nominee split, 0.00-100.00
+//   lat / long    -> Decimal(9, 6)
+//
+// Connection URLs live in prisma.config.ts, not here (Prisma 7).
+// Docs: https://fintechprimitives.com/docs/api/ and https://docs.fintechprimitives.com
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
+  runtime      = "bun"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ===========================================================================
+// Enums — ours
+// ===========================================================================
+
+enum UserRole {
+  INVESTOR
+  /// Sub-broker / ARN holder acting for investors. The agent subdomain builds
+  /// on this plus Partner; nothing else in the schema needs to change.
+  DISTRIBUTOR
+  ADMIN
+  SUPPORT
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+/// How a login account relates to an investor profile.
+///
+/// One account can reach several profiles (a parent operating a minor's
+/// folios, one holder of a joint account) and one profile can be reachable by
+/// several accounts. That is why this is a join table and not a column.
+enum UserProfileRelationship {
+  /// The profile is the account holder's own.
+  SELF
+  /// Account holder is the guardian of a minor investor. (minor subdomain)
+  GUARDIAN
+  /// Account holder is a second or third holder. (joint subdomain)
+  JOINT_HOLDER
+  /// Power of attorney.
+  POA
+  /// Distributor servicing the investor. (agent subdomain)
+  ADVISOR
+}
+
+/// Cursor for the stepped onboarding UI — see InvestorOnboarding.
+enum OnboardingStage {
+  /// PAN checked against the KRAs; we know whether the investor is compliant.
+  KYC_CHECK
+  /// KYC non-compliant: digital KYC application in flight.
+  KYC_REQUEST
+  /// Demographic details captured on the investor profile.
+  PROFILE
+  /// At least one address, phone number and email address recorded.
+  CONTACT_DETAILS
+  /// Bank account added (and verified, where verification is enabled).
+  BANK_ACCOUNT
+  /// Nominee declared, or nomination explicitly opted out of.
+  NOMINEE
+  /// FATCA / tax residency declaration complete.
+  FATCA
+  /// MF investment account created and folio defaults set.
+  INVESTMENT_ACCOUNT
+  /// e-mandate registered — only needed before a SIP.
+  MANDATE
+  /// Ready to transact.
+  COMPLETED
+}
+
+enum FilePurpose {
+  SIGNATURE
+  CANCELLED_CHEQUE
+  PHOTO
+  IPV_VIDEO
+  IDENTITY_PROOF
+  ADDRESS_PROOF
+  OTHER
+}
+
+/// Which side of a related party a contact block belongs to.
+enum RelatedPartyContactSubject {
+  /// The nominee / related party themselves.
+  SELF
+  /// The nominee's guardian, when the nominee is a minor.
+  GUARDIAN
+}
+
+/// Frequency dimension of MfSchemeThreshold.
+///
+/// A near-copy of PlanFrequency, plus NOT_APPLICABLE for the one-off threshold
+/// types that have no cadence (lumpsum, withdrawal, switch). It exists as its
+/// own enum so the column can be NOT NULL, which is what lets
+/// `(scheme, type, frequency)` be a real natural key: Prisma refuses a null
+/// inside a compound-unique `where`, so a nullable frequency could not be
+/// upserted — every catalogue sync would need a read-then-write instead.
+enum SchemeThresholdFrequency {
+  /// Our own value, not FP's — the threshold has no frequency dimension.
+  NOT_APPLICABLE     @map("not_applicable")
+  DAILY              @map("daily")
+  CALENDAR_DAY_DAILY @map("calendar_day_daily")
+  DAY_IN_A_WEEK      @map("day_in_a_week")
+  FOUR_TIMES_A_MONTH @map("four_times_a_month")
+  DAY_IN_A_FORTNIGHT @map("day_in_a_fortnight")
+  TWICE_A_MONTH      @map("twice_a_month")
+  MONTHLY            @map("monthly")
+  QUARTERLY          @map("quarterly")
+  HALF_YEARLY        @map("half_yearly")
+  YEARLY             @map("yearly")
+
+  @@map("scheme_threshold_frequency")
+}
+
+/// Transaction-type dimension of MfSchemeThreshold.
+enum SchemeThresholdType {
+  LUMPSUM
+  ADDITIONAL
+  WITHDRAWAL
+  SWITCH_IN
+  SWITCH_OUT
+  SIP
+  SWP
+  STP
+}
+
+enum OtpPurpose {
+  PHONE_VERIFICATION
+  LOGIN
+  /// SEBI mandates 2FA before an order reaches the RTA. The verified challenge
+  /// is what backs MfPurchase.consent* — see MfPurchase.
+  TRANSACTION_APPROVAL
+}
+
+enum OtpStatus {
+  PENDING
+  VERIFIED
+  EXPIRED
+  /// Too many wrong attempts — the challenge is burnt, request a new one.
+  FAILED
+  CANCELLED
+}
+
+enum WebhookProcessingStatus {
+  PENDING
+  PROCESSED
+  /// Retries exhausted. Needs an operator; see FpWebhookEvent.lastError.
+  FAILED
+  /// Recognised event we intentionally do not act on.
+  IGNORED
+}
+
+// ===========================================================================
+// Enums — FP identity vocabulary
+// ===========================================================================
+
+enum InvestorProfileType {
+  INDIVIDUAL @map("individual")
+
+  @@map("investor_profile_type")
+}
+
+/// FP accepts resident_individual and nri for an individual profile today.
+/// The minor statuses are referenced by FP's own source_of_wealth and
+/// income_slab rules, so they are declared here for the minor subdomain.
+enum TaxStatus {
+  RESIDENT_INDIVIDUAL    @map("resident_individual")
+  NRI                    @map("nri")
+  RESIDENT_MINOR         @map("resident_minor")
+  NON_RESIDENT_MINOR_NRO @map("non_resident_minor_nro")
+
+  @@map("tax_status")
+}
+
+enum Gender {
+  MALE        @map("male")
+  FEMALE      @map("female")
+  TRANSGENDER @map("transgender")
+
+  @@map("gender")
+}
+
+enum MaritalStatus {
+  MARRIED   @map("married")
+  UNMARRIED @map("unmarried")
+  OTHERS    @map("others")
+
+  @@map("marital_status")
+}
+
+/// investor_profile.occupation. Note the spelling differs from
+/// KycOccupationType — FP uses two vocabularies. Do not merge them.
+enum Occupation {
+  BUSINESS               @map("business")
+  PROFESSIONAL           @map("professional")
+  RETIRED                @map("retired")
+  HOUSE_WIFE             @map("house_wife")
+  STUDENT                @map("student")
+  PUBLIC_SECTOR_SERVICE  @map("public_sector_service")
+  PRIVATE_SECTOR_SERVICE @map("private_sector_service")
+  GOVERNMENT_SERVICE     @map("government_service")
+  AGRICULTURE            @map("agriculture")
+  DOCTOR                 @map("doctor")
+  FOREX_DEALER           @map("forex_dealer")
+  SERVICE                @map("service")
+  OTHERS                 @map("others")
+
+  @@map("occupation")
+}
+
+/// kyc_request.occupation_type. Same idea as Occupation, different spellings.
+enum KycOccupationType {
+  BUSINESS          @map("business")
+  PROFESSIONAL      @map("professional")
+  RETIRED           @map("retired")
+  HOUSEWIFE         @map("housewife")
+  STUDENT           @map("student")
+  PUBLIC_SECTOR     @map("public_sector")
+  PRIVATE_SECTOR    @map("private_sector")
+  GOVERNMENT_SECTOR @map("government_sector")
+  OTHERS            @map("others")
+
+  @@map("kyc_occupation_type")
+}
+
+enum SourceOfWealth {
+  SALARY             @map("salary")
+  BUSINESS           @map("business")
+  GIFT               @map("gift")
+  ANCESTRAL_PROPERTY @map("ancestral_property")
+  RENTAL_INCOME      @map("rental_income")
+  PRIZE_MONEY        @map("prize_money")
+  ROYALTY            @map("royalty")
+  OTHERS             @map("others")
+
+  @@map("source_of_wealth")
+}
+
+enum IncomeSlab {
+  UPTO_1LAKH               @map("upto_1lakh")
+  ABOVE_1LAKH_UPTO_5LAKH   @map("above_1lakh_upto_5lakh")
+  ABOVE_5LAKH_UPTO_10LAKH  @map("above_5lakh_upto_10lakh")
+  ABOVE_10LAKH_UPTO_25LAKH @map("above_10lakh_upto_25lakh")
+  ABOVE_25LAKH_UPTO_1CR    @map("above_25lakh_upto_1cr")
+  ABOVE_1CR                @map("above_1cr")
+
+  @@map("income_slab")
+}
+
+enum PepDetails {
+  PEP_EXPOSED    @map("pep_exposed")
+  PEP_RELATED    @map("pep_related")
+  NOT_APPLICABLE @map("not_applicable")
+
+  @@map("pep_details")
+}
+
+/// FP documents exactly one value for individual KYC today.
+enum ResidentialStatus {
+  RESIDENT_INDIVIDUAL @map("resident_individual")
+
+  @@map("residential_status")
+}
+
+/// Tax identification type. FP allows the full list only when country = IN;
+/// for every other country the value must be TIN.
+enum TaxIdType {
+  PASSPORT        @map("passport")
+  ELECTION_ID     @map("election_id")
+  PAN             @map("pan")
+  ID_CARD         @map("id_card")
+  DRIVING_LICENSE @map("driving_license")
+  AADHAAR_LETTER  @map("aadhaar_letter")
+  NREGA_JOB_CARD  @map("nrega_job_card")
+  TIN             @map("tin")
+  NOT_CATEGORIZED @map("not_categorized")
+  OTHERS          @map("others")
+
+  @@map("tax_id_type")
+}
+
+enum AddressNature {
+  RESIDENTIAL       @map("residential")
+  BUSINESS_LOCATION @map("business_location")
+  /// Non-individual profiles only; declared for the later subdomain.
+  REGISTERED_OFFICE @map("registered_office")
+
+  @@map("address_nature")
+}
+
+/// Whose contact detail this is — FP's `belongs_to`.
+enum ContactBelongsTo {
+  SELF               @map("self")
+  SPOUSE             @map("spouse")
+  DEPENDENT_CHILDREN @map("dependent_children")
+  DEPENDENT_SIBLINGS @map("dependent_siblings")
+  DEPENDENT_PARENTS  @map("dependent_parents")
+  GUARDIAN           @map("guardian")
+  PMS                @map("pms")
+  CUSTODIAN          @map("custodian")
+  POA                @map("poa")
+
+  @@map("contact_belongs_to")
+}
+
+/// Outcome of a bank account penny-drop verification.
+enum BavStatus {
+  PENDING   @map("pending")
+  COMPLETED @map("completed")
+  FAILED    @map("failed")
+
+  @@map("bav_status")
+}
+
+/// How likely the account belongs to the investor. A COMPLETED verification can
+/// still come back LOW or ZERO, which is not a pass.
+enum BavConfidence {
+  VERY_HIGH @map("very_high")
+  HIGH      @map("high")
+  UNCERTAIN @map("uncertain")
+  LOW       @map("low")
+  VERY_LOW  @map("very_low")
+  ZERO      @map("zero")
+
+  @@map("bav_confidence")
+}
+
+enum BankAccountType {
+  SAVINGS @map("savings")
+  CURRENT @map("current")
+  NRE     @map("nre")
+  NRO     @map("nro")
+
+  @@map("bank_account_type")
+}
+
+/// related_party.relationship. FP's list has no NOMINEE value: a nominee is a
+/// related party referenced from MfInvestmentAccountNominee, and this field
+/// says how they are related to the investor.
+enum RelatedPartyRelationship {
+  FATHER                         @map("father")
+  MOTHER                         @map("mother")
+  COURT_APPOINTED_LEGAL_GUARDIAN @map("court_appointed_legal_guardian")
+  AUNT                           @map("aunt")
+  BROTHER                        @map("brother")
+  BROTHER_IN_LAW                 @map("brother_in_law")
+  DAUGHTER                       @map("daughter")
+  DAUGHTER_IN_LAW                @map("daughter_in_law")
+  FATHER_IN_LAW                  @map("father_in_law")
+  GRAND_DAUGHTER                 @map("grand_daughter")
+  GRAND_FATHER                   @map("grand_father")
+  GRAND_MOTHER                   @map("grand_mother")
+  GRAND_SON                      @map("grand_son")
+  MOTHER_IN_LAW                  @map("mother_in_law")
+  NEPHEW                         @map("nephew")
+  NIECE                          @map("niece")
+  SISTER                         @map("sister")
+  SISTER_IN_LAW                  @map("sister_in_law")
+  SON                            @map("son")
+  SON_IN_LAW                     @map("son_in_law")
+  SPOUSE                         @map("spouse")
+  UNCLE                          @map("uncle")
+  OTHERS                         @map("others")
+
+  @@map("related_party_relationship")
+}
+
+/// Identity proof declared for a nominee (or their guardian) on a folio.
+enum IdentityProofType {
+  PAN             @map("pan")
+  AADHAAR         @map("aadhaar")
+  DRIVING_LICENCE @map("driving_licence")
+  PASSPORT        @map("passport")
+
+  @@map("identity_proof_type")
+}
+
+enum NominationsInfoVisibility {
+  SHOW_ALL_NOMINEE_NAMES @map("show_all_nominee_names")
+  SHOW_NOMINATION_STATUS @map("show_nomination_status")
+
+  @@map("nominations_info_visibility")
+}
+
+// ===========================================================================
+// Enums — FP KYC vocabulary
+// ===========================================================================
+
+/// Whether a KYC form opens a new KYC record or amends an existing one.
+/// FP decides eligibility from the PAN's real status, so this is not a free
+/// choice — see the KycForm model.
+enum KycFormType {
+  FRESH  @map("fresh")
+  MODIFY @map("modify")
+
+  @@map("kyc_form_type")
+}
+
+enum KycFormStatus {
+  /// Eligibility is being checked, asynchronously. Poll.
+  UNDER_REVIEW        @map("under_review")
+  /// Eligible; fill in the fields FP is asking for.
+  CREATED             @map("created")
+  /// Everything present — send the investor to the esign URL.
+  AWAITING_ESIGN      @map("awaiting_esign")
+  /// Esigned, on its way to the KRA.
+  AWAITING_SUBMISSION @map("awaiting_submission")
+  SUBMITTED           @map("submitted")
+  FAILED              @map("failed")
+  /// No action within 7 days. Not resumable — start a new form.
+  EXPIRED             @map("expired")
+
+  @@map("kyc_form_status")
+}
+
+enum KycRequestStatus {
+  /// Created but incomplete — see KycRequest.fieldsNeeded.
+  PENDING        @map("pending")
+  /// All data present; create an Esign and redirect the investor.
+  ESIGN_REQUIRED @map("esign_required")
+  SUBMITTED      @map("submitted")
+  /// Accepted by the KRA.
+  SUCCESSFUL     @map("successful")
+  REJECTED       @map("rejected")
+  /// Not completed within 5 days of creation. Not resumable — start a new one.
+  EXPIRED        @map("expired")
+
+  @@map("kyc_request_status")
+}
+
+enum IdentityDocumentType {
+  AADHAAR @map("aadhaar")
+
+  @@map("identity_document_type")
+}
+
+enum DocumentFetchStatus {
+  PENDING    @map("pending")
+  SUCCESSFUL @map("successful")
+  FAILED     @map("failed")
+  EXPIRED    @map("expired")
+
+  @@map("document_fetch_status")
+}
+
+enum EsignStatus {
+  PENDING    @map("pending")
+  SUCCESSFUL @map("successful")
+  FAILED     @map("failed")
+
+  @@map("esign_status")
+}
+
+// ===========================================================================
+// Enums — FP scheme catalogue
+// ===========================================================================
+
+enum SchemeCategory {
+  EQUITY @map("equity")
+  DEBT   @map("debt")
+  LIQUID @map("liquid")
+  HYBRID @map("hybrid")
+  OTHERS @map("others")
+
+  @@map("scheme_category")
+}
+
+enum SchemePlanType {
+  REGULAR @map("regular")
+  DIRECT  @map("direct")
+
+  @@map("scheme_plan_type")
+}
+
+enum SchemeInvestmentOption {
+  GROWTH           @map("growth")
+  DIV_PAYOUT       @map("div_payout")
+  DIV_REINVESTMENT @map("div_reinvestment")
+
+  @@map("scheme_investment_option")
+}
+
+enum SchemeDeliveryMode {
+  PHYSICAL       @map("physical")
+  DEMAT          @map("demat")
+  DEMAT_PHYSICAL @map("demat_physical")
+
+  @@map("scheme_delivery_mode")
+}
+
+// ===========================================================================
+// Enums — FP order vocabulary
+// ===========================================================================
+
+enum HoldingPattern {
+  SINGLE             @map("single")
+  JOINT              @map("joint")
+  EITHER_OR_SURVIVOR @map("either_or_survivor")
+  ANYONE_OR_SURVIVOR @map("anyone_or_survivor")
+  FIRST_OR_SURVIVOR  @map("first_or_survivor")
+
+  @@map("holding_pattern")
+}
+
+/// Which route an order takes to the AMC.
+///
+/// `cybrillapoa` is FP's ONDC implementation and is the value the API actually
+/// expects — `ondc` is also accepted but the documented gateway name for
+/// orders is cybrillapoa. Both are modelled so a mirrored order is never
+/// silently recorded as the wrong route.
+enum OrderGateway {
+  RTA         @map("rta")
+  CYBRILLAPOA @map("cybrillapoa")
+  ONDC        @map("ondc")
+
+  @@map("order_gateway")
+}
+
+/// Shared lifecycle of mf_purchase / mf_redemption / mf_switch.
+///
+/// A pending order expires if it is not confirmed in time: T+7 working days
+/// for a purchase, T+1 for a redemption or switch, counted from
+/// `scheduledOn`. Expiry surfaces as FAILED with failureCode = order_expiry.
+enum MfOrderState {
+  /// ONDC gateway only: the gateway is reviewing the order asynchronously.
+  UNDER_REVIEW @map("under_review")
+  /// Created, not yet ready for submission.
+  PENDING      @map("pending")
+  /// Payment or settlement in place; ready for the gateway.
+  CONFIRMED    @map("confirmed")
+  SUBMITTED    @map("submitted")
+  SUCCESSFUL   @map("successful")
+  FAILED       @map("failed")
+  CANCELLED    @map("cancelled")
+  /// A previously successful order was reversed by the gateway; units revert.
+  REVERSED     @map("reversed")
+
+  @@map("mf_order_state")
+}
+
+enum MfPurchaseType {
+  /// Fresh purchase — no folio yet, the AMC creates one.
+  PURCHASE            @map("purchase")
+  /// Into an existing folio.
+  ADDITIONAL_PURCHASE @map("additional_purchase")
+
+  @@map("mf_purchase_type")
+}
+
+enum RedemptionMode {
+  NORMAL  @map("normal")
+  /// Liquid schemes that support it: proceeds within ~30 minutes. RTA only.
+  INSTANT @map("instant")
+
+  @@map("redemption_mode")
+}
+
+enum OrderInitiatedBy {
+  INVESTOR    @map("investor")
+  DISTRIBUTOR @map("distributor")
+
+  @@map("order_initiated_by")
+}
+
+enum OrderInitiatedVia {
+  WEB                @map("web")
+  MOBILE_APP         @map("mobile_app")
+  MOBILE_APP_ANDROID @map("mobile_app_android")
+  MOBILE_APP_IOS     @map("mobile_app_ios")
+  MOBILE_WEB         @map("mobile_web")
+  MOBILE_WEB_ANDROID @map("mobile_web_android")
+  MOBILE_WEB_IOS     @map("mobile_web_ios")
+
+  @@map("order_initiated_via")
+}
+
+// ===========================================================================
+// Enums — FP transaction plan vocabulary (SIP / SWP / STP)
+// ===========================================================================
+
+enum PlanState {
+  /// Registered with FP, activation attempted automatically.
+  CREATED          @map("created")
+  /// ONDC gateway only.
+  REVIEW_COMPLETED @map("review_completed")
+  /// ONDC gateway only.
+  CONFIRMED        @map("confirmed")
+  /// ONDC gateway only.
+  SUBMITTED        @map("submitted")
+  /// Only an active plan generates installments.
+  ACTIVE           @map("active")
+  CANCELLED        @map("cancelled")
+  /// Every installment has been generated.
+  COMPLETED        @map("completed")
+  /// Activation failed.
+  FAILED           @map("failed")
+
+  @@map("plan_state")
+}
+
+/// Installment cadence. `installmentDay` means different things per frequency:
+/// 1-5 (Mon-Fri) for the weekly and fortnightly cadences, 1-28 for the
+/// monthly and longer ones, and nothing at all for DAILY.
+enum PlanFrequency {
+  /// Every business day; market holidays are skipped.
+  DAILY              @map("daily")
+  /// Every calendar day. Confirmed present in the sandbox scheme thresholds,
+  /// but FP gates it per customer — check before offering it.
+  CALENDAR_DAY_DAILY @map("calendar_day_daily")
+  DAY_IN_A_WEEK      @map("day_in_a_week")
+  FOUR_TIMES_A_MONTH @map("four_times_a_month")
+  DAY_IN_A_FORTNIGHT @map("day_in_a_fortnight")
+  TWICE_A_MONTH      @map("twice_a_month")
+  MONTHLY            @map("monthly")
+  QUARTERLY          @map("quarterly")
+  HALF_YEARLY        @map("half_yearly")
+  YEARLY             @map("yearly")
+
+  @@map("plan_frequency")
+}
+
+enum PlanPurpose {
+  CHILDREN_EDUCATION @map("children_education")
+  CHILDREN_MARRIAGE  @map("children_marriage")
+  HOUSE              @map("house")
+  CAR                @map("car")
+  TRAVEL             @map("travel")
+  RETIREMENT         @map("retirement")
+  OTHERS             @map("others")
+
+  @@map("plan_purpose")
+}
+
+enum PlanPaymentMethod {
+  MANDATE @map("mandate")
+
+  @@map("plan_payment_method")
+}
+
+// ===========================================================================
+// Enums — FP payments vocabulary
+//
+// The payment gateway APIs (/api/pg/*) predate the v2 object APIs and shout in
+// upper case. The @map values keep that, so a row still reads like the payload.
+// ===========================================================================
+
+enum MandateType {
+  /// NACH e-mandate. Reported back as NACH once registered.
+  E_MANDATE @map("E_MANDATE")
+  NACH      @map("NACH")
+  UPI       @map("UPI")
+
+  @@map("mandate_type")
+}
+
+enum MandateStatus {
+  CREATED   @map("CREATED")
+  RECEIVED  @map("RECEIVED")
+  SUBMITTED @map("SUBMITTED")
+  /// Only an APPROVED mandate can back a payment.
+  APPROVED  @map("APPROVED")
+  REJECTED  @map("REJECTED")
+  CANCELLED @map("CANCELLED")
+
+  @@map("mandate_status")
+}
+
+enum PaymentProvider {
+  RAZORPAY    @map("RAZORPAY")
+  BILLDESK    @map("BILLDESK")
+  CYBRILLAPOA @map("CYBRILLAPOA")
+  ONDC        @map("ONDC")
+
+  @@map("payment_provider")
+}
+
+enum PaymentType {
+  NETBANKING       @map("NETBANKING")
+  NACH             @map("NACH")
+  ECS              @map("ECS")
+  CHEQUE           @map("CHEQUE")
+  /// The zero-value debit that authorises a mandate.
+  AUTH_TRANSACTION @map("AUTH_TRANSACTION")
+
+  @@map("payment_type")
+}
+
+enum PaymentMethod {
+  NETBANKING @map("NETBANKING")
+  UPI        @map("UPI")
+  EMANDATE   @map("EMANDATE")
+
+  @@map("payment_method")
+}
+
+enum PaymentStatus {
+  INITIATED @map("INITIATED")
+  PENDING   @map("PENDING")
+  SUBMITTED @map("SUBMITTED")
+  APPROVED  @map("APPROVED")
+  REJECTED  @map("REJECTED")
+  SUCCESS   @map("SUCCESS")
+  FAILED    @map("FAILED")
+
+  @@map("payment_status")
+}
+
+enum RefundStatus {
+  CREATED    @map("CREATED")
+  SUCCESSFUL @map("SUCCESSFUL")
+  FAILED     @map("FAILED")
+
+  @@map("refund_status")
+}
+
+/// How the investor's money reached the AMC, for settlement reporting.
+enum SettlementPaymentType {
+  NETBANKING @map("netbanking")
+  NACH       @map("nach")
+  NEFT       @map("neft")
+  RTGS       @map("rtgs")
+
+  @@map("settlement_payment_type")
+}
+
+// ===========================================================================
+// Identity and access — ours
+// ===========================================================================
+
+/// A login account on our platform. Not an FP object.
+///
+/// Mobile first: `phone` is the credential the MSG91 OTP flow verifies, so it
+/// is required and unique. Email is optional here even though FP requires one
+/// for KYC — it is collected during onboarding, not at signup.
+model User {
+  // uuid(7) is time-ordered, so inserts append to the end of the B-tree
+  // instead of fragmenting it the way random uuid(4) does.
+  id String @id @default(uuid(7)) @db.Uuid
+
+  sessions InvestorSession[]
+  commands InvestorCommand[]
+
+  /// E.164, always normalised (+919876543210).
+  phone    String     @unique @db.VarChar(20)
+  email    String?    @unique @db.VarChar(255)
+  fullName String?    @db.VarChar(150)
+  role     UserRole   @default(INVESTOR)
+  status   UserStatus @default(PENDING_VERIFICATION)
+
+  /// Null for OTP-only accounts. Argon2id — never a reversible encoding.
+  passwordHash String? @db.VarChar(255)
+
+  emailVerifiedAt DateTime?
+  phoneVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  /// Soft delete: financial records reference users with onDelete: Restrict,
+  /// so an investor with history can never be hard-deleted.
+  deletedAt DateTime?
+
+  profileLinks     UserInvestorProfile[]
+  uploadedFiles    FpFile[]
+  kycChecks        KycCheck[]
+  kycRequests      KycRequest[]
+  kycForms         KycForm[]
+  preVerifications PreVerification[]
+  watchlist        WatchlistItem[]
+  auditLogs        AuditLog[]
+
+  @@index([status])
+  @@index([deletedAt])
+  @@index([createdAt])
+  @@map("users")
+}
+
+/// Which investor profiles a login account may act on, and in what capacity.
+///
+/// Many-to-many on purpose. A guardian reaches their own profile plus each
+/// minor's; a joint holder reaches a profile they do not own. Both later
+/// subdomains are then a new `relationship` value and no schema change.
+model UserInvestorProfile {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  relationship UserProfileRelationship @default(SELF)
+  /// The profile this account lands on after login.
+  isPrimary    Boolean                 @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, investorProfileId])
+  @@index([investorProfileId])
+  @@map("user_investor_profiles")
+}
+
+/// Where an investor is in the onboarding journey.
+///
+/// A denormalised cursor, kept so the app can resume a half-finished signup in
+/// one read instead of probing eight tables. The rows themselves stay the
+/// source of truth: the onboarding service advances `stage` in the SAME
+/// transaction that writes the step it completed, and a repair job can always
+/// recompute it. Never branch on `stage` for a compliance decision — read the
+/// underlying row (KycCheck.isCompliant, MandateStatus.APPROVED) for that.
+model InvestorOnboarding {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  investorProfileId String          @unique @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  stage OnboardingStage @default(KYC_CHECK)
+
+  /// Last failure shown to the investor, so a resumed session can explain
+  /// itself. Free text from us, never a raw FP payload.
+  lastError String? @db.VarChar(500)
+
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  @@index([stage])
+  @@map("investor_onboardings")
+}
+
+// ===========================================================================
+// FP files
+// ===========================================================================
+
+/// A file uploaded to FP (POST /files) — signature, cancelled cheque, photo.
+///
+/// The bytes live in FP. We keep the id and enough metadata to render a list,
+/// and `fpUrl` only because FP returns it; treat it as short-lived.
+model FpFile {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  purpose     FilePurpose @default(OTHER)
+  filename    String?     @db.VarChar(255)
+  contentType String?     @db.VarChar(120)
+  byteSize    Int?
+  fpUrl       String?     @db.VarChar(1000)
+
+  uploadedByUserId String? @db.Uuid
+  uploadedBy       User?   @relation(fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  signatureForProfiles InvestorProfile[] @relation("ProfileSignature")
+  cancelledChequeFor   BankAccount[]
+  signatureForKyc      KycRequest[]      @relation("KycSignature")
+
+  @@index([purpose])
+  @@index([uploadedByUserId])
+  @@map("fp_files")
+}
+
+// ===========================================================================
+// KYC
+// ===========================================================================
+
+/// POST /api/kyc/check — the investor's KYC status at the KRAs.
+///
+/// Read isCompliant together with constraints before accepting investments.
+/// A false status does not always permit digital KYC: inspect action/reason.
+/// One row per provider check; refetch updates that projection. Separate check
+/// requests retain separate rows, but this is not immutable status history.
+model KycCheck {
+  id   String @id @default(uuid(7)) @db.Uuid
+  /// FP returns a bare UUID here, not a prefixed id.
+  fpId String @unique @db.VarChar(64)
+
+  /// Full PAN. Unavoidable: it is the lookup key at the KRAs and the join key
+  /// against migrated folios. Encrypt at rest at the database level.
+  pan         String    @db.VarChar(10)
+  /// Present only for the "fetch KYC data" variant, which also needs a DOB.
+  dateOfBirth DateTime? @db.Date
+
+  /// FP's `status`: true = KYC compliant.
+  isCompliant Boolean
+  /// FP's `action` / `reason`, e.g. "modify" / "onhold". Free text upstream.
+  action      String? @db.VarChar(60)
+  reason      String? @db.VarChar(120)
+
+  /// KRA demographics (name, gender, father_name, both addresses, contacts).
+  /// Json because the shape varies by KRA and by variant of the call, and we
+  /// only ever echo it into a prefill form — nothing queries inside it.
+  entityDetails Json?   @db.JsonB
+  /// Investment restrictions, e.g. an investment_limit cap.
+  constraints   Json?   @db.JsonB
+  /// Which KRAs answered, and when.
+  sources       Json?   @db.JsonB
+  /// FP's own reference to the upstream fetch.
+  sourceRefId   String? @db.VarChar(120)
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  investorProfileId String?          @db.Uuid
+  investorProfile   InvestorProfile? @relation(fields: [investorProfileId], references: [id], onDelete: SetNull)
+
+  fpCreatedAt DateTime?
+  fpUpdatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  /// Hot path: "the newest check for this PAN".
+  @@index([pan, createdAt(sort: Desc)])
+  @@index([userId])
+  @@index([investorProfileId])
+  @@map("kyc_checks")
+}
+
+/// Cybrilla partner-realm POST /poa/pre_verifications. Separate from KycCheck:
+/// request completion, KRA readiness and PAN/bank verdicts are different facts.
+/// One row per provider request; retries create history, polling updates fpId.
+/// Use a separate database per environment/partner, as with the other FP mirrors.
+model PreVerification {
+  id                    String    @id @default(uuid(7)) @db.Uuid
+  fpId                  String    @unique @db.VarChar(64)
+  /// Wire status: accepted or completed. Preserve unknown future states;
+  /// only an explicitly verified verdict may grant readiness.
+  status                String    @db.VarChar(60)
+  investorIdentifier    String?   @db.VarChar(10)
+  readinessStatus       String?   @db.VarChar(60)
+  readinessCode         String?   @db.VarChar(120)
+  readinessReason       String?   @db.Text
+  /// Optional extension returned by some partner deployments.
+  readinessModification String?   @db.VarChar(120)
+  pan                   String?   @db.VarChar(10)
+  panStatus             String?   @db.VarChar(60)
+  panCode               String?   @db.VarChar(120)
+  panReason             String?   @db.Text
+  name                  String?   @db.Text
+  nameStatus            String?   @db.VarChar(60)
+  nameCode              String?   @db.VarChar(120)
+  nameReason            String?   @db.Text
+  dateOfBirth           DateTime? @db.Date
+  dateOfBirthStatus     String?   @db.VarChar(60)
+  dateOfBirthCode       String?   @db.VarChar(120)
+  dateOfBirthReason     String?   @db.Text
+
+  /// May precede profile creation. Links must come from trusted ownership context.
+  userId            String?                     @db.Uuid
+  user              User?                       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  investorProfileId String?                     @db.Uuid
+  investorProfile   InvestorProfile?            @relation(fields: [investorProfileId], references: [id], onDelete: SetNull)
+  bankResults       PreVerificationBankResult[]
+
+  fpCreatedAt DateTime? @db.Timestamptz(3)
+  fpUpdatedAt DateTime? @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+  syncedAt    DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([investorIdentifier, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([investorProfileId, createdAt(sort: Desc)])
+  @@index([status, syncedAt])
+  @@map("pre_verifications")
+}
+
+/// One result per bank entry in the provider response, including failed checks.
+/// Keep the checked account details even before a BankAccount exists in FP.
+/// Sensitive account data: encrypt database/backups and redact logs/API output.
+model PreVerificationBankResult {
+  id                         String          @id @default(uuid(7)) @db.Uuid
+  preVerificationId          String          @db.Uuid
+  preVerification            PreVerification @relation(fields: [preVerificationId], references: [id], onDelete: Cascade)
+  /// Zero-based position in bank_accounts; enforced nonnegative in migration SQL.
+  position                   Int
+  status                     String?         @db.VarChar(60)
+  code                       String?         @db.VarChar(120)
+  reason                     String?         @db.Text
+  accountNumber              String          @db.Text
+  accountNumberFingerprint   String?         @db.VarChar(64)
+  ifscCode                   String          @db.VarChar(11)
+  /// POA vocabulary includes nre_savings/nro_savings; not BankAccountType.
+  accountType                String          @db.VarChar(60)
+  /// Partner-realm file reference, not a tenant-realm FpFile foreign key.
+  bankAccountProofFpId       String?         @db.VarChar(64)
+  /// Request-only permission: never infer consent from a successful response.
+  manualVerificationApproved Boolean?
+  createdAt                  DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt                  DateTime        @updatedAt @db.Timestamptz(3)
+
+  @@unique([preVerificationId, position])
+  @@index([accountNumberFingerprint])
+  @@map("pre_verification_bank_results")
+}
+
+/// POST /v2/kyc_requests — a digital KYC application for a non-compliant PAN.
+///
+/// Lifecycle: pending -> esign_required -> submitted -> successful | rejected,
+/// with a hard 5-day expiry from creation. An expired request cannot be
+/// resumed; create a new one. `fieldsNeeded` is FP telling us what is still
+/// missing, and is what the app should drive its form off.
+model KycRequest {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  status KycRequestStatus @default(PENDING)
+
+  // --- Identity -----------------------------------------------------------
+  name              String             @db.VarChar(70)
+  pan               String             @db.VarChar(10)
+  dateOfBirth       DateTime           @db.Date
+  /// Last 4 digits only — that is all FP accepts, and all we should hold.
+  aadhaarLast4      String?            @db.VarChar(4)
+  fatherName        String?            @db.VarChar(70)
+  motherName        String?            @db.VarChar(70)
+  spouseName        String?            @db.VarChar(70)
+  gender            Gender?
+  maritalStatus     MaritalStatus?
+  residentialStatus ResidentialStatus?
+  occupationType    KycOccupationType?
+
+  // --- Contact ------------------------------------------------------------
+  email        String @db.VarChar(255)
+  mobileIsd    String @db.VarChar(4)
+  mobileNumber String @db.VarChar(20)
+
+  // --- Nationality and tax ------------------------------------------------
+  /// FP supports exactly one entry today but types it as an array.
+  citizenshipCountries       String[]    @db.VarChar(2)
+  nationalityCountry         String?     @db.VarChar(2)
+  countryOfBirth             String?     @db.VarChar(2)
+  placeOfBirth               String?     @db.VarChar(120)
+  incomeSlab                 IncomeSlab?
+  pepDetails                 PepDetails?
+  /// Must be declared explicitly; drives whether tax residencies are required.
+  taxResidencyOtherThanIndia Boolean?
+
+  // --- Documents ----------------------------------------------------------
+  signatureFileId String? @db.Uuid
+  signatureFile   FpFile? @relation("KycSignature", fields: [signatureFileId], references: [id], onDelete: SetNull)
+
+  identityProofId String?           @db.Uuid
+  identityProof   IdentityDocument? @relation("KycIdentityProof", fields: [identityProofId], references: [id], onDelete: SetNull)
+
+  addressProofId   String?            @db.Uuid
+  addressProof     IdentityDocument?  @relation("KycAddressProof", fields: [addressProofId], references: [id], onDelete: SetNull)
+  addressProofType IdentityProofType?
+
+  /// Where the investor was when they applied. Required by the KRAs.
+  geoLatitude  Decimal? @db.Decimal(9, 6)
+  geoLongitude Decimal? @db.Decimal(9, 6)
+
+  // --- FP feedback --------------------------------------------------------
+  /// FP's requirements.fields_needed — drive the form off this, not off a
+  /// hardcoded list, because FP changes what it asks for.
+  fieldsNeeded        String[]          @db.VarChar(60)
+  /// verification.status mirrors `status`; kept because FP sends both.
+  verificationStatus  KycRequestStatus?
+  /// verification.details_verbose: field -> { code, reason }. Json because the
+  /// keys are field paths ("address.proof") chosen by FP.
+  verificationDetails Json?             @db.JsonB
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  investorProfileId String?          @db.Uuid
+  investorProfile   InvestorProfile? @relation(fields: [investorProfileId], references: [id], onDelete: SetNull)
+
+  expiresAt       DateTime
+  esignRequiredAt DateTime?
+  submittedAt     DateTime?
+  successfulAt    DateTime?
+  rejectedAt      DateTime?
+
+  fpCreatedAt DateTime?
+  fpUpdatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  taxResidencies KycRequestTaxResidency[]
+  esigns         Esign[]
+  documents      IdentityDocument[]       @relation("KycRequestDocuments")
+
+  @@index([pan, createdAt(sort: Desc)])
+  @@index([status])
+  /// Expiry sweep: "pending requests past their 5-day window".
+  @@index([status, expiresAt])
+  @@index([userId])
+  @@map("kyc_requests")
+}
+
+/// kyc_request.non_indian_tax_residency_1..3, normalised.
+///
+/// `slot` preserves which numbered field FP sent it in, so a PATCH can put it
+/// back where it came from.
+model KycRequestTaxResidency {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  kycRequestId String     @db.Uuid
+  kycRequest   KycRequest @relation(fields: [kycRequestId], references: [id], onDelete: Cascade)
+
+  /// 1-3.
+  slot        Int
+  country     String @db.VarChar(2)
+  taxIdNumber String @db.VarChar(60)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([kycRequestId, slot])
+  @@map("kyc_request_tax_residencies")
+}
+
+/// POST /poa/kyc_forms — digital KYC on the Cybrilla POA realm.
+///
+/// Distinct from KycRequest, which is the same idea on FP's tenant realm. They
+/// are not interchangeable: KycRequest needs the tenant to be provisioned for
+/// KYC, while this needs only the partner credentials, so on a tenant where
+/// `/v2/kyc_requests` answers "Couldn't find Tenant" this is the route that
+/// works. Both models exist because a deployment may have either, or both.
+///
+/// Eligibility is the usual failure and is decided from the PAN's real KYC
+/// status: FRESH needs a PAN with no KYC, MODIFY needs one already registered.
+/// The wrong choice settles to FAILED with `ineligible_for_*` in `reason`, so
+/// check a pre-verification before choosing.
+model KycForm {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  type   KycFormType
+  status KycFormStatus @default(UNDER_REVIEW)
+  /// FP's machine-readable failure cause, e.g. "ineligible_for_fresh_kyc".
+  reason String?       @db.VarChar(120)
+
+  pan         String   @db.VarChar(10)
+  name        String   @db.VarChar(70)
+  dateOfBirth DateTime @db.Date
+
+  email        String? @db.VarChar(255)
+  mobileIsd    String? @db.VarChar(4)
+  mobileNumber String? @db.VarChar(20)
+
+  /// DigiLocker link for the identity and address proof. Short-lived; reissue
+  /// with the retry endpoint rather than storing it for long.
+  proofFetchUrl    String?              @db.VarChar(1000)
+  proofStatus      DocumentFetchStatus?
+  /// Where the investor returns to after DigiLocker and after esign.
+  proofCallbackUrl String?              @db.VarChar(1000)
+  esignCallbackUrl String?              @db.VarChar(1000)
+
+  esignUrl    String?      @db.VarChar(1000)
+  esignStatus EsignStatus?
+
+  signatureProvided Boolean @default(false)
+
+  /// What FP still wants before the form can be esigned. Drive the form UI off
+  /// this, not off a hardcoded list.
+  fieldsNeeded String[] @db.VarChar(60)
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  investorProfileId String?          @db.Uuid
+  investorProfile   InvestorProfile? @relation(fields: [investorProfileId], references: [id], onDelete: SetNull)
+
+  fpCreatedAt          DateTime?
+  fpUpdatedAt          DateTime?
+  reviewCompletedAt    DateTime?
+  awaitingEsignAt      DateTime?
+  awaitingSubmissionAt DateTime?
+  submittedAt          DateTime?
+  failedAt             DateTime?
+  /// Seven days from creation. An expired form cannot be resumed.
+  expiresAt            DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@index([pan, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([userId])
+  @@map("kyc_forms")
+}
+
+/// A document pulled from DigiLocker for a KYC request.
+///
+/// `fetchRedirectUrl` expires an hour after issue — re-create the document
+/// rather than reusing a stale link.
+model IdentityDocument {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  type IdentityDocumentType @default(AADHAAR)
+
+  kycRequestId String?     @db.Uuid
+  kycRequest   KycRequest? @relation("KycRequestDocuments", fields: [kycRequestId], references: [id], onDelete: SetNull)
+
+  fetchStatus      DocumentFetchStatus @default(PENDING)
+  fetchRedirectUrl String?             @db.VarChar(1000)
+  fetchPostbackUrl String?             @db.VarChar(1000)
+
+  // Fetched payload, typed rather than Json: the Aadhaar shape is fixed and
+  // the address is prefilled into the KYC form.
+  /// Last 4 digits of the Aadhaar number, which is all FP returns.
+  numberLast4 String? @db.VarChar(4)
+  line1       String? @db.VarChar(255)
+  city        String? @db.VarChar(100)
+  pincode     String? @db.VarChar(10)
+  country     String? @db.VarChar(2)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  identityProofFor KycRequest[] @relation("KycIdentityProof")
+  addressProofFor  KycRequest[] @relation("KycAddressProof")
+
+  @@index([kycRequestId])
+  @@index([fetchStatus])
+  @@map("identity_documents")
+}
+
+/// Aadhaar e-sign on a KYC application form.
+///
+/// Several esigns can exist for one request: `redirectUrl` may be reused, but
+/// a fresh esign is the safe answer to an abandoned attempt.
+model Esign {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  kycRequestId String     @db.Uuid
+  kycRequest   KycRequest @relation(fields: [kycRequestId], references: [id], onDelete: Cascade)
+
+  type        String?     @db.VarChar(30)
+  status      EsignStatus @default(PENDING)
+  redirectUrl String?     @db.VarChar(1000)
+  postbackUrl String?     @db.VarChar(1000)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  @@index([kycRequestId])
+  @@index([status])
+  @@map("esigns")
+}
+
+// ===========================================================================
+// Investor profile and its children
+// ===========================================================================
+
+/// POST /v2/investor_profiles — the investor's demographic record in FP.
+///
+/// PAN is indexed but NOT unique: FP lists profiles by PAN, so one PAN can
+/// carry several profiles (an individual and, later, the same person as
+/// guardian on a minor's profile). Several fields are write-once in FP —
+/// `taxStatus`, `dateOfBirth`, `pan`, `countryOfBirth` — and the service layer
+/// must refuse to PATCH them rather than let FP reject the call.
+model InvestorProfile {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  type      InvestorProfileType @default(INDIVIDUAL)
+  taxStatus TaxStatus?
+
+  name          String?        @db.VarChar(70)
+  dateOfBirth   DateTime?      @db.Date
+  gender        Gender?
+  maritalStatus MaritalStatus?
+  occupation    Occupation?
+  /// Full PAN — required by FP and the folio join key. See KycCheck.pan.
+  pan           String?        @db.VarChar(10)
+
+  // --- KRA demographics --------------------------------------------------
+  // Undocumented on FP's investor_profile but real: it returns AND accepts all
+  // of these, and they are write-once ("father_name is already set and cannot
+  // be modified"). Verified against the sandbox. They matter most on a tenant
+  // where the KYC-check API is not provisioned, because then the profile is the
+  // only place this data exists — and it can only be captured at create time.
+  /// Last 4 digits only, which is all FP holds.
+  aadhaarLast4         String?  @db.VarChar(4)
+  fatherName           String?  @db.VarChar(70)
+  motherName           String?  @db.VarChar(70)
+  citizenshipCountries String[] @db.VarChar(2)
+
+  // --- Guardian (minor subdomain) ----------------------------------------
+  // FP accepts these only while the investor is under 18. Present now so the
+  // minor journey needs no migration.
+  guardianName        String?   @db.VarChar(80)
+  guardianDateOfBirth DateTime? @db.Date
+  guardianPan         String?   @db.VarChar(10)
+
+  // --- Birth, nationality, wealth ----------------------------------------
+  /// ANSI 2-letter country codes throughout.
+  countryOfBirth     String?         @db.VarChar(2)
+  placeOfBirth       String?         @db.VarChar(120)
+  nationalityCountry String?         @db.VarChar(2)
+  /// For a minor this holds the GUARDIAN's source of wealth and income slab,
+  /// per FP's rule for the minor tax statuses.
+  sourceOfWealth     SourceOfWealth?
+  incomeSlab         IncomeSlab?
+  pepDetails         PepDetails?
+
+  signatureFileId String? @db.Uuid
+  signatureFile   FpFile? @relation("ProfileSignature", fields: [signatureFileId], references: [id], onDelete: SetNull)
+
+  /// FP beta: the investor profile id of the investor's employer.
+  employerProfileId String?           @db.Uuid
+  employerProfile   InvestorProfile?  @relation("ProfileEmployer", fields: [employerProfileId], references: [id], onDelete: SetNull)
+  employees         InvestorProfile[] @relation("ProfileEmployer")
+
+  /// IP the profile was created from. FP stores it for audit; so do we.
+  ipAddress String? @db.VarChar(45)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  onboarding       InvestorOnboarding?
+  userLinks        UserInvestorProfile[]
+  taxResidencies   TaxResidency[]
+  addresses        Address[]
+  phoneNumbers     PhoneNumber[]
+  emailAddresses   EmailAddress[]
+  bankAccounts     BankAccount[]
+  relatedParties   RelatedParty[]
+  dematAccounts    DematAccount[]
+  kycChecks        KycCheck[]
+  kycRequests      KycRequest[]
+  kycForms         KycForm[]
+  preVerifications PreVerification[]
+
+  primaryFor MfInvestmentAccount[] @relation("PrimaryInvestor")
+  secondFor  MfInvestmentAccount[] @relation("SecondInvestor")
+  thirdFor   MfInvestmentAccount[] @relation("ThirdInvestor")
+
+  @@index([pan])
+  @@index([type])
+  @@index([createdAt])
+  @@map("investor_profiles")
+}
+
+/// investor_profile.first_tax_residency .. fourth_tax_residency, normalised.
+///
+/// At least one is mandatory to submit FATCA, whatever the tax status. FP can
+/// default slot 1 to India + PAN via `use_default_tax_residences`, which is an
+/// input flag only and so has no column here.
+model TaxResidency {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  /// 1-4, matching FP's first_/second_/third_/fourth_ fields.
+  slot           Int
+  country        String    @db.VarChar(2)
+  taxIdType      TaxIdType
+  taxIdNumber    String    @db.VarChar(60)
+  /// FP takes 2099-12-31 for "no end date known".
+  applicableFrom DateTime? @db.Date
+  applicableTo   DateTime? @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([investorProfileId, slot])
+  @@map("tax_residencies")
+}
+
+/// POST /v2/addresses. Write-once in FP: every field is immutable once set,
+/// so a correction means a new address object.
+///
+/// For country = IN, FP derives city and state from the postal code.
+model Address {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  line1      String         @db.VarChar(255)
+  line2      String?        @db.VarChar(255)
+  line3      String?        @db.VarChar(255)
+  city       String?        @db.VarChar(100)
+  state      String?        @db.VarChar(100)
+  postalCode String         @db.VarChar(10)
+  country    String         @db.VarChar(2)
+  nature     AddressNature?
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  communicationFor         MfFolioDefaults[] @relation("CommunicationAddress")
+  overseasCommunicationFor MfFolioDefaults[] @relation("OverseasCommunicationAddress")
+
+  @@index([investorProfileId])
+  @@map("addresses")
+}
+
+/// POST /v2/phone_numbers. Write-once in FP apart from `belongsTo`.
+model PhoneNumber {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  /// ISD code, with or without a leading "+". Max 4 chars including the sign.
+  isd       String            @db.VarChar(4)
+  number    String            @db.VarChar(20)
+  belongsTo ContactBelongsTo?
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  communicationFor MfFolioDefaults[]
+
+  @@index([investorProfileId])
+  @@map("phone_numbers")
+}
+
+/// POST /v2/email_addresses. Write-once in FP apart from `belongsTo`.
+model EmailAddress {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  email     String            @db.VarChar(255)
+  belongsTo ContactBelongsTo?
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  communicationFor MfFolioDefaults[]
+
+  @@index([investorProfileId])
+  @@map("email_addresses")
+}
+
+/// POST /v2/bank_accounts.
+///
+/// The full account number is deliberately NOT stored. FP validates and holds
+/// it; downstream (Mandates, Payments) addresses the account by `fpOldId`. We
+/// keep the last four digits to render it and a fingerprint to answer "is this
+/// account already linked?" without holding the number itself.
+model BankAccount {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  /// FP's numeric id. Mandates and Payments accept only this — not `fpId`.
+  fpOldId Int?   @unique
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  primaryAccountHolderName String          @db.VarChar(150)
+  accountNumberLast4       String          @db.VarChar(4)
+  /// SHA-256 of the normalised account number + IFSC. Lets us dedupe and
+  /// recognise a re-entered account without persisting the number.
+  accountNumberFingerprint String          @db.VarChar(64)
+  type                     BankAccountType
+  ifscCode                 String          @db.VarChar(11)
+
+  // Branch details, resolved by FP from the IFSC.
+  bankName            String? @db.VarChar(150)
+  branchName          String? @db.VarChar(150)
+  branchAddress       String? @db.VarChar(300)
+  branchCity          String? @db.VarChar(100)
+  branchDistrict      String? @db.VarChar(100)
+  branchState         String? @db.VarChar(100)
+  branchContactNumber String? @db.VarChar(30)
+
+  cancelledChequeFileId String? @db.Uuid
+  cancelledChequeFile   FpFile? @relation(fields: [cancelledChequeFileId], references: [id], onDelete: SetNull)
+
+  // --- Bank account verification (penny-drop) ------------------------------
+  // Not cosmetic on the cybrillapoa gateway: an order whose payout account is
+  // unverified is accepted, paid for, confirmed — and then fails at submission
+  // with `payout_account_verification_pending`. Verify during onboarding.
+  /// FP's `bav_…` id, when a verification has been requested.
+  verificationFpId       String?        @unique @db.VarChar(64)
+  verificationStatus     BavStatus?
+  /// How sure FP is the account belongs to this investor. Only VERY_HIGH and
+  /// HIGH should be treated as usable.
+  verificationConfidence BavConfidence?
+  verificationReason     String?        @db.VarChar(60)
+  verifiedAt             DateTime?
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  mandates  Mandate[]
+  payments  Payment[]
+  payoutFor MfFolioDefaults[]
+
+  @@unique([investorProfileId, accountNumberFingerprint])
+  @@index([investorProfileId])
+  @@map("bank_accounts")
+}
+
+/// POST /v2/related_parties — a person related to the investor, used for
+/// nominations. Write-once in FP: a non-mandatory field can be added later but
+/// never changed afterwards.
+///
+/// A nominee only becomes a nominee when referenced from
+/// MfInvestmentAccountNominee; this record just describes the person.
+model RelatedParty {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  name         String                   @db.VarChar(40)
+  relationship RelatedPartyRelationship
+  dateOfBirth  DateTime?                @db.Date
+  /// FP accepts a PAN only if the party is 18 or older.
+  pan          String?                  @db.VarChar(10)
+
+  /// Guardian identity, required when the party is a minor. Their contact
+  /// details live in RelatedPartyContact with subject = GUARDIAN.
+  guardianName String? @db.VarChar(35)
+  guardianPan  String? @db.VarChar(10)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  contacts   RelatedPartyContact[]
+  nomineeFor MfInvestmentAccountNominee[]
+
+  @@index([investorProfileId])
+  @@map("related_parties")
+}
+
+/// The identity-proof and contact block of a related party, or of that party's
+/// guardian when the party is a minor.
+///
+/// FP repeats the same six fields twice on related_party, once bare and once
+/// `guardian_`-prefixed. One table keyed by `subject` models both without
+/// duplicating a dozen columns, and makes the minor case a row rather than a
+/// migration. FP requires at least one identity proof here before a new folio
+/// can be created.
+model RelatedPartyContact {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  relatedPartyId String       @db.Uuid
+  relatedParty   RelatedParty @relation(fields: [relatedPartyId], references: [id], onDelete: Cascade)
+
+  subject RelatedPartyContactSubject
+
+  /// Last 4 digits only — all FP accepts.
+  aadhaarLast4         String? @db.VarChar(4)
+  passportNumber       String? @db.VarChar(30)
+  drivingLicenceNumber String? @db.VarChar(30)
+  emailAddress         String? @db.VarChar(255)
+  phoneIsd             String? @db.VarChar(4)
+  phoneNumber          String? @db.VarChar(20)
+
+  line1      String? @db.VarChar(255)
+  line2      String? @db.VarChar(255)
+  line3      String? @db.VarChar(255)
+  city       String? @db.VarChar(100)
+  state      String? @db.VarChar(100)
+  postalCode String? @db.VarChar(10)
+  country    String? @db.VarChar(2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([relatedPartyId, subject])
+  @@map("related_party_contacts")
+}
+
+/// POST /v2/demat_accounts. FP does not create the demat account; this links
+/// an existing one so folios opened against it are held in demat mode.
+model DematAccount {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  dpId     String @db.VarChar(20)
+  clientId String @db.VarChar(20)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  folioDefaults MfFolioDefaults[]
+
+  @@unique([investorProfileId, dpId, clientId])
+  @@index([investorProfileId])
+  @@map("demat_accounts")
+}
+
+// ===========================================================================
+// Distributor / partner — the seam for the agent subdomain
+// ===========================================================================
+
+/// A sub-broker an order can be attributed to (FP `ptnr_…`).
+///
+/// Orders already carry `partnerId` and `euin`, so attribution works before
+/// the agent subdomain exists. That subdomain adds agent logins, hierarchy and
+/// commissions around this record — not inside the order tables.
+model Partner {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  name     String  @db.VarChar(200)
+  /// AMFI registration number of the distributor.
+  arn      String? @db.VarChar(20)
+  /// Default EUIN for orders routed through this partner.
+  euin     String? @db.VarChar(10)
+  isActive Boolean @default(true)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  investmentAccounts MfInvestmentAccount[]
+  purchases          MfPurchase[]
+  redemptions        MfRedemption[]
+  switches           MfSwitch[]
+  purchasePlans      MfPurchasePlan[]
+  redemptionPlans    MfRedemptionPlan[]
+  switchPlans        MfSwitchPlan[]
+
+  @@index([isActive])
+  @@map("partners")
+}
+
+// ===========================================================================
+// Scheme catalogue
+// ===========================================================================
+
+/// An asset management company. Synced from GET /api/oms/amcs.
+model MfAmc {
+  id      String @id @default(uuid(7)) @db.Uuid
+  /// FP's numeric AMC id, used by the fund_schemes filters. Note
+  /// GET /api/oms/amcs returns it as `amc_id`, not `id` as the reference
+  /// implies — verified against the sandbox.
+  fpAmcId Int?   @unique
+
+  name     String  @unique @db.VarChar(200)
+  code     String? @unique @db.VarChar(20)
+  logoUrl  String? @db.VarChar(500)
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  schemes MfScheme[]
+
+  @@index([isActive])
+  @@map("mf_amcs")
+}
+
+/// One tradeable scheme plan, identified by ISIN.
+///
+/// ISIN is the wire identifier everywhere in FP's order APIs, which is why it
+/// carries a unique constraint and orders reference it directly. The threshold
+/// columns are not decoration: FP rejects an order whose amount falls outside
+/// them, so validate locally first and save the round trip.
+///
+/// One vocabulary wrinkle: the v1 catalogue (GET /api/oms/fund_schemes) shouts
+/// its enums — "EQUITY", "REGULAR", "GROWTH", "DEMAT_PHYSICAL" — while the v2
+/// object APIs use lower case. These columns follow v2, so the catalogue sync
+/// lower-cases on ingest. That is the one place in this schema where the
+/// stored value is not byte-identical to the payload it came from.
+model MfScheme {
+  id         String @id @default(uuid(7)) @db.Uuid
+  isin       String @unique @db.VarChar(12)
+  /// FP's numeric fund_scheme_id.
+  fpSchemeId Int?   @unique
+
+  amcId String @db.Uuid
+  amc   MfAmc  @relation(fields: [amcId], references: [id], onDelete: Restrict)
+
+  name       String  @db.VarChar(250)
+  /// RTA's short code for the scheme, as it appears in folio payout details.
+  schemeCode String? @db.VarChar(20)
+  amfiCode   String? @db.VarChar(20)
+  fpRtaId    Int?
+
+  category         SchemeCategory
+  planType         SchemePlanType
+  investmentOption SchemeInvestmentOption
+  subCategory      String?                @db.VarChar(120)
+  deliveryMode     SchemeDeliveryMode?
+
+  isActive           Boolean @default(true)
+  closeEnded         Boolean @default(false)
+  /// FP reports lock-in as a flag plus a period; keep both.
+  lockIn             Boolean @default(false)
+  lockInPeriodDays   Int?
+  longTermPeriodDays Int?
+
+  purchaseAllowed          Boolean @default(true)
+  redemptionAllowed        Boolean @default(true)
+  instantRedemptionAllowed Boolean @default(false)
+  switchInAllowed          Boolean @default(false)
+  switchOutAllowed         Boolean @default(false)
+  sipAllowed               Boolean @default(false)
+  swpAllowed               Boolean @default(false)
+  stpInAllowed             Boolean @default(false)
+  stpOutAllowed            Boolean @default(false)
+
+  // Lumpsum limits. Fresh purchases are bounded by the initial values,
+  // purchases into an existing folio by the additional ones.
+  minInitialInvestment          Decimal? @db.Decimal(18, 2)
+  maxInitialInvestment          Decimal? @db.Decimal(18, 2)
+  initialInvestmentMultiples    Decimal? @db.Decimal(18, 2)
+  minAdditionalInvestment       Decimal? @db.Decimal(18, 2)
+  maxAdditionalInvestment       Decimal? @db.Decimal(18, 2)
+  additionalInvestmentMultiples Decimal? @db.Decimal(18, 2)
+
+  // Redemption limits, by amount or by units. The multiples go to 4dp because
+  // FP reports 0.001 for index funds.
+  minWithdrawalAmount     Decimal? @db.Decimal(18, 4)
+  maxWithdrawalAmount     Decimal? @db.Decimal(18, 2)
+  withdrawalMultiples     Decimal? @db.Decimal(18, 4)
+  minWithdrawalUnits      Decimal? @db.Decimal(18, 4)
+  maxWithdrawalUnits      Decimal? @db.Decimal(18, 4)
+  withdrawalUnitMultiples Decimal? @db.Decimal(18, 4)
+
+  /// Instant redemption limits, set only where insta_redemption_allowed.
+  minInstantWithdrawalAmount Decimal? @db.Decimal(18, 4)
+  instantWithdrawalMultiples Decimal? @db.Decimal(18, 4)
+
+  // Switch limits. FP leaves the maximums null on many schemes.
+  minSwitchInAmount        Decimal? @db.Decimal(18, 4)
+  maxSwitchInAmount        Decimal? @db.Decimal(18, 2)
+  switchInAmountMultiples  Decimal? @db.Decimal(18, 4)
+  minSwitchOutAmount       Decimal? @db.Decimal(18, 4)
+  maxSwitchOutAmount       Decimal? @db.Decimal(18, 2)
+  switchOutAmountMultiples Decimal? @db.Decimal(18, 4)
+  minSwitchOutUnits        Decimal? @db.Decimal(18, 4)
+  maxSwitchOutUnits        Decimal? @db.Decimal(18, 4)
+  switchOutUnitMultiples   Decimal? @db.Decimal(18, 4)
+
+  merged       Boolean   @default(false)
+  mergedToIsin String?   @db.VarChar(12)
+  mergerDate   DateTime? @db.Date
+
+  expenseRatio Decimal? @db.Decimal(6, 4)
+  exitLoadPct  Decimal? @db.Decimal(6, 4)
+
+  /// Denormalised copy of the newest NavHistory row, so a scheme list does not
+  /// need a correlated subquery per row. NavHistory stays the source of truth.
+  latestNav     Decimal?  @db.Decimal(12, 4)
+  latestNavDate DateTime? @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  navHistory    NavHistory[]
+  thresholds    MfSchemeThreshold[]
+  watchlistedBy WatchlistItem[]
+
+  purchases       MfPurchase[]
+  redemptions     MfRedemption[]
+  switchesOut     MfSwitch[]         @relation("SwitchOutScheme")
+  switchesIn      MfSwitch[]         @relation("SwitchInScheme")
+  purchasePlans   MfPurchasePlan[]
+  redemptionPlans MfRedemptionPlan[]
+  switchPlansOut  MfSwitchPlan[]     @relation("SwitchPlanOutScheme")
+  switchPlansIn   MfSwitchPlan[]     @relation("SwitchPlanInScheme")
+
+  @@index([amcId])
+  @@index([category, isActive])
+  @@index([planType, investmentOption])
+  @@index([isActive, sipAllowed])
+  @@map("mf_schemes")
+}
+
+/// Per-frequency limits for a scheme, from FP's *_frequency_specific_data.
+///
+/// A separate table because the limits are a matrix — SIP monthly and SIP
+/// quarterly have different minimums and different permitted dates — and
+/// flattening it into MfScheme would mean a column per combination.
+model MfSchemeThreshold {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  schemeId String   @db.Uuid
+  scheme   MfScheme @relation(fields: [schemeId], references: [id], onDelete: Cascade)
+
+  type      SchemeThresholdType
+  /// NOT_APPLICABLE for the one-off types (LUMPSUM, ADDITIONAL, WITHDRAWAL,
+  /// SWITCH_IN, SWITCH_OUT); a real cadence for SIP, SWP and STP.
+  frequency SchemeThresholdFrequency @default(NOT_APPLICABLE)
+
+  amountMin       Decimal? @db.Decimal(18, 2)
+  amountMax       Decimal? @db.Decimal(18, 2)
+  amountMultiples Decimal? @db.Decimal(18, 2)
+  unitsMin        Decimal? @db.Decimal(18, 4)
+  unitsMax        Decimal? @db.Decimal(18, 4)
+  unitsMultiples  Decimal? @db.Decimal(18, 4)
+  installmentsMin Int?
+  /// Days of the month the AMC permits an installment on. Empty for DAILY.
+  allowedDates    Int[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@unique([schemeId, type, frequency])
+  @@map("mf_scheme_thresholds")
+}
+
+/// One NAV per scheme per day. The source of truth behind MfScheme.latestNav.
+model NavHistory {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  schemeId String   @db.Uuid
+  scheme   MfScheme @relation(fields: [schemeId], references: [id], onDelete: Cascade)
+
+  navDate DateTime @db.Date
+  nav     Decimal  @db.Decimal(12, 4)
+
+  createdAt DateTime @default(now())
+
+  /// One NAV per scheme per day; makes the daily import idempotent via upsert.
+  @@unique([schemeId, navDate])
+  @@index([navDate])
+  @@map("nav_history")
+}
+
+/// Ours, not FP's — a scheme the investor is watching.
+model WatchlistItem {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  schemeId String   @db.Uuid
+  scheme   MfScheme @relation(fields: [schemeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, schemeId])
+  @@index([userId])
+  @@map("watchlist_items")
+}
+
+// ===========================================================================
+// MF investment account
+// ===========================================================================
+
+/// POST /v2/mf_investment_accounts — the container every order and folio hangs
+/// off. No investment account, no orders.
+///
+/// Holders are three explicit slots because that is how FP models them, and
+/// because the RTAs group folios by (PANs, holding pattern). Only the primary
+/// is set today; second and third are the joint subdomain, already typed.
+///
+/// `fpOldId` is not decoration — the holdings report addresses the account by
+/// that integer.
+model MfInvestmentAccount {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  fpOldId Int?   @unique
+
+  primaryInvestorProfileId String          @db.Uuid
+  primaryInvestorProfile   InvestorProfile @relation("PrimaryInvestor", fields: [primaryInvestorProfileId], references: [id], onDelete: Restrict)
+
+  // Joint subdomain: FP already accepts these, we simply do not populate them.
+  secondInvestorProfileId String?          @db.Uuid
+  secondInvestorProfile   InvestorProfile? @relation("SecondInvestor", fields: [secondInvestorProfileId], references: [id], onDelete: Restrict)
+  thirdInvestorProfileId  String?          @db.Uuid
+  thirdInvestorProfile    InvestorProfile? @relation("ThirdInvestor", fields: [thirdInvestorProfileId], references: [id], onDelete: Restrict)
+
+  /// Denormalised from FP's response. Kept because folio migration matches on
+  /// PAN before any profile exists to point at.
+  primaryInvestorPan String? @db.VarChar(10)
+  secondInvestorPan  String? @db.VarChar(10)
+  thirdInvestorPan   String? @db.VarChar(10)
+
+  holdingPattern HoldingPattern @default(SINGLE)
+
+  /// Agent subdomain: which distributor services this account.
+  servicingPartnerId String?  @db.Uuid
+  servicingPartner   Partner? @relation(fields: [servicingPartnerId], references: [id], onDelete: SetNull)
+
+  fpCreatedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncedAt    DateTime  @default(now())
+
+  folioDefaults   MfFolioDefaults?
+  nominees        MfInvestmentAccountNominee[]
+  folios          MfFolio[]
+  holdings        MfHolding[]
+  purchases       MfPurchase[]
+  redemptions     MfRedemption[]
+  switches        MfSwitch[]
+  purchasePlans   MfPurchasePlan[]
+  redemptionPlans MfRedemptionPlan[]
+  switchPlans     MfSwitchPlan[]
+
+  @@index([primaryInvestorProfileId])
+  @@index([primaryInvestorPan])
+  @@index([holdingPattern])
+  @@map("mf_investment_accounts")
+}
+
+/// FP's `folio_defaults` hash: which of the investor's several addresses, phone
+/// numbers, emails and bank accounts to stamp onto a new folio.
+///
+/// A 1:1 table rather than fifteen columns on the account, because that is the
+/// shape FP sends and because these defaults must be set before the first
+/// order — a distinct row makes "not configured yet" unambiguous.
+///
+/// FP only honours folio defaults when the account was created from an
+/// investor profile id, not from a legacy investor id.
+model MfFolioDefaults {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  mfInvestmentAccountId String              @unique @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Cascade)
+
+  communicationEmailAddressId String?       @db.Uuid
+  communicationEmailAddress   EmailAddress? @relation(fields: [communicationEmailAddressId], references: [id], onDelete: SetNull)
+
+  communicationPhoneNumberId String?      @db.Uuid
+  communicationPhoneNumber   PhoneNumber? @relation(fields: [communicationPhoneNumberId], references: [id], onDelete: SetNull)
+
+  communicationAddressId String?  @db.Uuid
+  communicationAddress   Address? @relation("CommunicationAddress", fields: [communicationAddressId], references: [id], onDelete: SetNull)
+
+  overseasCommunicationAddressId String?  @db.Uuid
+  overseasCommunicationAddress   Address? @relation("OverseasCommunicationAddress", fields: [overseasCommunicationAddressId], references: [id], onDelete: SetNull)
+
+  /// Where redemption proceeds and dividends land.
+  payoutBankAccountId String?      @db.Uuid
+  payoutBankAccount   BankAccount? @relation(fields: [payoutBankAccountId], references: [id], onDelete: SetNull)
+
+  /// Set this and new folios are held in demat mode; leave it null for
+  /// physical mode.
+  dematAccountId String?       @db.Uuid
+  dematAccount   DematAccount? @relation(fields: [dematAccountId], references: [id], onDelete: SetNull)
+
+  /// Whether the statement of account shows nominee names or just the status.
+  nominationsInfoVisibility NominationsInfoVisibility?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@map("mf_folio_defaults")
+}
+
+/// One of the up-to-three nominees in an account's folio defaults.
+///
+/// A row per slot instead of nominee1_*, nominee2_*, nominee3_* columns:
+/// the allocation percentages have to sum to 100, which is a query over rows,
+/// not a comparison of columns. FP requires a proof type for an adult nominee
+/// and a guardian proof type for a minor one; the matching number lives on the
+/// related party.
+model MfInvestmentAccountNominee {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Cascade)
+
+  /// 1-3, matching FP's nominee1 / nominee2 / nominee3.
+  slot Int
+
+  relatedPartyId String       @db.Uuid
+  relatedParty   RelatedParty @relation(fields: [relatedPartyId], references: [id], onDelete: Restrict)
+
+  allocationPercentage Decimal @db.Decimal(5, 2)
+
+  identityProofType         IdentityProofType?
+  guardianIdentityProofType IdentityProofType?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@unique([mfInvestmentAccountId, slot])
+  /// FP rejects duplicate nominee names on one folio.
+  @@unique([mfInvestmentAccountId, relatedPartyId])
+  @@map("mf_investment_account_nominees")
+}
+
+// ===========================================================================
+// Folios and holdings
+// ===========================================================================
+
+/// A folio at the AMC. Read-only from our side: folios are created by the AMC
+/// when a fresh purchase succeeds, or arrive through FP's folio migration of
+/// RTA reporting files.
+///
+/// The holder columns are flattened copies of what the RTA reports, not
+/// pointers into our profile tables — a migrated folio can name a holder we
+/// have no profile for.
+model MfFolio {
+  id   String  @id @default(uuid(7)) @db.Uuid
+  fpId String? @unique @db.VarChar(64)
+
+  number  String  @db.VarChar(30)
+  /// FP's AMC code as reported on the folio.
+  amcCode String? @db.VarChar(20)
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Cascade)
+
+  holdingPattern HoldingPattern?
+
+  // Demat details, when the folio is held in demat mode.
+  dpId     String? @db.VarChar(20)
+  clientId String? @db.VarChar(20)
+
+  // Holders as reported by the RTA.
+  primaryInvestorName     String?   @db.VarChar(150)
+  primaryInvestorPan      String?   @db.VarChar(10)
+  primaryInvestorDob      DateTime? @db.Date
+  primaryInvestorGender   String?   @db.VarChar(20)
+  secondaryInvestorName   String?   @db.VarChar(150)
+  secondaryInvestorPan    String?   @db.VarChar(10)
+  secondaryInvestorDob    DateTime? @db.Date
+  secondaryInvestorGender String?   @db.VarChar(20)
+  thirdInvestorName       String?   @db.VarChar(150)
+  thirdInvestorPan        String?   @db.VarChar(10)
+  thirdInvestorDob        DateTime? @db.Date
+  thirdInvestorGender     String?   @db.VarChar(20)
+
+  /// The RTA's own tax-status and occupation vocabularies differ from the
+  /// investor-profile enums (it reports "individual", "on_behalf_of_minor"),
+  /// so these stay strings rather than being force-fitted.
+  primaryInvestorTaxStatus  String? @db.VarChar(60)
+  primaryInvestorOccupation String? @db.VarChar(60)
+
+  // Guardian, present only on a minor's folio.
+  guardianName         String?   @db.VarChar(150)
+  guardianPan          String?   @db.VarChar(10)
+  guardianDob          DateTime? @db.Date
+  guardianGender       String?   @db.VarChar(20)
+  guardianRelationship String?   @db.VarChar(60)
+
+  /// Contacts registered against the folio at the AMC. These decide where the
+  /// 2FA consent OTP for an order on this folio must be sent.
+  emailAddresses String[] @db.VarChar(255)
+  mobileNumbers  String[] @db.VarChar(20)
+
+  /// FP lets us stash up to 5 key/value pairs against a folio.
+  annexure Json? @db.JsonB
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  nominees      MfFolioNominee[]
+  payoutDetails MfFolioSchemePayout[]
+  holdings      MfHolding[]
+  purchases     MfPurchase[]
+  redemptions   MfRedemption[]
+  switches      MfSwitch[]
+
+  @@unique([mfInvestmentAccountId, number])
+  @@index([number])
+  @@index([primaryInvestorPan])
+  @@map("mf_folios")
+}
+
+/// Nominee as registered on the folio at the AMC.
+///
+/// Distinct from MfInvestmentAccountNominee: that is what we asked for, this is
+/// what the AMC recorded. Comparing the two is how nomination mismatches get
+/// found.
+model MfFolioNominee {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  mfFolioId String  @db.Uuid
+  mfFolio   MfFolio @relation(fields: [mfFolioId], references: [id], onDelete: Cascade)
+
+  /// 1-3.
+  slot                 Int
+  name                 String?   @db.VarChar(150)
+  dateOfBirth          DateTime? @db.Date
+  relationship         String?   @db.VarChar(60)
+  guardianName         String?   @db.VarChar(150)
+  guardianRelationship String?   @db.VarChar(60)
+  allocationPercentage Decimal?  @db.Decimal(5, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@unique([mfFolioId, slot])
+  @@map("mf_folio_nominees")
+}
+
+/// Payout bank account configured per scheme within a folio.
+///
+/// `schemeIsin` is intentionally not a foreign key: a migrated folio can hold
+/// a scheme the catalogue sync has not reached yet, and dropping the payout row
+/// would be worse than lacking the constraint. Join on MfScheme.isin.
+model MfFolioSchemePayout {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  mfFolioId String  @db.Uuid
+  mfFolio   MfFolio @relation(fields: [mfFolioId], references: [id], onDelete: Cascade)
+
+  schemeIsin String  @db.VarChar(12)
+  schemeCode String? @db.VarChar(20)
+
+  bankAccountName         String?          @db.VarChar(150)
+  /// As reported by the RTA — already masked at source ("SB 8132").
+  bankAccountNumberMasked String?          @db.VarChar(40)
+  bankAccountType         BankAccountType?
+  bankIfsc                String?          @db.VarChar(11)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@unique([mfFolioId, schemeIsin])
+  @@index([schemeIsin])
+  @@map("mf_folio_scheme_payouts")
+}
+
+/// Current position per (folio, scheme), from FP's holdings report.
+///
+/// A projection, not a ledger: FP recomputes it from RTA feeds and we overwrite
+/// it wholesale. Never derive units by adding up our own order rows — allotment
+/// happens at the AMC, after stamp duty, and only the report is authoritative.
+/// Every figure carries its own as-on date because units, market value and NAV
+/// are as of different days.
+model MfHolding {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Cascade)
+
+  mfFolioId   String?  @db.Uuid
+  mfFolio     MfFolio? @relation(fields: [mfFolioId], references: [id], onDelete: SetNull)
+  folioNumber String   @db.VarChar(30)
+
+  /// Not a foreign key, for the same reason as MfFolioSchemePayout.schemeIsin.
+  schemeIsin String  @db.VarChar(12)
+  schemeName String? @db.VarChar(250)
+
+  units           Decimal   @db.Decimal(18, 4)
+  /// Units free of lock-in and pending orders — what can actually be redeemed.
+  redeemableUnits Decimal?  @db.Decimal(18, 4)
+  unitsAsOn       DateTime? @db.Date
+
+  marketValue           Decimal?  @db.Decimal(18, 2)
+  redeemableMarketValue Decimal?  @db.Decimal(18, 2)
+  marketValueAsOn       DateTime? @db.Date
+
+  investedValue     Decimal?  @db.Decimal(18, 2)
+  investedValueAsOn DateTime? @db.Date
+
+  /// Dividends already paid out on this position.
+  payoutAmount Decimal?  @db.Decimal(18, 2)
+  payoutAsOn   DateTime? @db.Date
+
+  nav     Decimal?  @db.Decimal(12, 4)
+  navAsOn DateTime? @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@unique([mfInvestmentAccountId, folioNumber, schemeIsin])
+  @@index([mfInvestmentAccountId])
+  @@index([schemeIsin])
+  @@map("mf_holdings")
+}
+
+// ===========================================================================
+// Orders
+//
+// Three tables rather than one polymorphic `orders`, mirroring FP's three
+// objects. They share a lifecycle (MfOrderState) but not their results: a
+// purchase allots units, a redemption releases them, a switch does both across
+// two schemes. Separate tables keep every column non-null-by-accident and let
+// each row read like the FP payload it came from.
+//
+// `sourceRefId` is our idempotency key. FP requires it to be unique across all
+// three order types, so generate a UUID and never reuse one — a retried create
+// with the same value is rejected by FP instead of placing a second order.
+// ===========================================================================
+
+/// POST /v2/mf_purchases — lumpsum purchase, or an installment of a purchase
+/// plan when `plan` is set.
+///
+/// RTA flow: created PENDING -> 2FA consent captured -> payment (or a reported
+/// settlement) -> CONFIRMED -> submitted to the RTA. `allottedUnits`,
+/// `purchasedAmount` and `purchasedPrice` stay null until the order succeeds:
+/// units are allotted at the applicable cut-off NAV, net of stamp duty.
+model MfPurchase {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  /// The Payments API takes this integer as an `amc_order_ids` entry.
+  fpOldId Int?   @unique
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  schemeIsin String   @db.VarChar(12)
+  scheme     MfScheme @relation(fields: [schemeIsin], references: [isin], onDelete: Restrict)
+
+  /// Null on a fresh purchase until the AMC creates the folio.
+  folioNumber String?  @db.VarChar(30)
+  mfFolioId   String?  @db.Uuid
+  mfFolio     MfFolio? @relation(fields: [mfFolioId], references: [id], onDelete: SetNull)
+
+  planId String?         @db.Uuid
+  plan   MfPurchasePlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+
+  type    MfPurchaseType?
+  state   MfOrderState    @default(PENDING)
+  gateway OrderGateway    @default(RTA)
+
+  amount Decimal @db.Decimal(18, 2)
+
+  // Allotment, filled in once the gateway processes the order.
+  allottedUnits   Decimal?  @db.Decimal(18, 4)
+  purchasedAmount Decimal?  @db.Decimal(18, 2)
+  purchasedPrice  Decimal?  @db.Decimal(12, 4)
+  allottedNavDate DateTime? @db.Date
+
+  /// Our idempotency key, unique across all order types in FP.
+  sourceRefId String? @unique @db.VarChar(64)
+
+  /// IP of the investor's device, and of our server. Both are reported to the
+  /// RTA, so they are audit data, not diagnostics.
+  userIp   String? @db.VarChar(45)
+  serverIp String? @db.VarChar(45)
+
+  euin      String?  @db.VarChar(10)
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  initiatedBy  OrderInitiatedBy?
+  initiatedVia OrderInitiatedVia?
+
+  /// SEBI-mandated 2FA. The OTP goes to the contact registered on the folio,
+  /// or to the account's folio defaults for a fresh purchase, and is verified
+  /// through PhoneVerification before these are sent to FP. Write-once.
+  consentEmail   String?   @db.VarChar(255)
+  consentIsdCode String?   @db.VarChar(4)
+  consentMobile  String?   @db.VarChar(20)
+  consentAt      DateTime?
+
+  /// FP's codes: payment_failure, order_expiry, order_failure_at_gateway, …
+  failureCode   String? @db.VarChar(60)
+  failureReason String? @db.VarChar(500)
+
+  /// The day the order goes to the gateway. Order expiry counts from here.
+  scheduledOn DateTime? @db.Date
+  tradedOn    DateTime? @db.Date
+
+  fpCreatedAt DateTime?
+  confirmedAt DateTime?
+  submittedAt DateTime?
+  succeededAt DateTime?
+  failedAt    DateTime?
+  retriedAt   DateTime?
+  reversedAt  DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  settlementDetail MfSettlementDetail?
+  payments         PaymentPurchase[]
+  paymentSubmission PaymentSubmission?
+
+  @@index([mfInvestmentAccountId, fpCreatedAt(sort: Desc)])
+  @@index([state, scheduledOn])
+  @@index([schemeIsin])
+  @@index([planId])
+  @@index([folioNumber])
+  @@map("mf_purchases")
+}
+
+/// POST /v2/mf_redemptions.
+///
+/// Exactly one of `amount` and `units` is set. Both null is meaningful and not
+/// a bug: it redeems the entire holding.
+model MfRedemption {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  fpOldId Int?   @unique
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  schemeIsin String   @db.VarChar(12)
+  scheme     MfScheme @relation(fields: [schemeIsin], references: [isin], onDelete: Restrict)
+
+  folioNumber String?  @db.VarChar(30)
+  mfFolioId   String?  @db.Uuid
+  mfFolio     MfFolio? @relation(fields: [mfFolioId], references: [id], onDelete: SetNull)
+
+  planId String?           @db.Uuid
+  plan   MfRedemptionPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+
+  state          MfOrderState   @default(PENDING)
+  gateway        OrderGateway   @default(RTA)
+  redemptionMode RedemptionMode @default(NORMAL)
+
+  /// Requested amount, or requested units — never both, possibly neither.
+  amount Decimal? @db.Decimal(18, 2)
+  units  Decimal? @db.Decimal(18, 4)
+
+  redeemedAmount  Decimal?  @db.Decimal(18, 2)
+  redeemedUnits   Decimal?  @db.Decimal(18, 4)
+  redeemedPrice   Decimal?  @db.Decimal(12, 4)
+  redeemedNavDate DateTime? @db.Date
+
+  /// Populated for INSTANT redemptions only; normal proceeds follow the
+  /// folio's payout mandate.
+  redemptionBankAccountNumber String? @db.VarChar(20)
+  redemptionBankAccountIfsc   String? @db.VarChar(11)
+
+  sourceRefId String? @unique @db.VarChar(64)
+
+  userIp   String? @db.VarChar(45)
+  serverIp String? @db.VarChar(45)
+
+  euin      String?  @db.VarChar(10)
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  initiatedBy  OrderInitiatedBy?
+  initiatedVia OrderInitiatedVia?
+
+  consentEmail   String?   @db.VarChar(255)
+  consentIsdCode String?   @db.VarChar(4)
+  consentMobile  String?   @db.VarChar(20)
+  consentAt      DateTime?
+
+  failureCode   String? @db.VarChar(60)
+  failureReason String? @db.VarChar(500)
+
+  scheduledOn DateTime? @db.Date
+  tradedOn    DateTime? @db.Date
+
+  fpCreatedAt DateTime?
+  confirmedAt DateTime?
+  submittedAt DateTime?
+  succeededAt DateTime?
+  failedAt    DateTime?
+  reversedAt  DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  payoutDetail MfPayoutDetail?
+
+  @@index([mfInvestmentAccountId, fpCreatedAt(sort: Desc)])
+  @@index([state, scheduledOn])
+  @@index([schemeIsin])
+  @@index([planId])
+  @@index([folioNumber])
+  @@map("mf_redemptions")
+}
+
+/// POST /v2/mf_switches — redeem from one scheme and buy into another inside
+/// the same folio. Both legs are reported, at their own NAVs.
+model MfSwitch {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  fpOldId Int?   @unique
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  switchOutSchemeIsin String   @db.VarChar(12)
+  switchOutScheme     MfScheme @relation("SwitchOutScheme", fields: [switchOutSchemeIsin], references: [isin], onDelete: Restrict)
+  switchInSchemeIsin  String   @db.VarChar(12)
+  switchInScheme      MfScheme @relation("SwitchInScheme", fields: [switchInSchemeIsin], references: [isin], onDelete: Restrict)
+
+  folioNumber String?  @db.VarChar(30)
+  mfFolioId   String?  @db.Uuid
+  mfFolio     MfFolio? @relation(fields: [mfFolioId], references: [id], onDelete: SetNull)
+
+  planId String?       @db.Uuid
+  plan   MfSwitchPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+
+  state   MfOrderState @default(PENDING)
+  gateway OrderGateway @default(RTA)
+
+  /// Requested switch-out amount, or units — never both.
+  amount Decimal? @db.Decimal(18, 2)
+  units  Decimal? @db.Decimal(18, 4)
+
+  switchedOutUnits  Decimal? @db.Decimal(18, 4)
+  switchedOutAmount Decimal? @db.Decimal(18, 2)
+  switchedOutPrice  Decimal? @db.Decimal(12, 4)
+  switchedInUnits   Decimal? @db.Decimal(18, 4)
+  switchedInAmount  Decimal? @db.Decimal(18, 2)
+  switchedInPrice   Decimal? @db.Decimal(12, 4)
+
+  sourceRefId String? @unique @db.VarChar(64)
+
+  userIp   String? @db.VarChar(45)
+  serverIp String? @db.VarChar(45)
+
+  euin      String?  @db.VarChar(10)
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  initiatedBy  OrderInitiatedBy?
+  initiatedVia OrderInitiatedVia?
+
+  consentEmail   String?   @db.VarChar(255)
+  consentIsdCode String?   @db.VarChar(4)
+  consentMobile  String?   @db.VarChar(20)
+  consentAt      DateTime?
+
+  failureCode   String? @db.VarChar(60)
+  failureReason String? @db.VarChar(500)
+
+  scheduledOn DateTime? @db.Date
+  tradedOn    DateTime? @db.Date
+
+  fpCreatedAt DateTime?
+  confirmedAt DateTime?
+  submittedAt DateTime?
+  succeededAt DateTime?
+  failedAt    DateTime?
+  reversedAt  DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@index([mfInvestmentAccountId, fpCreatedAt(sort: Desc)])
+  @@index([state, scheduledOn])
+  @@index([switchOutSchemeIsin])
+  @@index([switchInSchemeIsin])
+  @@index([planId])
+  @@map("mf_switches")
+}
+
+// ===========================================================================
+// Transaction plans (SIP / SWP / STP)
+//
+// `systematic` is the switch that decides what the plan actually is. True
+// registers it with the RTA as a real SIP/SWP/STP; false makes FP generate
+// individual lumpsum orders on a schedule, which then need per-installment
+// consent. The two behave differently and are validated against different
+// scheme thresholds.
+// ===========================================================================
+
+/// POST /v2/mf_purchase_plans — a SIP when `systematic`, otherwise a scheduled
+/// series of lumpsum purchases.
+model MfPurchasePlan {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  fpOldId Int?   @unique
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  schemeIsin String   @db.VarChar(12)
+  scheme     MfScheme @relation(fields: [schemeIsin], references: [isin], onDelete: Restrict)
+
+  folioNumber String? @db.VarChar(30)
+
+  amount         Decimal       @db.Decimal(18, 2)
+  systematic     Boolean       @default(true)
+  frequency      PlanFrequency
+  /// Null for DAILY. 1-5 for the weekly/fortnightly cadences, 1-28 otherwise.
+  installmentDay Int?
+
+  numberOfInstallments  Int
+  remainingInstallments Int?
+
+  state   PlanState    @default(CREATED)
+  gateway OrderGateway @default(RTA)
+
+  /// True delegates installment generation to FP. False means we call the
+  /// installment API ourselves, and FP then leaves nextInstallmentDate null.
+  autoGenerateInstallments    Boolean @default(true)
+  /// Generates the first installment immediately, bypassing the minimum gap.
+  /// Purchase plans only. No payment is auto-created for that installment.
+  generateFirstInstallmentNow Boolean @default(false)
+
+  /// Mandate that funds the installments. `paymentSourceRef` is FP's own
+  /// reference to the instrument (the mandate's numeric id as a string), kept
+  /// verbatim alongside our foreign key.
+  paymentMethod    PlanPaymentMethod?
+  paymentSourceRef String?            @db.VarChar(64)
+  mandateId        String?            @db.Uuid
+  mandate          Mandate?           @relation(fields: [mandateId], references: [id], onDelete: SetNull)
+
+  purpose PlanPurpose?
+
+  /// A future date on which FP should start registering the plan. RTA only.
+  requestedActivationDate DateTime? @db.Date
+  startDate               DateTime? @db.Date
+  endDate                 DateTime? @db.Date
+  nextInstallmentDate     DateTime? @db.Date
+  previousInstallmentDate DateTime? @db.Date
+
+  sourceRefId String? @unique @db.VarChar(64)
+
+  userIp   String? @db.VarChar(45)
+  serverIp String? @db.VarChar(45)
+
+  euin      String?  @db.VarChar(10)
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  initiatedBy  OrderInitiatedBy?
+  initiatedVia OrderInitiatedVia?
+
+  consentEmail   String?   @db.VarChar(255)
+  consentIsdCode String?   @db.VarChar(4)
+  consentMobile  String?   @db.VarChar(20)
+  consentAt      DateTime?
+
+  /// FP sets this when it cancels a plan itself, e.g. after consecutive
+  /// failed installments.
+  autoCancelled           Boolean?
+  cancellationCode        String?   @db.VarChar(60)
+  cancellationScheduledOn DateTime? @db.Date
+  /// FP's free-text reason for the current state.
+  reason                  String?   @db.VarChar(500)
+
+  fpCreatedAt DateTime?
+  activatedAt DateTime?
+  cancelledAt DateTime?
+  failedAt    DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  installments MfPurchase[]
+
+  @@index([mfInvestmentAccountId])
+  /// Scheduler hot path: "which active plans have an installment due".
+  @@index([state, nextInstallmentDate])
+  @@index([schemeIsin])
+  @@index([mandateId])
+  @@map("mf_purchase_plans")
+}
+
+/// POST /v2/mf_redemption_plans — an SWP when `systematic`.
+model MfRedemptionPlan {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  fpOldId Int?   @unique
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  schemeIsin String   @db.VarChar(12)
+  scheme     MfScheme @relation(fields: [schemeIsin], references: [isin], onDelete: Restrict)
+
+  folioNumber String? @db.VarChar(30)
+
+  /// Per-installment amount, or units — never both.
+  amount Decimal? @db.Decimal(18, 2)
+  units  Decimal? @db.Decimal(18, 4)
+
+  systematic     Boolean       @default(true)
+  frequency      PlanFrequency
+  installmentDay Int?
+
+  numberOfInstallments  Int
+  remainingInstallments Int?
+
+  state   PlanState    @default(CREATED)
+  gateway OrderGateway @default(RTA)
+
+  autoGenerateInstallments Boolean @default(true)
+
+  requestedActivationDate DateTime? @db.Date
+  startDate               DateTime? @db.Date
+  endDate                 DateTime? @db.Date
+  nextInstallmentDate     DateTime? @db.Date
+  previousInstallmentDate DateTime? @db.Date
+
+  sourceRefId String? @unique @db.VarChar(64)
+
+  userIp   String? @db.VarChar(45)
+  serverIp String? @db.VarChar(45)
+
+  euin      String?  @db.VarChar(10)
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  initiatedBy  OrderInitiatedBy?
+  initiatedVia OrderInitiatedVia?
+
+  consentEmail   String?   @db.VarChar(255)
+  consentIsdCode String?   @db.VarChar(4)
+  consentMobile  String?   @db.VarChar(20)
+  consentAt      DateTime?
+
+  autoCancelled           Boolean?
+  cancellationCode        String?   @db.VarChar(60)
+  cancellationScheduledOn DateTime? @db.Date
+  reason                  String?   @db.VarChar(500)
+
+  fpCreatedAt DateTime?
+  activatedAt DateTime?
+  cancelledAt DateTime?
+  failedAt    DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  installments MfRedemption[]
+
+  @@index([mfInvestmentAccountId])
+  @@index([state, nextInstallmentDate])
+  @@index([schemeIsin])
+  @@map("mf_redemption_plans")
+}
+
+/// POST /v2/mf_switch_plans — an STP when `systematic`.
+model MfSwitchPlan {
+  id      String @id @default(uuid(7)) @db.Uuid
+  fpId    String @unique @db.VarChar(64)
+  fpOldId Int?   @unique
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  switchOutSchemeIsin String   @db.VarChar(12)
+  switchOutScheme     MfScheme @relation("SwitchPlanOutScheme", fields: [switchOutSchemeIsin], references: [isin], onDelete: Restrict)
+  switchInSchemeIsin  String   @db.VarChar(12)
+  switchInScheme      MfScheme @relation("SwitchPlanInScheme", fields: [switchInSchemeIsin], references: [isin], onDelete: Restrict)
+
+  folioNumber String? @db.VarChar(30)
+
+  amount Decimal? @db.Decimal(18, 2)
+  units  Decimal? @db.Decimal(18, 4)
+
+  systematic     Boolean       @default(true)
+  frequency      PlanFrequency
+  installmentDay Int?
+
+  numberOfInstallments  Int
+  remainingInstallments Int?
+
+  state   PlanState    @default(CREATED)
+  gateway OrderGateway @default(RTA)
+
+  autoGenerateInstallments Boolean @default(true)
+
+  requestedActivationDate DateTime? @db.Date
+  startDate               DateTime? @db.Date
+  endDate                 DateTime? @db.Date
+  nextInstallmentDate     DateTime? @db.Date
+  previousInstallmentDate DateTime? @db.Date
+
+  sourceRefId String? @unique @db.VarChar(64)
+
+  userIp   String? @db.VarChar(45)
+  serverIp String? @db.VarChar(45)
+
+  euin      String?  @db.VarChar(10)
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  initiatedBy  OrderInitiatedBy?
+  initiatedVia OrderInitiatedVia?
+
+  consentEmail   String?   @db.VarChar(255)
+  consentIsdCode String?   @db.VarChar(4)
+  consentMobile  String?   @db.VarChar(20)
+  consentAt      DateTime?
+
+  autoCancelled           Boolean?
+  cancellationCode        String?   @db.VarChar(60)
+  cancellationScheduledOn DateTime? @db.Date
+  reason                  String?   @db.VarChar(500)
+
+  fpCreatedAt DateTime?
+  activatedAt DateTime?
+  cancelledAt DateTime?
+  failedAt    DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  installments MfSwitch[]
+
+  @@index([mfInvestmentAccountId])
+  @@index([state, nextInstallmentDate])
+  @@index([switchOutSchemeIsin])
+  @@map("mf_switch_plans")
+}
+
+// ===========================================================================
+// Mandates and payments
+//
+// These live behind FP's older /api/pg/* gateway, which identifies everything
+// by integer. Hence `fpId Int` here, and why BankAccount.fpOldId and
+// MfPurchase.fpOldId exist at all.
+// ===========================================================================
+
+/// POST /api/pg/mandates — the investor's standing authorisation to debit
+/// their bank account, for SIP installments and one-off purchases.
+///
+/// Only an APPROVED mandate can fund a payment; creating a payment against any
+/// other status yields a FAILED payment. Cancelling a mandate fails the
+/// payments of every SIP still using it.
+model Mandate {
+  id   String @id @default(uuid(7)) @db.Uuid
+  /// FP's integer mandate id.
+  fpId Int    @unique
+
+  bankAccountId String      @db.Uuid
+  bankAccount   BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Restrict)
+
+  mandateType   MandateType
+  mandateStatus MandateStatus @default(CREATED)
+
+  /// Per-debit ceiling. E_MANDATE tops out at ₹1 Cr; UPI autopay at ₹1 Lakh.
+  mandateLimit Decimal @db.Decimal(18, 2)
+
+  /// Our reference passed to the payment provider, and the provider's own.
+  mandateRef   String? @db.VarChar(64)
+  mandateToken String? @db.VarChar(120)
+  /// Unique Mandate Reference Number issued by NPCI once registered.
+  umrn         String? @db.VarChar(40)
+
+  validFrom DateTime? @db.Date
+  /// Defaults to validFrom + 30 years, which is also the ceiling.
+  validTo   DateTime? @db.Date
+
+  providerName PaymentProvider?
+  providerId   Int?
+
+  rejectedReason String? @db.VarChar(500)
+
+  fpCreatedAt DateTime?
+  receivedAt  DateTime?
+  submittedAt DateTime?
+  approvedAt  DateTime?
+  rejectedAt  DateTime?
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  payments      Payment[]
+  purchasePlans MfPurchasePlan[]
+
+  @@index([bankAccountId])
+  @@index([mandateStatus])
+  @@map("mandates")
+}
+
+/// A payment collected for one or more purchase orders — netbanking/UPI
+/// redirect, or a debit against an approved mandate.
+///
+/// FP does not check whether a payment already exists for an order, so the
+/// PaymentPurchase link is what stops us paying twice: look for a live payment
+/// on the order before creating another.
+model Payment {
+  id   String @id @default(uuid(7)) @db.Uuid
+  /// FP's integer payment id.
+  fpId Int    @unique
+
+  paymentType PaymentType
+  method      PaymentMethod?
+  status      PaymentStatus  @default(INITIATED)
+  amount      Decimal        @db.Decimal(18, 2)
+
+  mandateId String?  @db.Uuid
+  mandate   Mandate? @relation(fields: [mandateId], references: [id], onDelete: SetNull)
+
+  fromBankAccountId String?      @db.Uuid
+  fromBankAccount   BankAccount? @relation(fields: [fromBankAccountId], references: [id], onDelete: SetNull)
+
+  provider PaymentProvider?
+
+  /// Expected debit date on the investor's account.
+  debitDate DateTime? @db.Date
+
+  /// Provider redirect the investor must complete. Short-lived — re-create the
+  /// payment rather than reusing a stale link.
+  tokenUrl           String?   @db.VarChar(1000)
+  /// Where the provider posted the browser back to us, and when.
+  postbackReceivedAt DateTime?
+
+  failureCode  String?  @db.VarChar(60)
+  failedReason String?  @db.VarChar(500)
+  /// Authorised after the cut-off. Such payments are usually refunded.
+  lateAuth     Boolean?
+
+  refundReference String?       @db.VarChar(120)
+  refundReason    String?       @db.VarChar(200)
+  refundStatus    RefundStatus?
+  refundCreatedAt DateTime?
+
+  fpCreatedAt         DateTime?
+  submittedAt         DateTime?
+  debitConfirmedAt    DateTime?
+  transferInitiatedAt DateTime?
+  settledAt           DateTime?
+  failedAt            DateTime?
+  rejectedAt          DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  purchases PaymentPurchase[]
+
+  @@index([status])
+  @@index([mandateId])
+  @@index([fromBankAccountId])
+  @@index([fpCreatedAt(sort: Desc)])
+  @@map("payments")
+}
+
+/// Which purchases a payment covers.
+///
+/// Many-to-many because FP's `amc_order_ids` is a list: one netbanking
+/// redirect can settle up to ten orders in a cart, and a retried order can be
+/// paid by a second payment after the first failed.
+model PaymentPurchase {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  paymentId String  @db.Uuid
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  mfPurchaseId String     @db.Uuid
+  mfPurchase   MfPurchase @relation(fields: [mfPurchaseId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([paymentId, mfPurchaseId])
+  @@index([mfPurchaseId])
+  @@map("payment_purchases")
+}
+
+/// POST /v2/mf_settlement_details — proof that the investor's money reached
+/// the AMC, for orders paid outside FP.
+///
+/// Required before such an order can be confirmed. The UTR and settlement time
+/// arrive later, in a second call, which is why both are nullable.
+model MfSettlementDetail {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  mfPurchaseId String     @unique @db.Uuid
+  mfPurchase   MfPurchase @relation(fields: [mfPurchaseId], references: [id], onDelete: Cascade)
+
+  paymentType SettlementPaymentType
+  utrNumber   String?               @db.VarChar(60)
+
+  // Source: the investor's bank account.
+  bankAccountNumber String?          @db.VarChar(20)
+  bankIfsc          String?          @db.VarChar(11)
+  bankName          String?          @db.VarChar(150)
+  bankAccountType   BankAccountType?
+
+  // Beneficiary: the AMC's collection account.
+  beneficiaryAccountNumber String? @db.VarChar(30)
+  beneficiaryAccountTitle  String? @db.VarChar(150)
+  beneficiaryBankName      String? @db.VarChar(150)
+
+  settlementProcessedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@map("mf_settlement_details")
+}
+
+/// Where the proceeds of a successful redemption were paid.
+model MfPayoutDetail {
+  id   String  @id @default(uuid(7)) @db.Uuid
+  fpId String? @unique @db.VarChar(64)
+
+  mfRedemptionId String       @unique @db.Uuid
+  mfRedemption   MfRedemption @relation(fields: [mfRedemptionId], references: [id], onDelete: Cascade)
+
+  amount                  Decimal? @db.Decimal(18, 2)
+  utrNumber               String?  @db.VarChar(60)
+  /// Masked at source by the RTA.
+  bankAccountNumberMasked String?  @db.VarChar(40)
+  bankIfsc                String?  @db.VarChar(11)
+  bankName                String?  @db.VarChar(150)
+  status                  String?  @db.VarChar(40)
+
+  paidAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  syncedAt  DateTime @default(now())
+
+  @@map("mf_payout_details")
+}
+
+// ===========================================================================
+// Phone verification (MSG91 OTP) — ours
+// ===========================================================================
+
+/// One OTP challenge for one phone number.
+///
+/// The OTP itself is deliberately absent from this table — not even hashed.
+/// MSG91 generates and verifies it, so the code never touches our database or
+/// our logs. What we own here is everything MSG91 cannot enforce for us:
+/// resend cooldowns, send caps, attempt caps, lockout, and an audit trail.
+///
+/// With purpose = TRANSACTION_APPROVAL this is also the SEBI 2FA record behind
+/// an order's consent: verify the challenge first, then send the consent to FP.
+model PhoneVerification {
+  id      String  @id @default(uuid(7)) @db.Uuid
+  /// Server-derived transaction/account context; absent for login challenges.
+  context String? @db.VarChar(200)
+
+  /// E.164, always normalised (+919876543210) so rate limits cannot be evaded
+  /// by reformatting the same number.
+  phone   String     @db.VarChar(20)
+  purpose OtpPurpose @default(PHONE_VERIFICATION)
+  status  OtpStatus  @default(PENDING)
+
+  /// MSG91's request id, for correlating with their delivery logs.
+  providerRequestId String? @db.VarChar(100)
+
+  /// Wrong codes submitted against this challenge.
+  attempts  Int @default(0)
+  /// Deliveries for this challenge, including resends.
+  sendCount Int @default(1)
+
+  expiresAt   DateTime
+  lastSentAt  DateTime  @default(now())
+  verifiedAt  DateTime?
+  lockedUntil DateTime?
+
+  /// Single-use proof that the caller controls this number, handed to a
+  /// later signup / login / order-consent step. Stored as a SHA-256 hash: a
+  /// database leak must not yield usable tokens.
+  tokenHash      String?   @unique @db.VarChar(64)
+  tokenExpiresAt DateTime?
+  consumedAt     DateTime?
+
+  ipAddress String? @db.VarChar(45)
+  userAgent String? @db.VarChar(300)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Hot path: "the newest challenge for this number and purpose".
+  @@index([phone, purpose, createdAt(sort: Desc)])
+  /// Used by the send-rate-limit window query and by expiry sweeps.
+  @@index([status, expiresAt])
+  @@map("phone_verifications")
+}
+
+// ===========================================================================
+// FP webhooks and audit — ours
+// ===========================================================================
+
+/// Inbox for FP webhook deliveries (POST to our notification_webhooks URL).
+///
+/// Write the raw event first, acknowledge, then process asynchronously — a
+/// webhook handler that does work inline will time out and be redelivered.
+/// `fpEventId` is unique, so a redelivery collides instead of applying twice.
+/// The payload is retained because it is the only evidence of what FP told us
+/// and when, which is exactly what a reconciliation dispute needs.
+model FpWebhookEvent {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// FP's `evt_…` id. The idempotency key for the whole pipeline.
+  fpEventId String @unique @db.VarChar(64)
+
+  /// e.g. "mf_purchase.successful", "kyc_request.rejected".
+  type       String  @db.VarChar(80)
+  /// Parsed out of `type` so events can be filtered by object.
+  objectType String? @db.VarChar(40)
+  /// The `fpId` of the object the event concerns, for joining to our mirror.
+  objectFpId String? @db.VarChar(64)
+
+  payload Json @db.JsonB
+
+  status    WebhookProcessingStatus @default(PENDING)
+  attempts  Int                     @default(0)
+  lastError String?                 @db.VarChar(1000)
+
+  /// When FP says the event occurred, vs when it reached us. A large gap means
+  /// a delivery backlog and a stale mirror.
+  occurredAt  DateTime?
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([status, receivedAt])
+  @@index([type, receivedAt(sort: Desc)])
+  @@index([objectType, objectFpId])
+  @@map("fp_webhook_events")
+}
+
+model InvestorSession {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique @db.VarChar(64)
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([userId, expiresAt])
+  @@map("investor_sessions")
+}
+
+/// Shared between application instances; expired windows are reset atomically.
+model ApiRateLimit {
+  key             String   @id @db.VarChar(64)
+  count           Int
+  windowStartedAt DateTime @db.Timestamptz(3)
+
+  @@index([windowStartedAt])
+  @@map("api_rate_limits")
+}
+
+/// Durable API command journal. An uncertain write stays blocked until reconciled;
+/// never automatically expire a claim and repeat a potentially successful debit.
+model InvestorCommand {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  userId      String    @db.Uuid
+  user        User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  key         String    @db.VarChar(128)
+  requestHash String    @db.VarChar(64)
+  route       String    @db.VarChar(250)
+  statusCode  Int?
+  response    Json?     @db.JsonB
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+
+  @@unique([userId, key])
+  @@index([completedAt, createdAt])
+  @@map("investor_commands")
+}
+
+/// Cross-process lock acquired before contacting the payment provider.
+/// A lost response keeps the lock; reconcile against FP before releasing it.
+model PaymentSubmission {
+  orderId     String   @id @db.Uuid
+  order       MfPurchase @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  /// Provider id is saved immediately after create, before secondary fetches.
+  fpPaymentId Int?
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([fpPaymentId])
+  @@map("payment_submissions")
+}
+
+model AuditLog {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// Kept as SetNull so purging an actor never destroys the audit trail.
+  actorId   String?   @db.Uuid
+  actor     User?     @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  /// The actor's role at the time of the action — roles change, history must
+  /// not. The admin subdomain reads this, not the current User.role.
+  actorRole UserRole?
+
+  action     String  @db.VarChar(100)
+  entityType String  @db.VarChar(60)
+  entityId   String? @db.VarChar(64)
+  metadata   Json?   @db.JsonB
+  ipAddress  String? @db.VarChar(45)
+  userAgent  String? @db.VarChar(300)
+  requestId  String? @db.VarChar(64)
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
