@@ -155,6 +155,13 @@ export async function provision(req: Request, res: Response) {
       userId: investorId(req),
       sourceOfWealth: oneOf(body, "sourceOfWealth", SOURCES_OF_WEALTH, false),
       countryOfBirth: optionalString(body, "countryOfBirth", { maxLength: 2 }),
+      gender: oneOf(body, "gender", GENDERS, false),
+      occupation: oneOf(body, "occupation", OCCUPATIONS, false),
+      incomeSlab: oneOf(body, "incomeSlab", INCOME_SLABS, false),
+      pepDetails: oneOf(body, "pepDetails", PEP_VALUES, false),
+      placeOfBirth: optionalString(body, "placeOfBirth", { maxLength: 120 }),
+      maritalStatus: oneOf(body, "maritalStatus", MARITAL_STATUSES, false),
+      fatherName: optionalString(body, "fatherName", { maxLength: 70 }),
       ...(address && {
         address: {
           line1: requiredString(address, "line1", { maxLength: 120 }),

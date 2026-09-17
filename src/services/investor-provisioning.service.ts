@@ -153,10 +153,11 @@ function missingProfileFields(
   input: ProvisionInput,
 ): string[] {
   if (!prefill) return ["kycIdentity"];
+  const profile = { ...prefill, ...input };
   const gaps: string[] = [];
-  if (!prefill.name) gaps.push("name");
-  if (!prefill.dateOfBirth) gaps.push("dateOfBirth");
-  for (const field of REQUIRED_FOR_PROFILE) if (!prefill[field]) gaps.push(field);
+  if (!profile.name) gaps.push("name");
+  if (!profile.dateOfBirth) gaps.push("dateOfBirth");
+  for (const field of REQUIRED_FOR_PROFILE) if (!profile[field]) gaps.push(field);
   // Never on a KYC form, so it can only come from the caller.
   if (!input.sourceOfWealth) gaps.push("sourceOfWealth");
   return gaps;
@@ -179,25 +180,30 @@ export async function provisionInvestor(input: ProvisionInput): Promise<Provisio
   const profileGaps = stage.investorProfileId ? [] : missingProfileFields(prefill, input);
 
   if (!stage.investorProfileId && prefill && profileGaps.length === 0) {
+    // A PAN that is already KYC-registered has no KYC form. In that case the
+    // pre-verification supplies the identity and the app supplies the profile
+    // answers it just collected. Prefer the form when it exists, and fill only
+    // its gaps from the explicit answers.
+    const profileData = { ...input, ...prefill };
     const profile = await createInvestorProfile({
       userId,
-      name: prefill.name!,
-      pan: prefill.pan,
-      dateOfBirth: prefill.dateOfBirth!,
-      taxStatus: prefill.taxStatus ?? "resident_individual",
-      gender: prefill.gender!,
-      occupation: prefill.occupation!,
-      incomeSlab: prefill.incomeSlab!,
-      pepDetails: prefill.pepDetails!,
-      placeOfBirth: prefill.placeOfBirth!,
+      name: profileData.name!,
+      pan: profileData.pan,
+      dateOfBirth: profileData.dateOfBirth!,
+      taxStatus: profileData.taxStatus ?? "resident_individual",
+      gender: profileData.gender!,
+      occupation: profileData.occupation!,
+      incomeSlab: profileData.incomeSlab!,
+      pepDetails: profileData.pepDetails!,
+      placeOfBirth: profileData.placeOfBirth!,
       sourceOfWealth: input.sourceOfWealth!,
       // The KYC form leaves country of birth null more often than not, and this
       // journey is resident individuals only.
-      countryOfBirth: input.countryOfBirth ?? prefill.countryOfBirth ?? INDIA,
-      nationalityCountry: prefill.nationalityCountry ?? INDIA,
-      citizenshipCountries: prefill.citizenshipCountries ?? [INDIA],
-      ...(prefill.maritalStatus && { maritalStatus: prefill.maritalStatus }),
-      ...(prefill.fatherName && { fatherName: prefill.fatherName }),
+      countryOfBirth: input.countryOfBirth ?? profileData.countryOfBirth ?? INDIA,
+      nationalityCountry: profileData.nationalityCountry ?? INDIA,
+      citizenshipCountries: profileData.citizenshipCountries ?? [INDIA],
+      ...(profileData.maritalStatus && { maritalStatus: profileData.maritalStatus }),
+      ...(profileData.fatherName && { fatherName: profileData.fatherName }),
       ...(prefill.aadhaarLast4 && { aadhaarLast4: prefill.aadhaarLast4 }),
       ...(input.ipAddress && { ipAddress: input.ipAddress }),
     });

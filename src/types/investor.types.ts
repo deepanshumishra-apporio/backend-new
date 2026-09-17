@@ -41,6 +41,13 @@ export interface ProvisionInput {
   userId: string;
   sourceOfWealth?: string;
   countryOfBirth?: string;
+  gender?: string;
+  occupation?: string;
+  incomeSlab?: string;
+  pepDetails?: string;
+  placeOfBirth?: string;
+  maritalStatus?: string;
+  fatherName?: string;
   address?: {
     line1: string;
     line2?: string;
