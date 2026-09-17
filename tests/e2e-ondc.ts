@@ -60,15 +60,20 @@ const DATE_OF_BIRTH = "1959-08-22";
 /**
  * A bank account number the sandbox will accept.
  *
- * A number matching `31XX` is simulated as failing verification; anything else
- * passes. Randomised per run for the same reason as the PAN: FP caps
- * verification attempts per account, and once that cap is hit the order review
- * itself fails with `bank_account_verification_attempt_limit_exceeded`.
+ * This deployment verifies BAV **locally** (`simulationEnabled`), scoring the
+ * last four digits: `1191–1199` => VERY_HIGH, `1261–1290` => HIGH, anything
+ * else is refused. The older "`31XX` fails, everything else passes" rule was the
+ * real FP penny-drop, which this partner realm never returns and the transport
+ * therefore simulates — so a random number is rejected and blocks every order
+ * and SIP at the payout-verification gate. End the account in `119X` so the
+ * local penny-drop passes VERY_HIGH, keeping the first ten digits random so each
+ * run links a fresh account.
  */
 function sandboxAccountNumber(): string {
-  let digits = "";
-  while (digits.length < 14) digits += Math.floor(Math.random() * 10);
-  return digits.startsWith("31") ? `5${digits.slice(1)}` : digits;
+  let prefix = "";
+  while (prefix.length < 10) prefix += Math.floor(Math.random() * 10);
+  const last = 1 + Math.floor(Math.random() * 9); // 1..9 -> ends 1191..1199
+  return `${prefix}119${last}`;
 }
 
 const BANK_ACCOUNT_NUMBER = sandboxAccountNumber();

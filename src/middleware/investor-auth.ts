@@ -55,22 +55,45 @@ sessionRouter.post('/sandbox', async (req, res) => {
   const expiresAt = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   const user = await db.$transaction(async tx => {
     // Demo verification never stamps a real email/phone verification timestamp.
-    const byEmail = await tx.user.findUnique({ where: { email } });
+    //
+    // Sign in only when the email AND the mobile belong to the SAME account;
+    // any other combination is a signup or a genuine conflict, never a silent
+    // overwrite. Both columns are unique, so exactly one of these holds:
+    //   - neither exists            → a new pair → sign up (create).
+    //   - both exist, same account  → email+mobile match → sign in.
+    //   - they point at different accounts, or one is taken by someone else
+    //                               → mismatch → 409, so no account is hijacked.
+    const [byPhone, byEmail] = await Promise.all([
+      tx.user.findUnique({ where: { phone } }),
+      tx.user.findUnique({ where: { email } }),
+    ]);
+    if (byPhone && byEmail && byPhone.id !== byEmail.id)
+      throw new HttpError(409, 'SANDBOX_IDENTITY_MISMATCH',
+        'This email and mobile number belong to different accounts. Use a matching pair, or a new email and number to sign up.');
     if (byEmail && byEmail.phone !== phone)
       throw new HttpError(409, 'SANDBOX_IDENTITY_MISMATCH',
         'This email is already signed up with a different mobile number. Use that number, or a different email.');
+    // A mobile already tied to a different email is not this identity. Never
+    // overwrite it — that would move one investor's KYC onto another's email.
+    if (byPhone && byPhone.email && byPhone.email !== email)
+      throw new HttpError(409, 'SANDBOX_IDENTITY_MISMATCH',
+        'This mobile number is already signed up with a different email. Use that email, or a different number.');
     // Judged before the upsert, never after: the write below activates the
     // account, so asking afterwards would wave a suspended one straight
     // through. `PENDING_VERIFICATION` passes — a code accepted here *is* that
     // account's verification, and refusing it locked out every account the real
     // OTP flow had created but not yet activated.
-    const existing = await tx.user.findUnique({ where: { phone } });
+    const existing = byPhone;
     if (existing && (existing.deletedAt || existing.role !== 'INVESTOR' ||
         !['ACTIVE', 'PENDING_VERIFICATION'].includes(existing.status)))
       throw new HttpError(403, 'ACCOUNT_UNAVAILABLE', 'This account cannot sign in. Contact support.');
     const account = await tx.user.upsert({
-      where: { phone }, create: { phone, email, status: 'ACTIVE' },
-      update: { email, status: 'ACTIVE', lastLoginAt: now },
+      where: { phone },
+      create: { phone, email, status: 'ACTIVE' },
+      // Sign-in: never change a matched account's email (a differing one was
+      // already refused above). Only adopt an email for a mobile-only account
+      // the live OTP flow created without one.
+      update: { status: 'ACTIVE', lastLoginAt: now, ...(existing && !existing.email ? { email } : {}) },
     });
     await tx.investorSession.create({ data: {
       userId: account.id, tokenHash: tokenHash(accessToken), expiresAt,
