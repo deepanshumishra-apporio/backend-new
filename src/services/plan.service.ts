@@ -397,7 +397,9 @@ async function resolveMandate(mandateId: string | undefined, mfInvestmentAccount
 // ---------------------------------------------------------------------------
 
 export async function createSip(input: CreateSipInput): Promise<PlanDto> {
-  await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
+  // FP rejects SIPs at review when the payout bank has not passed verification,
+  // even on sandbox deployments that relax this check for ordinary orders.
+  await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber, true);
   const account = await requireAccount(input.mfInvestmentAccountId);
   const frequency = asFrequency(input.frequency);
   assertSipSchedule(frequency, input.installmentDay, input.numberOfInstallments);

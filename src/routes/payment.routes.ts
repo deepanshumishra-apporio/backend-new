@@ -16,5 +16,6 @@ paymentRouter.post("/mandates/:mandateId/cancel", payment.cancelMandate);
 paymentRouter.post("/mandates/:mandateId/pay", payment.payByMandate);
 
 paymentRouter.post("/netbanking", payment.payByNetbanking);
+paymentRouter.post("/upi", payment.payByNetbanking);
 paymentRouter.get("/:paymentId", payment.getPayment);
 paymentRouter.post("/:paymentId/refresh", payment.refreshPayment);

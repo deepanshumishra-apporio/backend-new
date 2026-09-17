@@ -17,6 +17,7 @@ import {
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
+import { fpCatalogue, fpErrorToHttpError } from "../integrations/fp/index.ts";
 
 type ThresholdType = (typeof SchemeThresholdType)[keyof typeof SchemeThresholdType];
 type ThresholdFrequency =
@@ -166,6 +167,14 @@ export async function validatePurchase(
   amount: string,
   hasFolio: boolean,
 ): Promise<void> {
+  try {
+    const live = await fpCatalogue.fetchFundScheme(isin);
+    if (!live.purchase_allowed || !live.active || live.merged) {
+      throw HttpError.badRequest("This scheme is currently unavailable for purchase. Choose another scheme.", { isin });
+    }
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
   const scheme = await requireTradableScheme(isin);
   if (!scheme.purchaseAllowed) {
     throw HttpError.badRequest(`${scheme.name} is not open for purchases`);

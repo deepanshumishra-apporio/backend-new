@@ -177,7 +177,11 @@ export async function investmentReadiness(accountId: string): Promise<Investment
  *
  * Every order, plan and payment goes through this before anything reaches FP.
  */
-export async function assertInvestmentReady(accountId: string, folioNumber?: string | null): Promise<void> {
+export async function assertInvestmentReady(
+  accountId: string,
+  folioNumber?: string | null,
+  requireVerifiedPayout = payoutVerificationRequired(),
+): Promise<void> {
   const account = await db.mfInvestmentAccount.findUnique({
     where: { id: accountId },
     include: { primaryInvestorProfile: true, folioDefaults: true },
@@ -194,7 +198,7 @@ export async function assertInvestmentReady(accountId: string, folioNumber?: str
   if (!payoutBankAccountId) {
     throw HttpError.conflict("Set a payout bank account on this investment account before transacting");
   }
-  if (payoutVerificationRequired() && !(await bankIsVerified(payoutBankAccountId))) {
+  if (requireVerifiedPayout && !(await bankIsVerified(payoutBankAccountId))) {
     throw HttpError.conflict("Verify the payout bank account before transacting");
   }
 
