@@ -838,14 +838,15 @@ model User {
   /// so an investor with history can never be hard-deleted.
   deletedAt DateTime?
 
-  profileLinks     UserInvestorProfile[]
-  uploadedFiles    FpFile[]
-  kycChecks        KycCheck[]
-  kycRequests      KycRequest[]
-  kycForms         KycForm[]
-  preVerifications PreVerification[]
-  watchlist        WatchlistItem[]
-  auditLogs        AuditLog[]
+  profileLinks       UserInvestorProfile[]
+  uploadedFiles      FpFile[]
+  kycChecks          KycCheck[]
+  kycRequests        KycRequest[]
+  kycForms           KycForm[]
+  preVerifications   PreVerification[]
+  bankAccountLookups BankAccountLookup[]
+  watchlist          WatchlistItem[]
+  auditLogs          AuditLog[]
 
   @@index([status])
   @@index([deletedAt])
@@ -898,6 +899,15 @@ model InvestorOnboarding {
   /// Last failure shown to the investor, so a resumed session can explain
   /// itself. Free text from us, never a raw FP payload.
   lastError String? @db.VarChar(500)
+
+  /// When the investor declined to nominate, or null if they never said.
+  ///
+  /// Declining leaves no nominee row, so without this there is nothing to tell
+  /// "said no" apart from "has not been asked" — and the resume route, which
+  /// reads what is still outstanding, sent the investor back to the nominee
+  /// screen for ever. A timestamp rather than a boolean because the choice is a
+  /// regulatory declaration and when it was made is part of it.
+  nominationOptOutAt DateTime?
 
   startedAt   DateTime  @default(now())
   completedAt DateTime?
@@ -1406,19 +1416,20 @@ model InvestorProfile {
   updatedAt   DateTime  @updatedAt
   syncedAt    DateTime  @default(now())
 
-  onboarding       InvestorOnboarding?
-  userLinks        UserInvestorProfile[]
-  taxResidencies   TaxResidency[]
-  addresses        Address[]
-  phoneNumbers     PhoneNumber[]
-  emailAddresses   EmailAddress[]
-  bankAccounts     BankAccount[]
-  relatedParties   RelatedParty[]
-  dematAccounts    DematAccount[]
-  kycChecks        KycCheck[]
-  kycRequests      KycRequest[]
-  kycForms         KycForm[]
-  preVerifications PreVerification[]
+  onboarding         InvestorOnboarding?
+  userLinks          UserInvestorProfile[]
+  taxResidencies     TaxResidency[]
+  addresses          Address[]
+  phoneNumbers       PhoneNumber[]
+  emailAddresses     EmailAddress[]
+  bankAccounts       BankAccount[]
+  relatedParties     RelatedParty[]
+  dematAccounts      DematAccount[]
+  kycChecks          KycCheck[]
+  kycRequests        KycRequest[]
+  kycForms           KycForm[]
+  preVerifications   PreVerification[]
+  bankAccountLookups BankAccountLookup[]
 
   primaryFor MfInvestmentAccount[] @relation("PrimaryInvestor")
   secondFor  MfInvestmentAccount[] @relation("SecondInvestor")
@@ -1591,10 +1602,41 @@ model BankAccount {
   mandates  Mandate[]
   payments  Payment[]
   payoutFor MfFolioDefaults[]
+  lookup    BankAccountLookup?
 
   @@unique([investorProfileId, accountNumberFingerprint])
   @@index([investorProfileId])
   @@map("bank_accounts")
+}
+
+/// Consent-backed discovery of an investor's bank account from their verified
+/// mobile number. The full account number is deliberately never persisted;
+/// FP returns it only while the investor confirms and links the result.
+model BankAccountLookup {
+  id   String @id @default(uuid(7)) @db.Uuid
+  fpId String @unique @db.VarChar(64)
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  investorProfileId String          @db.Uuid
+  investorProfile   InvestorProfile @relation(fields: [investorProfileId], references: [id], onDelete: Cascade)
+
+  sourceRefId String @unique @db.VarChar(64)
+  phoneLast4  String @db.VarChar(4)
+  status      String @db.VarChar(20)
+
+  bankAccountId String?      @unique @db.Uuid
+  bankAccount   BankAccount? @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+
+  consentedAt DateTime @db.Timestamptz(3)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+  syncedAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([investorProfileId, createdAt(sort: Desc)])
+  @@map("bank_account_lookups")
 }
 
 /// POST /v2/related_parties — a person related to the investor, used for
@@ -2373,8 +2415,8 @@ model MfPurchase {
   updatedAt DateTime @updatedAt
   syncedAt  DateTime @default(now())
 
-  settlementDetail MfSettlementDetail?
-  payments         PaymentPurchase[]
+  settlementDetail  MfSettlementDetail?
+  payments          PaymentPurchase[]
   paymentSubmission PaymentSubmission?
 
   @@index([mfInvestmentAccountId, fpCreatedAt(sort: Desc)])
@@ -3042,6 +3084,12 @@ model PhoneVerification {
   /// MSG91's request id, for correlating with their delivery logs.
   providerRequestId String? @db.VarChar(100)
 
+  /// SHA-256 of "<id>:<code>", set only when this challenge was delivered by
+  /// email. MSG91 keeps its own codes, so an SMS challenge leaves this null —
+  /// which is also how verification knows which path to take. Salted with the
+  /// row id so a leaked table cannot be reversed with one rainbow table.
+  codeHash String? @db.VarChar(64)
+
   /// Wrong codes submitted against this challenge.
   attempts  Int @default(0)
   /// Deliveries for this challenge, including resends.
@@ -3159,11 +3207,11 @@ model InvestorCommand {
 /// Cross-process lock acquired before contacting the payment provider.
 /// A lost response keeps the lock; reconcile against FP before releasing it.
 model PaymentSubmission {
-  orderId     String   @id @db.Uuid
+  orderId     String     @id @db.Uuid
   order       MfPurchase @relation(fields: [orderId], references: [id], onDelete: Restrict)
   /// Provider id is saved immediately after create, before secondary fetches.
   fpPaymentId Int?
-  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  createdAt   DateTime   @default(now()) @db.Timestamptz(3)
 
   @@index([fpPaymentId])
   @@map("payment_submissions")

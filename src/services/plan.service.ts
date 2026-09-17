@@ -19,10 +19,18 @@ import { fpErrorToHttpError, fpPlans } from "../integrations/fp/index.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, asUnits } from "../utils/money.ts";
 import { consumeVerificationToken } from "./otp.service.ts";
-import { resolveConsentContact } from "./order.service.ts";
+import { resolveConsentContact, sendConsent } from "./order.service.ts";
 import { syncPurchasePlan, syncRedemptionPlan, syncSwitchPlan } from "./fp-sync/index.ts";
 import { validatePlan } from "./scheme-rules.service.ts";
-import type { PlanDto, CreateSipInput, CreateStpInput, CreateSwpInput } from "../types/plan.types.ts";
+import type {
+  PlanDto,
+  PlanMandateDto,
+  CreateSipInput,
+  CreateStpInput,
+  CreateSwpInput,
+} from "../types/plan.types.ts";
+
+import { assertSipMandate, assertSipSchedule } from "./sip-validation.ts";
 
 const GATEWAY = "cybrillapoa";
 
@@ -37,13 +45,13 @@ const planIdentitySelect = {
 
 async function resolvePlan(id: string) {
   const [sip, swp, stp] = await Promise.all([
-    db.mfPurchasePlan.findUnique({ where: { id }, select: { ...planIdentitySelect, mandateId: true } }),
+    db.mfPurchasePlan.findUnique({ where: { id }, select: { ...planIdentitySelect, mandateId: true, amount: true } }),
     db.mfRedemptionPlan.findUnique({ where: { id }, select: planIdentitySelect }),
     db.mfSwitchPlan.findUnique({ where: { id }, select: planIdentitySelect }),
   ]);
   const row = sip ?? swp ?? stp;
   if (!row || row.gateway !== "CYBRILLAPOA") throw HttpError.notFound("No such ONDC plan");
-  return { row, kind: sip ? "sip" : swp ? "swp" : "stp", mandateId: sip?.mandateId };
+  return { row, kind: sip ? "sip" : swp ? "swp" : "stp", mandateId: sip?.mandateId, amount: sip?.amount };
 }
 export async function getPlan(id: string): Promise<PlanDto> {
   const { kind } = await resolvePlan(id);
@@ -60,21 +68,26 @@ export async function refreshPlan(id: string): Promise<PlanDto> {
 }
 export async function confirmPlan(id: string, verificationToken: string): Promise<PlanDto> {
   await refreshPlan(id);
-  const { row, kind, mandateId } = await resolvePlan(id);
+  const { row, kind, mandateId, amount } = await resolvePlan(id);
   if (["ACTIVE", "SUBMITTED", "CONFIRMED"].includes(row.state)) return getPlan(id);
   if (row.state !== "REVIEW_COMPLETED") throw HttpError.conflict("Wait for the plan review to complete");
   if (kind === "sip") {
     if (!mandateId) throw HttpError.conflict("Create the SIP with an approved mandate before confirming");
-    await resolveMandate(mandateId, row.mfInvestmentAccountId);
+    await assertInvestmentReady(row.mfInvestmentAccountId, row.folioNumber ?? undefined);
+    await resolveMandate(mandateId, row.mfInvestmentAccountId, amount!.toString());
   }
   const contact = await resolveConsentContact(row.mfInvestmentAccountId, row.folioNumber);
   const proof = await consumeVerificationToken(verificationToken, `plan:${id}`);
   if (proof.phone.replace(/\D/g, "") !== `${contact.isdCode}${contact.mobile}`.replace(/\D/g, "")) throw HttpError.badRequest("Consent phone mismatch");
-  const payload = { id: row.fpId, state: "confirmed" as const, consent: { email: contact.email, isd_code: contact.isdCode, mobile: contact.mobile } };
+  const confirm = (consent: { email: string; isd_code?: string; mobile?: string }) =>
+    ({ id: row.fpId, state: "confirmed" as const, consent });
   try {
-    if (kind === "sip") await syncPurchasePlan(await fpPlans.updatePurchasePlan(payload), row.mfInvestmentAccountId);
-    else if (kind === "swp") await syncRedemptionPlan(await fpPlans.updateRedemptionPlan(payload), row.mfInvestmentAccountId);
-    else await syncSwitchPlan(await fpPlans.updateSwitchPlan(payload), row.mfInvestmentAccountId);
+    // Same mobile fallback as an order confirm — FP rejects the registered
+    // number on some accounts, and a plan stuck unconfirmed is as dead as an
+    // order stuck pending.
+    if (kind === "sip") await syncPurchasePlan(await sendConsent(contact, (c) => fpPlans.updatePurchasePlan(confirm(c))), row.mfInvestmentAccountId);
+    else if (kind === "swp") await syncRedemptionPlan(await sendConsent(contact, (c) => fpPlans.updateRedemptionPlan(confirm(c))), row.mfInvestmentAccountId);
+    else await syncSwitchPlan(await sendConsent(contact, (c) => fpPlans.updateSwitchPlan(confirm(c))), row.mfInvestmentAccountId);
     return getPlan(id);
   } catch (error) { fpErrorToHttpError(error); }
 }
@@ -87,6 +100,16 @@ export async function confirmPlan(id: string, verificationToken: string): Promis
  * left unconfirmed.
  */
 function assertCancellable(state: string): void {
+  // FP answers "Cancellation not allowed for plans in FAILED state with
+  // CYBRILLAPOA gateway", which reads as though the cancellation is the thing
+  // that went wrong. A failed plan is already dead — there is nothing left to
+  // cancel — so say that here rather than relaying the gateway's wording.
+  if (state === PlanState.FAILED) {
+    throw HttpError.conflict(
+      "This plan already failed, so there is nothing to cancel — start a new one instead",
+      { state },
+    );
+  }
   if (state === PlanState.REVIEW_COMPLETED) {
     throw HttpError.conflict(
       "A reviewed plan cannot be cancelled on the ONDC route — confirm it, or leave it unconfirmed",
@@ -95,7 +118,45 @@ function assertCancellable(state: string): void {
   }
 }
 
+/**
+ * Translate a refusal about a state we did not know the plan was in.
+ *
+ * `assertCancellable` runs against a state we have just re-read, so this is the
+ * narrow race where FP moved on between that GET and the cancel — and the
+ * catch-all for ONDC states no plan in the sandbox has ever reached, whose
+ * cancellability we therefore cannot check in advance. FP's own wording blames
+ * the cancellation ("Cancellation not allowed for plans in X state with
+ * CYBRILLAPOA gateway") rather than naming the state as the reason, so it is
+ * rewritten here instead of relayed.
+ */
+function cancelRefusal(error: unknown): never {
+  const message = error instanceof Error ? error.message : "";
+  const match = /Cancellation not allowed for plans in (\w+) state/i.exec(message);
+  if (match) {
+    const state = match[1]!.toUpperCase();
+    throw HttpError.conflict(
+      `This plan is ${state.toLowerCase().replace(/_/g, " ")} and can no longer be cancelled`,
+      { state },
+    );
+  }
+  fpErrorToHttpError(error);
+}
+
+/**
+ * Cancel a plan, deciding on FP's state rather than on our mirror's.
+ *
+ * Cancellation is the one operation whose legality depends entirely on a state
+ * FP can change without telling us. A plan we last saw as CONFIRMED may already
+ * have failed at submission — a payout account that never passed its penny-drop
+ * does exactly that — and cancelling it then produced FP's
+ * "Cancellation not allowed for plans in FAILED state with CYBRILLAPOA
+ * gateway", naming a state the investor had never been shown. Re-reading first
+ * costs one GET and lets `assertCancellable` answer in our own words.
+ *
+ * `confirmPlan` already refreshes for the same reason; this is the other half.
+ */
 export async function cancelPlan(id: string, cancellationCode: string, cancellationReason?: string): Promise<PlanDto> {
+  await refreshPlan(id);
   const { row, kind } = await resolvePlan(id);
   if (kind === "sip") return cancelSip(id, cancellationCode, cancellationReason);
   if (row.state === "CANCELLED") return getPlan(id);
@@ -105,7 +166,7 @@ export async function cancelPlan(id: string, cancellationCode: string, cancellat
     if (kind === "swp") await syncRedemptionPlan(await fpPlans.cancelRedemptionPlan(row.fpId, payload), row.mfInvestmentAccountId);
     else await syncSwitchPlan(await fpPlans.cancelSwitchPlan(row.fpId, payload), row.mfInvestmentAccountId);
     return getPlan(id);
-  } catch (error) { fpErrorToHttpError(error); }
+  } catch (error) { cancelRefusal(error); }
 }
 
 type Frequency = (typeof SchemeThresholdFrequency)[keyof typeof SchemeThresholdFrequency];
@@ -186,7 +247,24 @@ interface PlanRowBase {
 }
 
 /** What each plan table adds to `planSelect`; one definition per type. */
-const sipSelect = { ...planSelect, schemeIsin: true, scheme: { select: { name: true } } } as const;
+/**
+ * A SIP also carries the mandate it is debited by. Selected here rather than
+ * read on demand, because "which bank collects this, and under what UMRN" is
+ * the first thing an investor checks when an installment fails.
+ */
+const sipSelect = {
+  ...planSelect,
+  schemeIsin: true,
+  scheme: { select: { name: true } },
+  mandate: {
+    select: {
+      id: true,
+      mandateStatus: true,
+      umrn: true,
+      bankAccount: { select: { bankName: true, accountNumberLast4: true } },
+    },
+  },
+} as const;
 const swpSelect = { ...planSelect, units: true, schemeIsin: true, scheme: { select: { name: true } } } as const;
 const stpSelect = {
   ...planSelect,
@@ -194,6 +272,10 @@ const stpSelect = {
   switchOutSchemeIsin: true,
   switchInSchemeIsin: true,
   switchOutScheme: { select: { name: true } },
+  // The destination, named. An STP's whole point is the fund it transfers
+  // into, and without this the screen could only show an ISIN or fetch the
+  // scheme separately to read one field of it.
+  switchInScheme: { select: { name: true } },
 } as const;
 
 type SipRow = Prisma.MfPurchasePlanGetPayload<{ select: typeof sipSelect }>;
@@ -202,7 +284,14 @@ type StpRow = Prisma.MfSwitchPlanGetPayload<{ select: typeof stpSelect }>;
 
 function toPlanDto(
   row: PlanRowBase,
-  extra: { type: PlanDto["type"]; isin: string; schemeName: string | null; amount: string | null; units: string | null },
+  extra: {
+    type: PlanDto["type"];
+    isin: string;
+    schemeName: string | null;
+    amount: string | null;
+    units: string | null;
+    mandate?: PlanMandateDto | null;
+  },
 ): PlanDto {
   return {
     id: row.id,
@@ -223,6 +312,7 @@ function toPlanDto(
     nextInstallmentDate: asDate(row.nextInstallmentDate),
     previousInstallmentDate: asDate(row.previousInstallmentDate),
     folioNumber: row.folioNumber,
+    mandate: extra.mandate ?? null,
     cancellationCode: row.cancellationCode,
     reason: row.reason,
     createdAt: (row.fpCreatedAt ?? row.createdAt).toISOString(),
@@ -238,6 +328,15 @@ const toSipDto = (row: SipRow): PlanDto =>
     schemeName: row.scheme?.name ?? null,
     amount: asAmount(row.amount),
     units: null,
+    mandate: row.mandate
+      ? {
+          id: row.mandate.id,
+          status: row.mandate.mandateStatus,
+          umrn: row.mandate.umrn,
+          bankName: row.mandate.bankAccount.bankName,
+          accountNumberLast4: row.mandate.bankAccount.accountNumberLast4,
+        }
+      : null,
   });
 
 const toSwpDto = (row: SwpRow): PlanDto =>
@@ -258,6 +357,7 @@ const toStpDto = (row: StpRow): PlanDto => ({
     units: asUnits(row.units),
   }),
   switchInIsin: row.switchInSchemeIsin,
+  switchInSchemeName: row.switchInScheme?.name ?? null,
 });
 
 async function requireAccount(mfInvestmentAccountId: string) {
@@ -276,8 +376,8 @@ async function requireAccount(mfInvestmentAccountId: string) {
  * FP answers "Mandate passed is incorrect, pass correct mandate for order
  * gateway …" otherwise, which is impossible to act on from the client.
  */
-async function resolveMandate(mandateId: string | undefined, mfInvestmentAccountId: string) {
-  if (!mandateId) return undefined;
+async function resolveMandate(mandateId: string | undefined, mfInvestmentAccountId: string, amount: string) {
+  if (!mandateId) throw HttpError.badRequest("Choose an approved mandate before creating a SIP");
   const mandate = await db.mandate.findFirst({
     where: {
       id: mandateId,
@@ -285,14 +385,10 @@ async function resolveMandate(mandateId: string | undefined, mfInvestmentAccount
         investorProfile: { primaryFor: { some: { id: mfInvestmentAccountId } } },
       },
     },
-    select: { fpId: true, mandateStatus: true },
+    select: { fpId: true, mandateStatus: true, providerName: true, mandateLimit: true, validFrom: true, validTo: true },
   });
   if (!mandate) throw HttpError.badRequest("That mandate does not belong to this investor");
-  if (mandate.mandateStatus !== "APPROVED") {
-    throw HttpError.badRequest("The mandate must be approved before it can fund a plan", {
-      status: mandate.mandateStatus,
-    });
-  }
+  assertSipMandate(mandate, amount);
   return mandate;
 }
 
@@ -304,7 +400,7 @@ export async function createSip(input: CreateSipInput): Promise<PlanDto> {
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
   const account = await requireAccount(input.mfInvestmentAccountId);
   const frequency = asFrequency(input.frequency);
-  if (!["MONTHLY", "DAILY", "CALENDAR_DAY_DAILY"].includes(frequency)) throw HttpError.badRequest("ONDC SIP supports monthly and daily frequencies only");
+  assertSipSchedule(frequency, input.installmentDay, input.numberOfInstallments);
   await validatePlan(SchemeThresholdType.SIP, {
     isin: input.isin,
     amount: input.amount,
@@ -313,7 +409,7 @@ export async function createSip(input: CreateSipInput): Promise<PlanDto> {
     numberOfInstallments: input.numberOfInstallments,
   });
 
-  const mandate = await resolveMandate(input.mandateId, account.id);
+  const mandate = await resolveMandate(input.mandateId, account.id, input.amount);
 
   try {
     const created = await fpPlans.createPurchasePlan({
@@ -336,10 +432,112 @@ export async function createSip(input: CreateSipInput): Promise<PlanDto> {
       gateway: GATEWAY,
     });
     const row = await syncPurchasePlan(created, account.id);
+    await settleNewSip(row.id, created.id, account.id, input.isin);
     return getSip(row.id);
   } catch (error) {
     fpErrorToHttpError(error);
   }
+}
+
+/**
+ * Wait out FP's activation review, and refuse to call a dead plan "created".
+ *
+ * Every plan create answers `created` and FP runs its own checks immediately
+ * afterwards — on the ONDC gateway a refusal lands within a second, with
+ * `failed_at` equal to `created_at`. Returning the create response as-is
+ * therefore reports a live plan that is already dead, and the investor only
+ * finds out when they press "Refresh status" and meet FP's reason with no
+ * context. Poll briefly instead and raise the reason as the outcome of the
+ * request that caused it.
+ *
+ * The plan row stays — FP created it and the mirror must say so — so the id
+ * travels with the error and the client can still open the plan.
+ *
+ * An SWP and an STP are reviewed by the same gateway as a SIP and fail the
+ * same way; they were returning FP's optimistic `created` unchecked, which is
+ * the one case where the app shows a withdrawal plan the investor does not
+ * have.
+ */
+async function settleNewPlan(
+  kind: "sip" | "swp" | "stp",
+  id: string,
+  fpId: string,
+  mfInvestmentAccountId: string,
+): Promise<{ state: string; reason: string | null }> {
+  let state = "";
+  let reason: string | null = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 400 : 800));
+    if (kind === "sip") {
+      const fresh = await fpPlans.fetchPurchasePlan(fpId);
+      await syncPurchasePlan(fresh, mfInvestmentAccountId);
+      state = String(fresh.state).toUpperCase();
+      reason = fresh.reason ?? null;
+    } else if (kind === "swp") {
+      const fresh = await fpPlans.fetchRedemptionPlan(fpId);
+      await syncRedemptionPlan(fresh, mfInvestmentAccountId);
+      state = String(fresh.state).toUpperCase();
+      reason = fresh.reason ?? null;
+    } else {
+      const fresh = await fpPlans.fetchSwitchPlan(fpId);
+      await syncSwitchPlan(fresh, mfInvestmentAccountId);
+      state = String(fresh.state).toUpperCase();
+      reason = fresh.reason ?? null;
+    }
+    if (state !== PlanState.CREATED) break;
+  }
+  if (state === PlanState.FAILED) {
+    const noun = kind.toUpperCase();
+    throw HttpError.badRequest(
+      reason ?? `The provider refused this ${noun} without giving a reason`,
+      { planId: id, state, reason },
+    );
+  }
+  return { state, reason };
+}
+
+/** The SIP path, which also learns from a refusal that names the scheme. */
+async function settleNewSip(
+  id: string,
+  fpId: string,
+  mfInvestmentAccountId: string,
+  isin: string,
+): Promise<void> {
+  try {
+    await settleNewPlan("sip", id, fpId, mfInvestmentAccountId);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      const reason = (error.details as { reason?: string | null } | undefined)?.reason ?? null;
+      await rememberSipRefusal(isin, reason);
+      throw HttpError.badRequest(error.message, { ...(error.details ?? {}), isin });
+    }
+    throw error;
+  }
+}
+
+/**
+ * Believe a refusal about the scheme over the catalogue that advertised it.
+ *
+ * FP publishes `sip_allowed` and a full set of per-frequency SIP thresholds for
+ * schemes its own gateway then refuses — the sandbox's
+ * "ICICI Prudential Retirement Fund Hybrid Aggressive Plan IDCW Payout"
+ * (INF109KC1TV6) is one, and nothing in the catalogue distinguishes it from the
+ * Growth plan beside it that works. The flag is a hint; a refusal naming the
+ * scheme is evidence. Clearing it here makes `validatePlan` stop the next
+ * investor before the order rather than after it.
+ *
+ * Only a refusal that is *about the scheme* counts. "payout account
+ * verification pending" is about the investor and would otherwise disable SIPs
+ * on a perfectly good fund for everyone.
+ *
+ * Writing to a mirrored row is allowed here because FP is the one that said it:
+ * the refusal arrived in an API response, which is exactly the authority the
+ * mirror requires. A re-seed restores the catalogue's optimistic flag, and the
+ * next refusal clears it again.
+ */
+async function rememberSipRefusal(isin: string, reason: string | null): Promise<void> {
+  if (!reason || !/sip .*not allowed .*scheme/i.test(reason)) return;
+  await db.mfScheme.updateMany({ where: { isin }, data: { sipAllowed: false } });
 }
 
 export async function getSip(id: string): Promise<PlanDto> {
@@ -382,7 +580,7 @@ export async function cancelSip(
     await syncPurchasePlan(cancelled, plan.mfInvestmentAccountId);
     return getSip(id);
   } catch (error) {
-    fpErrorToHttpError(error);
+    cancelRefusal(error);
   }
 }
 
@@ -417,10 +615,14 @@ export async function createSwp(input: CreateSwpInput): Promise<PlanDto> {
       number_of_installments: input.numberOfInstallments,
       source_ref_id: input.sourceRefId ?? crypto.randomUUID(),
       user_ip: input.userIp,
+      ...(input.serverIp && { server_ip: input.serverIp }),
+      ...(input.euin && { euin: input.euin }),
       initiated_by: "investor",
+      ...(input.initiatedVia && { initiated_via: input.initiatedVia }),
       gateway: GATEWAY,
     });
     const row = await syncRedemptionPlan(created, account.id);
+    await settleNewPlan("swp", row.id, created.id, account.id);
     return getSwp(row.id);
   } catch (error) {
     fpErrorToHttpError(error);
@@ -461,10 +663,14 @@ export async function createStp(input: CreateStpInput): Promise<PlanDto> {
       number_of_installments: input.numberOfInstallments,
       source_ref_id: input.sourceRefId ?? crypto.randomUUID(),
       user_ip: input.userIp,
+      ...(input.serverIp && { server_ip: input.serverIp }),
+      ...(input.euin && { euin: input.euin }),
       initiated_by: "investor",
+      ...(input.initiatedVia && { initiated_via: input.initiatedVia }),
       gateway: GATEWAY,
     });
     const row = await syncSwitchPlan(created, account.id);
+    await settleNewPlan("stp", row.id, created.id, account.id);
     return getStp(row.id);
   } catch (error) {
     fpErrorToHttpError(error);

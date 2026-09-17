@@ -23,6 +23,6 @@ export class HttpError extends Error {
   /** An upstream provider failed. Ours to retry, not the caller's problem. */
   static badGateway = (m = "Upstream provider is unavailable") =>
     new HttpError(502, "BAD_GATEWAY", m);
-  static serviceUnavailable = (m = "Service temporarily unavailable") =>
-    new HttpError(503, "SERVICE_UNAVAILABLE", m);
+  static serviceUnavailable = (m = "Service temporarily unavailable", d?: Record<string, unknown>) =>
+    new HttpError(503, "SERVICE_UNAVAILABLE", m, d);
 }

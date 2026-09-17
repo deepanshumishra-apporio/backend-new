@@ -174,7 +174,7 @@ function upperCased(body: Record<string, unknown>, field: string): Record<string
 export function requiredPan(body: Record<string, unknown>, field = "pan"): string {
   return requiredString(upperCased(body, field), field, {
     pattern: PAN_PATTERN,
-    patternHint: `${field} must be a valid PAN, e.g. ABCDE1234F`,
+    patternHint: `${field} must be a valid PAN, e.g. ABCPS1234F`,
   });
 }
 

@@ -4,7 +4,7 @@
 
 For the diagrams and the reasoning behind this shape, see [`ARCHITECTURE.md`](ARCHITECTURE.md). The schema file itself carries the commentary explaining *why* each decision was made.
 
-48 models, 59 enums.
+53 models, 59 enums.
 
 ## Model inventory
 
@@ -30,6 +30,7 @@ For the diagrams and the reasoning behind this shape, see [`ARCHITECTURE.md`](AR
 | `PhoneNumber` | `phone_numbers` | yes | POST /v2/phone_numbers. |
 | `EmailAddress` | `email_addresses` | yes | POST /v2/email_addresses. |
 | `BankAccount` | `bank_accounts` | yes | POST /v2/bank_accounts. |
+| `BankAccountLookup` | `bank_account_lookups` | yes | Consent-backed discovery of an investor's bank account from their verified mobile number. |
 | `RelatedParty` | `related_parties` | yes | POST /v2/related_parties — a person related to the investor, used for nominations. |
 | `RelatedPartyContact` | `related_party_contacts` | — | The identity-proof and contact block of a related party, or of that party's guardian when the party is a minor. |
 | `DematAccount` | `demat_accounts` | yes | POST /v2/demat_accounts. |
@@ -59,6 +60,10 @@ For the diagrams and the reasoning behind this shape, see [`ARCHITECTURE.md`](AR
 | `MfPayoutDetail` | `mf_payout_details` | yes | Where the proceeds of a successful redemption were paid. |
 | `PhoneVerification` | `phone_verifications` | — | One OTP challenge for one phone number. |
 | `FpWebhookEvent` | `fp_webhook_events` | — | Inbox for FP webhook deliveries (POST to our notification_webhooks URL). |
+| `InvestorSession` | `investor_sessions` | — |  |
+| `ApiRateLimit` | `api_rate_limits` | — | Shared between application instances; expired windows are reset atomically. |
+| `InvestorCommand` | `investor_commands` | — | Durable API command journal. |
+| `PaymentSubmission` | `payment_submissions` | — | Cross-process lock acquired before contacting the payment provider. |
 | `AuditLog` | `audit_logs` | — |  |
 
 ## Models
@@ -85,7 +90,7 @@ A login account on our platform. Not an FP object.  Mobile first: `phone` is the
 | `updatedAt` | DateTime |  |  |
 | `deletedAt` | DateTime? |  | Soft delete: financial records reference users with onDelete: Restrict, so an investor with history can never be hard-deleted. |
 
-Relations: `profileLinks` → UserInvestorProfile, `uploadedFiles` → FpFile, `kycChecks` → KycCheck, `kycRequests` → KycRequest, `kycForms` → KycForm, `preVerifications` → PreVerification, `watchlist` → WatchlistItem, `auditLogs` → AuditLog.
+Relations: `sessions` → InvestorSession, `commands` → InvestorCommand, `profileLinks` → UserInvestorProfile, `uploadedFiles` → FpFile, `kycChecks` → KycCheck, `kycRequests` → KycRequest, `kycForms` → KycForm, `preVerifications` → PreVerification, `bankAccountLookups` → BankAccountLookup, `watchlist` → WatchlistItem, `auditLogs` → AuditLog.
 
 Indexes:
 
@@ -128,6 +133,7 @@ Where an investor is in the onboarding journey.  A denormalised cursor, kept so 
 | `investorProfileId` | Uuid | UK |  |
 | `stage` | OnboardingStage |  |  |
 | `lastError` | VarChar(500)? |  | Last failure shown to the investor, so a resumed session can explain itself. Free text from us, never a raw FP payload. |
+| `nominationOptOutAt` | DateTime? |  | When the investor declined to nominate, or null if they never said.  Declining leaves no nominee row, so without this there is nothing to tell "said no" apart from "has not been asked" — and the resume route, which reads what is still outstanding, sent the investor back to the nominee screen for ever. A timestamp rather than a boolean because the choice is a regulatory declaration and when it was made is part of it. |
 | `startedAt` | DateTime |  |  |
 | `completedAt` | DateTime? |  |  |
 | `updatedAt` | DateTime |  |  |
@@ -262,6 +268,7 @@ One result per bank entry in the provider response, including failed checks. Kee
 | `code` | VarChar(120)? |  |  |
 | `reason` | Text? |  |  |
 | `accountNumber` | Text |  |  |
+| `accountNumberFingerprint` | VarChar(64)? |  |  |
 | `ifscCode` | VarChar(11) |  |  |
 | `accountType` | VarChar(60) |  | POA vocabulary includes nre_savings/nro_savings; not BankAccountType. |
 | `bankAccountProofFpId` | VarChar(64)? |  | Partner-realm file reference, not a tenant-realm FpFile foreign key. |
@@ -274,6 +281,7 @@ Relations: `preVerification` → PreVerification.
 Indexes:
 
 - `@@unique([preVerificationId, position])`
+- `@@index([accountNumberFingerprint])`
 
 ### KycRequest
 
@@ -507,7 +515,7 @@ POST /v2/investor_profiles — the investor's demographic record in FP.  PAN is 
 | `updatedAt` | DateTime |  |  |
 | `syncedAt` | DateTime |  |  |
 
-Relations: `signatureFile` → FpFile, `employerProfile` → InvestorProfile, `employees` → InvestorProfile, `onboarding` → InvestorOnboarding, `userLinks` → UserInvestorProfile, `taxResidencies` → TaxResidency, `addresses` → Address, `phoneNumbers` → PhoneNumber, `emailAddresses` → EmailAddress, `bankAccounts` → BankAccount, `relatedParties` → RelatedParty, `dematAccounts` → DematAccount, `kycChecks` → KycCheck, `kycRequests` → KycRequest, `kycForms` → KycForm, `preVerifications` → PreVerification, `primaryFor` → MfInvestmentAccount, `secondFor` → MfInvestmentAccount, `thirdFor` → MfInvestmentAccount.
+Relations: `signatureFile` → FpFile, `employerProfile` → InvestorProfile, `employees` → InvestorProfile, `onboarding` → InvestorOnboarding, `userLinks` → UserInvestorProfile, `taxResidencies` → TaxResidency, `addresses` → Address, `phoneNumbers` → PhoneNumber, `emailAddresses` → EmailAddress, `bankAccounts` → BankAccount, `relatedParties` → RelatedParty, `dematAccounts` → DematAccount, `kycChecks` → KycCheck, `kycRequests` → KycRequest, `kycForms` → KycForm, `preVerifications` → PreVerification, `bankAccountLookups` → BankAccountLookup, `primaryFor` → MfInvestmentAccount, `secondFor` → MfInvestmentAccount, `thirdFor` → MfInvestmentAccount.
 
 Indexes:
 
@@ -654,12 +662,40 @@ POST /v2/bank_accounts.  The full account number is deliberately NOT stored. FP 
 | `updatedAt` | DateTime |  |  |
 | `syncedAt` | DateTime |  |  |
 
-Relations: `investorProfile` → InvestorProfile, `cancelledChequeFile` → FpFile, `mandates` → Mandate, `payments` → Payment, `payoutFor` → MfFolioDefaults.
+Relations: `investorProfile` → InvestorProfile, `cancelledChequeFile` → FpFile, `mandates` → Mandate, `payments` → Payment, `payoutFor` → MfFolioDefaults, `lookup` → BankAccountLookup.
 
 Indexes:
 
 - `@@unique([investorProfileId, accountNumberFingerprint])`
 - `@@index([investorProfileId])`
+
+### BankAccountLookup
+
+Table `bank_account_lookups`.
+
+Consent-backed discovery of an investor's bank account from their verified mobile number. The full account number is deliberately never persisted; FP returns it only while the investor confirms and links the result.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `fpId` | VarChar(64) | UK |  |
+| `userId` | Uuid |  |  |
+| `investorProfileId` | Uuid |  |  |
+| `sourceRefId` | VarChar(64) | UK |  |
+| `phoneLast4` | VarChar(4) |  |  |
+| `status` | VarChar(20) |  |  |
+| `bankAccountId` | Uuid? | UK |  |
+| `consentedAt` | Timestamptz(3) |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
+| `syncedAt` | Timestamptz(3) |  |  |
+
+Relations: `user` → User, `investorProfile` → InvestorProfile, `bankAccount` → BankAccount.
+
+Indexes:
+
+- `@@index([userId, createdAt(sort: Desc)])`
+- `@@index([investorProfileId, createdAt(sort: Desc)])`
 
 ### RelatedParty
 
@@ -1219,7 +1255,7 @@ POST /v2/mf_purchases — lumpsum purchase, or an installment of a purchase plan
 | `updatedAt` | DateTime |  |  |
 | `syncedAt` | DateTime |  |  |
 
-Relations: `mfInvestmentAccount` → MfInvestmentAccount, `scheme` → MfScheme, `mfFolio` → MfFolio, `plan` → MfPurchasePlan, `partner` → Partner, `settlementDetail` → MfSettlementDetail, `payments` → PaymentPurchase.
+Relations: `mfInvestmentAccount` → MfInvestmentAccount, `scheme` → MfScheme, `mfFolio` → MfFolio, `plan` → MfPurchasePlan, `partner` → Partner, `settlementDetail` → MfSettlementDetail, `payments` → PaymentPurchase, `paymentSubmission` → PaymentSubmission.
 
 Indexes:
 
@@ -1710,10 +1746,12 @@ One OTP challenge for one phone number.  The OTP itself is deliberately absent f
 | Column | Type | Key | Notes |
 |---|---|---|---|
 | `id` | Uuid | PK |  |
+| `context` | VarChar(200)? |  | Server-derived transaction/account context; absent for login challenges. |
 | `phone` | VarChar(20) |  | E.164, always normalised (+919876543210) so rate limits cannot be evaded by reformatting the same number. |
 | `purpose` | OtpPurpose |  |  |
 | `status` | OtpStatus |  |  |
 | `providerRequestId` | VarChar(100)? |  | MSG91's request id, for correlating with their delivery logs. |
+| `codeHash` | VarChar(64)? |  | SHA-256 of "<id>:<code>", set only when this challenge was delivered by email. MSG91 keeps its own codes, so an SMS challenge leaves this null — which is also how verification knows which path to take. Salted with the row id so a leaked table cannot be reversed with one rainbow table. |
 | `attempts` | Int |  | Wrong codes submitted against this challenge. |
 | `sendCount` | Int |  | Deliveries for this challenge, including resends. |
 | `expiresAt` | DateTime |  |  |
@@ -1759,6 +1797,84 @@ Indexes:
 - `@@index([status, receivedAt])`
 - `@@index([type, receivedAt(sort: Desc)])`
 - `@@index([objectType, objectFpId])`
+
+### InvestorSession
+
+Table `investor_sessions`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `userId` | Uuid |  |  |
+| `tokenHash` | VarChar(64) | UK |  |
+| `expiresAt` | Timestamptz(3) |  |  |
+| `revokedAt` | Timestamptz(3)? |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `user` → User.
+
+Indexes:
+
+- `@@index([userId, expiresAt])`
+
+### ApiRateLimit
+
+Table `api_rate_limits`.
+
+Shared between application instances; expired windows are reset atomically.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `key` | VarChar(64) | PK |  |
+| `count` | Int |  |  |
+| `windowStartedAt` | Timestamptz(3) |  |  |
+
+Indexes:
+
+- `@@index([windowStartedAt])`
+
+### InvestorCommand
+
+Table `investor_commands`.
+
+Durable API command journal. An uncertain write stays blocked until reconciled; never automatically expire a claim and repeat a potentially successful debit.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `userId` | Uuid |  |  |
+| `key` | VarChar(128) |  |  |
+| `requestHash` | VarChar(64) |  |  |
+| `route` | VarChar(250) |  |  |
+| `statusCode` | Int? |  |  |
+| `response` | JsonB? |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+| `completedAt` | Timestamptz(3)? |  |  |
+
+Relations: `user` → User.
+
+Indexes:
+
+- `@@unique([userId, key])`
+- `@@index([completedAt, createdAt])`
+
+### PaymentSubmission
+
+Table `payment_submissions`.
+
+Cross-process lock acquired before contacting the payment provider. A lost response keeps the lock; reconcile against FP before releasing it.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `orderId` | Uuid | PK |  |
+| `fpPaymentId` | Int? |  | Provider id is saved immediately after create, before secondary fetches. |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `order` → MfPurchase.
+
+Indexes:
+
+- `@@index([fpPaymentId])`
 
 ### AuditLog
 

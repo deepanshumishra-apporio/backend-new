@@ -6,7 +6,7 @@
   "scripts": {
     "//test": "test:unit is offline and fast; test:schema needs pglite; test:e2e talks to the live FP sandbox. `test` runs the two that need no network.",
     "test": "bun run test:unit && bun run test:schema",
-    "test:unit": "bun test tests/unit.test.ts",
+    "test:unit": "bun test tests/unit.test.ts tests/sandbox-auth.test.ts tests/kyc-prefill.test.ts && bun test tests/kyc-flow.test.ts && bun test tests/otp-context.test.ts && bun test tests/redemption-settle.test.ts",
     "test:schema": "node --test --test-isolation=none tests/investor-schema.test.mjs",
     "//e2e": "Live end-to-end run against the FP ONDC sandbox and the configured database. Creates real objects; never point it at production.",
     "test:e2e": "bun run tests/e2e-ondc.ts",
@@ -30,12 +30,14 @@
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "^7.9.1",
     "express": "^5.2.1",
+    "nodemailer": "^10.0.9",
     "pg": "^8.23.0"
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.4.3",
     "@types/bun": "latest",
     "@types/express": "^5.0.6",
+    "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.21.0",
     "prisma": "^7.9.1"
   },

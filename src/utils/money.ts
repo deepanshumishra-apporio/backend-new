@@ -17,3 +17,17 @@ export const asAllocation = (v: Prisma.Decimal | null | undefined) => fixed(v, 2
 /** yyyy-mm-dd, the format every FP date field uses. */
 export const asDate = (v: Date | null | undefined) =>
   v === null || v === undefined ? null : v.toISOString().slice(0, 10);
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * Today, on the calendar FP is keeping.
+ *
+ * Every date FP sends is an IST calendar date stored at UTC midnight, so a
+ * "today" taken from `toISOString()` is a day behind for the five and a half
+ * hours after IST midnight. Comparing the two made a mandate issued this
+ * morning look like it started tomorrow, and every SIP on it was refused with
+ * "Mandate is outside its validity period" until the sun came up.
+ */
+export const istToday = (now: Date = new Date()) =>
+  new Date(now.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);

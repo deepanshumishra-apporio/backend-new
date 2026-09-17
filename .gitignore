@@ -34,3 +34,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 /generated/prisma
+
+# runtime logs & scratch (never publish)
+*.log
+scratch/
+otp-fix-runtime.log
+otp-fix-runtime-error.log

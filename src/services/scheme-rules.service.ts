@@ -97,12 +97,15 @@ interface UnitRules {
   unitsMultiples: Prisma.Decimal | null;
 }
 
-function checkAmount(raw: string, rules: AmountRules, label: string): void {
+export function checkAmount(raw: string, rules: AmountRules, label: string): void {
   let amount: Prisma.Decimal;
   try {
     amount = new Prisma.Decimal(raw);
   } catch {
     throw HttpError.badRequest(`${label} must be a decimal number`);
+  }
+  if (!amount.isFinite() || amount.decimalPlaces() > 2) {
+    throw HttpError.badRequest(`${label} must be finite with at most two decimal places`);
   }
   if (amount.lessThanOrEqualTo(0)) {
     throw HttpError.badRequest(`${label} must be greater than zero`);
@@ -171,7 +174,72 @@ export async function validatePurchase(
     isin,
     hasFolio ? SchemeThresholdType.ADDITIONAL : SchemeThresholdType.LUMPSUM,
   );
-  if (threshold) checkAmount(amount, threshold, "amount");
+  checkAmount(amount, threshold ?? { amountMin: null, amountMax: null, amountMultiples: null }, "amount");
+}
+
+/**
+ * Refuse to sell more than the folio can actually give up.
+ *
+ * FP's own integration guide makes this step 3 of a redemption, before the
+ * order is created: `redeemable_units` must be greater than zero and the
+ * requested amount or units must fit inside it. Checking only the scheme's
+ * min/max — which is all this did — lets an investor ask for ten times what
+ * they hold and meet the refusal at the registrar instead of on the form.
+ *
+ * `redeemableUnits` is not `units`: it excludes anything under lock-in or
+ * already committed to a pending order, so an ELSS holding can show units and
+ * still be unsellable. The fallbacks exist because FP leaves the redeemable
+ * columns null on some holdings, and the total is a better answer than none.
+ *
+ * A pre-flight check, never an authority — same rule as the thresholds above.
+ * A folio we have never mirrored passes through to FP rather than failing
+ * closed, because a stale local holding must not block a valid order.
+ */
+export async function assertRedeemable(
+  mfInvestmentAccountId: string,
+  folioNumber: string,
+  isin: string,
+  amount: string | undefined,
+  units: string | undefined,
+): Promise<void> {
+  const holding = await db.mfHolding.findUnique({
+    where: {
+      mfInvestmentAccountId_folioNumber_schemeIsin: {
+        mfInvestmentAccountId,
+        folioNumber,
+        schemeIsin: isin,
+      },
+    },
+    select: { units: true, redeemableUnits: true, marketValue: true, redeemableMarketValue: true },
+  });
+  if (!holding) return;
+
+  const sellableUnits = holding.redeemableUnits ?? holding.units;
+  if (sellableUnits.lessThanOrEqualTo(0)) {
+    throw HttpError.badRequest(
+      "None of the units in this folio can be sold right now — they are under lock-in or already committed to a pending order",
+      { folioNumber, isin, redeemableUnits: sellableUnits.toFixed(4) },
+    );
+  }
+
+  if (units !== undefined && new Prisma.Decimal(units).greaterThan(sellableUnits)) {
+    throw HttpError.badRequest(
+      `Only ${sellableUnits.toFixed(4)} units in this folio can be sold`,
+      { redeemableUnits: sellableUnits.toFixed(4) },
+    );
+  }
+
+  const sellableValue = holding.redeemableMarketValue ?? holding.marketValue;
+  if (
+    amount !== undefined &&
+    sellableValue !== null &&
+    new Prisma.Decimal(amount).greaterThan(sellableValue)
+  ) {
+    throw HttpError.badRequest(
+      `This folio holds ${sellableValue.toFixed(2)} in this scheme, which is less than the amount requested`,
+      { redeemableAmount: sellableValue.toFixed(2) },
+    );
+  }
 }
 
 export async function validateRedemption(

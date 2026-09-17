@@ -8,8 +8,14 @@ import { errorHandler, notFoundHandler } from "./middleware/error-handler.ts";
 import { apiRouter } from "./routes/index.ts";
 import { apiRateLimit } from "./middleware/api-security.ts";
 import { browserCors } from "./middleware/cors.ts";
+import { assertOtpChannelConfig } from "./services/otp-channel.ts";
 
 export function createApp(): Express {
+  // Before anything binds: an OTP channel that is half-configured, or an email
+  // fallback left on in production, must stop the process rather than surface
+  // as a login nobody can complete.
+  assertOtpChannelConfig();
+
   const app = express();
 
   // Behind a load balancer, req.socket.remoteAddress is the balancer. Trusting

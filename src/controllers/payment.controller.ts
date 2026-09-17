@@ -33,6 +33,21 @@ export async function createMandate(req: Request, res: Response) {
   });
 }
 
+/**
+ * Sandbox only. Outside it the route is not mounted at all, so this is a second
+ * guard rather than the only one.
+ */
+export async function simulateMandate(req: Request<MandateParams>, res: Response) {
+  if (!paymentService.mandateSimulationAvailable()) throw HttpError.notFound("Route not found");
+  const body = asBody(req.body ?? {});
+  res.json({
+    data: await paymentService.simulateMandateSettlement(
+      req.params.mandateId,
+      oneOf(body, "status", ["APPROVED", "REJECTED"] as const, false) ?? "APPROVED",
+    ),
+  });
+}
+
 export async function authorizeMandate(req: Request<MandateParams>, res: Response) {
   const body = asBody(req.body ?? {});
   res.json({

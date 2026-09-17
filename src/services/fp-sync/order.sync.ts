@@ -86,18 +86,53 @@ async function resolveFolioId(
   return folio?.id ?? null;
 }
 
+/**
+ * Resolve the local plan row an installment belongs to.
+ *
+ * FP reports the owning plan on every order as `plan`, and it is the only link
+ * between a plan and the orders it generates — an SWP installment is an
+ * ordinary redemption that happens to carry `mfrp_…` here. Without this the
+ * installment lands with `planId` null and "what has my SWP paid out so far"
+ * has no answer at all, because the plan object itself only says when the next
+ * one is due.
+ *
+ * Null when the plan has not been mirrored yet: FP can announce an installment
+ * before the plan's own webhook lands, and an order is worth keeping either
+ * way. The next sync of the same order fills it in.
+ */
+async function resolvePlanId(
+  kind: "purchase" | "redemption" | "switch",
+  fpPlanId: string | null,
+): Promise<string | null> {
+  if (!fpPlanId) return null;
+  const where = { fpId: fpPlanId };
+  const select = { id: true } as const;
+  const plan =
+    kind === "purchase"
+      ? await db.mfPurchasePlan.findUnique({ where, select })
+      : kind === "redemption"
+        ? await db.mfRedemptionPlan.findUnique({ where, select })
+        : await db.mfSwitchPlan.findUnique({ where, select });
+  if (!plan) console.warn(`[fp-sync] ${kind} references unmirrored plan ${fpPlanId}`);
+  return plan?.id ?? null;
+}
+
 export async function syncPurchase(
   order: FpPurchase,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
   const common = orderCommon(order);
-  const mfFolioId = await resolveFolioId(mfInvestmentAccountId, common.folioNumber);
+  const [mfFolioId, planId] = await Promise.all([
+    resolveFolioId(mfInvestmentAccountId, common.folioNumber),
+    resolvePlanId("purchase", order.plan),
+  ]);
 
   const data = {
     ...common,
     mfInvestmentAccountId,
     schemeIsin: order.scheme,
     mfFolioId,
+    planId,
     type: fpEnum(MfPurchaseType, order.type, unknownValue("purchase type")),
     amount: fpAmount(order.amount) ?? "0.00",
     // Null until the AMC allots. Never synthesise these.
@@ -121,13 +156,17 @@ export async function syncRedemption(
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
   const common = orderCommon(order);
-  const mfFolioId = await resolveFolioId(mfInvestmentAccountId, common.folioNumber);
+  const [mfFolioId, planId] = await Promise.all([
+    resolveFolioId(mfInvestmentAccountId, common.folioNumber),
+    resolvePlanId("redemption", order.plan),
+  ]);
 
   const data = {
     ...common,
     mfInvestmentAccountId,
     schemeIsin: order.scheme,
     mfFolioId,
+    planId,
     redemptionMode: fpEnumOr(
       RedemptionMode,
       order.redemption_mode,
@@ -158,12 +197,16 @@ export async function syncSwitch(
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
   const common = orderCommon(order);
-  const mfFolioId = await resolveFolioId(mfInvestmentAccountId, common.folioNumber);
+  const [mfFolioId, planId] = await Promise.all([
+    resolveFolioId(mfInvestmentAccountId, common.folioNumber),
+    resolvePlanId("switch", order.plan),
+  ]);
 
   const data = {
     ...common,
     mfInvestmentAccountId,
     mfFolioId,
+    planId,
     switchOutSchemeIsin: order.switch_out_scheme,
     switchInSchemeIsin: order.switch_in_scheme,
     amount: fpAmount(order.amount),

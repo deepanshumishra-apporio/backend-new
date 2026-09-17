@@ -6,7 +6,12 @@ export const investorRouter = Router();
 // Express 5 forwards rejected promises to the error handler, so no wrapper.
 investorRouter.post("/profiles", investor.createProfile);
 investorRouter.get("/profiles", investor.listProfiles);
+// Before `/profiles/:profileId`, or the literal path is taken for an id.
+investorRouter.get("/profiles/prefill", investor.getProfilePrefill);
 investorRouter.get("/onboarding", investor.getOnboarding);
+// Builds the profile, contacts, nomination and investment account from what
+// the identity journey already collected. Idempotent; called after each step.
+investorRouter.post("/provision", investor.provision);
 investorRouter.get("/profiles/:profileId", investor.getProfile);
 
 // Contact details. Each is write-once at FP, so there is no update route:
@@ -16,6 +21,18 @@ investorRouter.post("/profiles/:profileId/phones", investor.addPhone);
 investorRouter.post("/profiles/:profileId/emails", investor.addEmail);
 investorRouter.post("/profiles/:profileId/bank-accounts", investor.addBankAccount);
 investorRouter.get("/profiles/:profileId/bank-accounts", investor.listBankAccounts);
+investorRouter.post(
+  "/profiles/:profileId/bank-account-lookups",
+  investor.createBankAccountLookup,
+);
+investorRouter.post(
+  "/bank-account-lookups/:lookupId/refresh",
+  investor.refreshBankAccountLookup,
+);
+investorRouter.post(
+  "/bank-account-lookups/:lookupId/link",
+  investor.linkBankAccountLookup,
+);
 investorRouter.post("/profiles/:profileId/nominees", investor.addNominee);
 
 // Bank account verification (penny-drop). Required before a cybrillapoa order

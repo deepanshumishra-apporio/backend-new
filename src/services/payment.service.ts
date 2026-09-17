@@ -15,9 +15,16 @@ import {
   PaymentStatus,
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
-import { FpApiError, FpTransportError, fpErrorToHttpError, fpPayments } from "../integrations/fp/index.ts";
+import {
+  FpApiError,
+  FpTransportError,
+  fpConfig,
+  fpErrorToHttpError,
+  fpPayments,
+  fpSimulation,
+} from "../integrations/fp/index.ts";
 import { HttpError } from "../utils/http-error.ts";
-import { asAmount, asDate } from "../utils/money.ts";
+import { asAmount, asDate, istToday } from "../utils/money.ts";
 import { syncMandate, syncPayment } from "./fp-sync/index.ts";
 import {
   assertInvestmentReady,
@@ -270,6 +277,42 @@ export async function refreshMandate(id: string): Promise<MandateDto> {
 }
 
 /**
+ * Sandbox only: drive a mandate to the state a real bank would have produced.
+ *
+ * Nothing in the sandbox reaches a bank, so a mandate created here stays
+ * CREATED for ever and no UMRN is ever issued — which leaves every SIP path
+ * untestable, because a plan can only be funded by an APPROVED mandate.
+ *
+ * `fpSimulation` refuses to run unless FP's own base URL is the sandbox host
+ * *and* `NODE_ENV` is not production, so this cannot be turned on by a stray
+ * environment variable. The route in front of it answers 404 off the same flag,
+ * so outside the sandbox this endpoint does not appear to exist at all.
+ */
+export const mandateSimulationAvailable = (): boolean => fpConfig().simulationEnabled;
+
+export async function simulateMandateSettlement(
+  id: string,
+  status: "APPROVED" | "REJECTED" = "APPROVED",
+): Promise<MandateDto> {
+  const mandate = await db.mandate.findUnique({
+    where: { id },
+    select: { fpId: true, mandateStatus: true },
+  });
+  if (!mandate) throw HttpError.notFound("No such mandate");
+  if (mandate.mandateStatus === MandateStatus.APPROVED) return getMandate(id);
+  try {
+    await fpSimulation.simulateMandate(mandate.fpId, status);
+    // Read it back rather than assuming: the UMRN is issued by FP during the
+    // transition, and it is the whole point of doing this.
+    const fresh = await fpPayments.fetchMandate(mandate.fpId);
+    await syncMandate(fresh);
+    return getMandate(id);
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
+/**
  * Cancel an approved mandate.
  *
  * This is not a quiet operation: FP marks the future payments of every SIP
@@ -431,6 +474,28 @@ async function resolvePayableOrders(mfPurchaseIds: string[]) {
 }
 
 /**
+ * The account an investor pays from when the caller names none.
+ *
+ * The payout account first — it is the one already registered against the
+ * folio — then any account on the profile, so an investor who has added a bank
+ * but not yet chosen a payout default can still pay.
+ */
+async function defaultPayingAccount(mfInvestmentAccountId: string): Promise<string | null> {
+  const account = await db.mfInvestmentAccount.findUnique({
+    where: { id: mfInvestmentAccountId },
+    select: { primaryInvestorProfileId: true, folioDefaults: { select: { payoutBankAccountId: true } } },
+  });
+  if (!account) return null;
+  if (account.folioDefaults?.payoutBankAccountId) return account.folioDefaults.payoutBankAccountId;
+  const any = await db.bankAccount.findFirst({
+    where: { investorProfileId: account.primaryInvestorProfileId, fpOldId: { not: null } },
+    select: { id: true },
+    orderBy: { createdAt: "asc" },
+  });
+  return any?.id ?? null;
+}
+
+/**
  * Collect payment by netbanking or UPI. The investor completes it at
  * `paymentUrl`, and FP confirms the order itself once the money arrives.
  */
@@ -439,24 +504,41 @@ export async function payByNetbanking(input: PayOrdersInput): Promise<PaymentDto
   const orders = await resolvePayableOrders(input.orderIds);
   await assertNotAlreadyPaid(input.orderIds);
 
-  const bankAccount = input.bankAccountId
-    ? await db.bankAccount.findUnique({
-        where: { id: input.bankAccountId },
-        select: { fpOldId: true, investorProfileId: true },
-      })
-    : null;
+  // The ONDC half of /api/pg requires the debiting account and answers a bare
+  // 422 "Bank Account Id could not be null" without it — which reaches the
+  // investor as an internal error on the one screen where they are trying to
+  // pay. The account they are paying from is not really the caller's choice
+  // anyway: it is the one registered on the investment account, so fall back to
+  // it rather than making every caller remember to send it.
+  const bankAccountId = input.bankAccountId ?? (await defaultPayingAccount(orders[0]!.mfInvestmentAccountId));
+  if (!bankAccountId) {
+    throw HttpError.conflict(
+      "This investment account has no bank account to pay from — add one, or set a payout bank account, before paying by netbanking",
+    );
+  }
 
-  if (input.bankAccountId) {
-    if (!bankAccount?.fpOldId) throw HttpError.badRequest("Invalid payment bank account");
-    const account = await db.mfInvestmentAccount.findUniqueOrThrow({ where: { id: orders[0]!.mfInvestmentAccountId }, select: { primaryInvestorProfileId: true } });
-    if (bankAccount.investorProfileId !== account.primaryInvestorProfileId) throw HttpError.badRequest("Payment bank account must belong to the order investor");
+  const bankAccount = await db.bankAccount.findUnique({
+    where: { id: bankAccountId },
+    select: { fpOldId: true, investorProfileId: true },
+  });
+  if (!bankAccount?.fpOldId) throw HttpError.badRequest("Invalid payment bank account");
+  const account = await db.mfInvestmentAccount.findUniqueOrThrow({ where: { id: orders[0]!.mfInvestmentAccountId }, select: { primaryInvestorProfileId: true } });
+  if (bankAccount.investorProfileId !== account.primaryInvestorProfileId) throw HttpError.badRequest("Payment bank account must belong to the order investor");
+  if (payoutVerificationRequired() && !(await bankIsVerified(bankAccountId))) {
+    throw HttpError.conflict("Verify the selected bank account before making a payment");
   }
   await claimPayment(input.orderIds);
 
   try {
-    const created = await fpPayments.createNetbankingPayment({
+    const created = await createNetbankingWithRetry({
       amc_order_ids: orders.map((order) => order.fpOldId),
-      ...(input.method && { method: input.method }),
+      // Mandatory on the ONDC provider, and its absence is reported terribly:
+      // FP answers `400 "payment method has to present for ondc provider"`, or
+      // in some combinations the actively misleading
+      // `422 "Provider ONDC not configured"`, which reads as though the whole
+      // gateway were switched off. NETBANKING is the default because it is the
+      // one every bank supports; UPI is the caller's opt-in.
+      method: input.method ?? "NETBANKING",
       ...(input.postbackUrl && { payment_postback_url: input.postbackUrl }),
       ...(bankAccount?.fpOldId && { bank_account_id: bankAccount.fpOldId }),
       // NOT the mandate's provider name. The payments half of /api/pg rejects
@@ -475,8 +557,77 @@ export async function payByNetbanking(input: PayOrdersInput): Promise<PaymentDto
     return getPayment(row.id);
   } catch (error) {
     await releaseClaimIfNothingHappened(input.orderIds, error);
+    rejectUnconfiguredProvider(error);
     fpErrorToHttpError(error);
   }
+}
+
+/** Is this FP's "the ONDC payment provider is not wired up" answer? */
+function isUnconfiguredProvider(error: unknown): boolean {
+  return (
+    error instanceof FpApiError &&
+    (error.code === "NO_PAYMENT_PROVIDER" ||
+      /provider\s+\S+\s+not configured/i.test(error.message))
+  );
+}
+
+/**
+ * Create the payment, riding out a provider that is momentarily not wired up.
+ *
+ * The ONDC payment provider flaps on this tenant: the same payload that answers
+ * `NO_PAYMENT_PROVIDER` one minute is accepted the next. Verified by sending
+ * identical requests minutes apart — so the investor was being turned away from
+ * checkout by a condition that had already passed.
+ *
+ * Retrying a payment POST is normally the one thing never to do, because a
+ * request that actually succeeded upstream would debit twice. It is safe here
+ * and only here: this is a 4xx, which means FP received the request, rejected
+ * it and created nothing — the same reasoning `releaseClaimIfNothingHappened`
+ * already relies on to hand the claim back. Every other failure, including any
+ * transport error, falls straight through untouched.
+ */
+async function createNetbankingWithRetry(
+  payload: Parameters<typeof fpPayments.createNetbankingPayment>[0],
+) {
+  // ~5s total. Measured: the provider answered 6/6 identical requests one
+  // minute and refused a raw call and a service call alike the next, so the
+  // outages run to minutes and this only covers the short blips. The honest
+  // answer to a long one is the AutoPay fallback the 503 points at, not making
+  // the investor watch a spinner.
+  const backoffMs = [500, 1500, 3000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fpPayments.createNetbankingPayment(payload);
+    } catch (error) {
+      const delay = backoffMs[attempt];
+      if (delay === undefined || !isUnconfiguredProvider(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
+ * Report an unprovisioned payment gateway as an outage, not as a bad request.
+ *
+ * FP answers `NO_PAYMENT_PROVIDER` / "Provider ONDC not configured" with a 4xx,
+ * so the generic translation blamed the investor for a 400 and put FP's
+ * internal wording — which names a provider they have never heard of — on the
+ * checkout screen. Nothing about the request was wrong: the ONDC payment
+ * provider comes and goes on this tenant, and while it is down UPI and
+ * netbanking cannot be collected at all.
+ *
+ * 503 because it is temporary and the investor should retry, and because a
+ * client that retries a 4xx is doing the wrong thing. The message names the
+ * one route that still works, since an investor with an approved mandate is
+ * not actually blocked.
+ */
+function rejectUnconfiguredProvider(error: unknown): void {
+  if (!isUnconfiguredProvider(error)) return;
+  throw HttpError.serviceUnavailable(
+    "UPI and netbanking are unavailable from our payment provider right now. " +
+      "Pay with AutoPay if you have one set up, or try again shortly.",
+    { retryable: true, alternative: "mandate" },
+  );
 }
 
 /** Debit an approved mandate instead of sending the investor to a bank page. */
@@ -496,7 +647,7 @@ export async function payByMandate(
   const account = await db.mfInvestmentAccount.findUniqueOrThrow({ where: { id: orders[0]!.mfInvestmentAccountId }, select: { primaryInvestorProfileId: true } });
   if (mandate.bankAccount.investorProfileId !== account.primaryInvestorProfileId) throw HttpError.badRequest("Mandate must belong to the order investor");
   if (mandate.mandateLimit.lessThan(orders[0]!.amount)) throw HttpError.badRequest("Order amount exceeds mandate limit");
-  const today = new Date().toISOString().slice(0, 10);
+  const today = istToday();
   if ((mandate.validFrom && mandate.validFrom.toISOString().slice(0, 10) > today) || (mandate.validTo && mandate.validTo.toISOString().slice(0, 10) < today)) throw HttpError.conflict("Mandate is outside its validity period");
   if (mandate.mandateStatus !== MandateStatus.APPROVED) {
     // FP would accept this and immediately fail the payment, which is a worse

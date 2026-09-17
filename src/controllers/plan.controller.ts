@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import * as planService from "../services/plan.service.ts";
+import { listPlanInstallments } from "../services/order.service.ts";
 import {
   asBody,
   clientIpv4,
@@ -46,16 +47,32 @@ const CANCELLATION_CODES = [
 
 type PlanParams = { planId: string };
 
+const INITIATED_VIA = [
+  "web",
+  "mobile_app",
+  "mobile_app_android",
+  "mobile_app_ios",
+  "mobile_web",
+  "mobile_web_android",
+  "mobile_web_ios",
+] as const;
+
 function shared(req: Request, body: Record<string, unknown>) {
   // Our enum name, e.g. MONTHLY. The service translates it to FP's wire form
   // — controllers and services share one vocabulary, and only the FP client
   // speaks FP's.
+  const euin = optionalString(body, "euin", { maxLength: 10 });
   return {
     mfInvestmentAccountId: requiredString(body, "mfInvestmentAccountId"),
     frequency: oneOf(body, "frequency", FREQUENCIES) as string,
     installmentDay: optionalInt(body, "installmentDay", { min: 1, max: 28 }),
     numberOfInstallments: requiredInt(body, "numberOfInstallments", { min: 1, max: 1200 }),
     userIp: clientIpv4({}, req.ip ?? req.socket.remoteAddress),
+    // Attribution the registrar records against the plan, exactly as an order
+    // carries it. An SWP raised in the app was being filed with no channel at
+    // all because only the SIP path collected these.
+    initiatedVia: oneOf(body, "initiatedVia", INITIATED_VIA, false),
+    ...(euin && { euin }),
     sourceRefId: optionalString(body, "sourceRefId", { maxLength: 64 }),
   };
 }
@@ -70,7 +87,7 @@ export async function createSip(req: Request, res: Response) {
       isin: requiredIsin(body),
       amount: requiredDecimal(body, "amount", { maxDecimalPlaces: 2 }),
       folioNumber: optionalString(body, "folioNumber", { maxLength: 30 }),
-      mandateId: optionalString(body, "mandateId"),
+      mandateId: requiredString(body, "mandateId"),
       purpose: oneOf(body, "purpose", PURPOSES, false),
     }),
   });
@@ -144,4 +161,11 @@ export async function refreshPlan(req: Request<PlanParams>, res: Response) {
 }
 export async function confirmPlan(req: Request<PlanParams>, res: Response) {
   res.json({ data: await planService.confirmPlan(req.params.planId, requiredString(asBody(req.body), "verificationToken")) });
+}
+
+export async function listInstallments(req: Request<PlanParams>, res: Response) {
+  // Resolves the plan first so an unknown id is a 404 rather than an empty list
+  // that reads as "this SIP has never paid in".
+  await planService.getPlan(req.params.planId);
+  res.json({ data: await listPlanInstallments(req.params.planId) });
 }

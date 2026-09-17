@@ -54,7 +54,16 @@ export class FpApiError extends Error {
    */
   toHttpError(): HttpError {
     if (this.status === 400 || this.status === 422) {
-      return HttpError.badRequest(this.message, {
+      // Folded into the message, not just the details. FP's own sentence for a
+      // rejected field is "Validation failed. 1 error(s)" — which names neither
+      // the field nor the problem — and the message is the only part a client
+      // shows. The field errors it sends alongside are the entire content of
+      // the failure, and they were being carried as far as `details` and then
+      // never read.
+      const detail = this.fieldErrors
+        .map((error) => `${error.field}: ${error.message}`)
+        .join("; ");
+      return HttpError.badRequest(detail === "" ? this.message : `${this.message} — ${detail}`, {
         provider: "fp",
         ...(this.code && { providerCode: this.code }),
         ...(this.fieldErrors.length > 0 && { fields: this.fieldErrors }),
@@ -87,7 +96,23 @@ export class FpTransportError extends Error {
   }
 
   toHttpError(): HttpError {
-    return HttpError.serviceUnavailable("Could not reach the upstream provider");
+    // Outside production the cause travels with it. "Could not reach the
+    // upstream provider" is the right thing to tell an investor and a useless
+    // thing to debug against: it is the same sentence for an expired token, a
+    // DNS failure and our own timeout, and the one fact that separates them is
+    // on the cause this error has been carrying, unread, all along.
+    if (process.env.NODE_ENV === "production") {
+      return HttpError.serviceUnavailable("Could not reach the upstream provider");
+    }
+    const cause = this.cause;
+    return HttpError.serviceUnavailable("Could not reach the upstream provider", {
+      endpoint: this.endpoint,
+      requestId: this.requestId,
+      cause: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause ?? "unknown"),
+      ...(cause instanceof Error && cause.stack
+        ? { causeStack: cause.stack.split(String.fromCharCode(10)).slice(0, 6) }
+        : {}),
+    });
   }
 }
 

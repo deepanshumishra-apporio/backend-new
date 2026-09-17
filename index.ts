@@ -3,6 +3,7 @@
 // Run with: bun run dev
 import { createApp } from "./src/app.ts";
 import { disconnectDatabase } from "./src/db/client.ts";
+import { closeEmailTransport } from "./src/integrations/email.client.ts";
 
 const port = Number(process.env["PORT"] ?? 3000);
 if (!Number.isInteger(port) || port <= 0) {
@@ -34,6 +35,7 @@ async function shutdown(signal: string): Promise<void> {
   forceExit.unref();
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  await closeEmailTransport();
   await disconnectDatabase();
   clearTimeout(forceExit);
   console.log("[server] stopped");

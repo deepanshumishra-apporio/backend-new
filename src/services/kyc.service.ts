@@ -17,7 +17,9 @@ import {
   fpPreVerification,
   hasPreVerifyConfig,
 } from "../integrations/fp/index.ts";
+import { fpFlatText } from "../utils/fp-mapping.ts";
 import { HttpError } from "../utils/http-error.ts";
+import { kycNextAction } from "../utils/kyc-steps.ts";
 import { asDate } from "../utils/money.ts";
 import { syncKycForm } from "./fp-sync/index.ts";
 import { syncPreVerification } from "./fp-sync/preverification.sync.ts";
@@ -93,6 +95,11 @@ function toReadinessDto(result: fpPreVerification.FpPreVerification): KycReadine
     ready: result.readiness.status === "verified",
     readinessStatus: result.readiness.status,
     readinessCode: result.readiness.code,
+    // Whether the KRA already holds a record for this PAN, and so whether a
+    // form has to be opened as `modify` rather than `fresh`. The client cannot
+    // work that out from the code alone, and asking the investor which one they
+    // need is asking them to guess at FP's eligibility rules.
+    modification: fpFlatText(result.readiness.modification, 120),
     checks: {
       pan: { status: result.pan?.status ?? null, code: result.pan?.code ?? null },
       name: { status: result.name?.status ?? null, code: result.name?.code ?? null },
@@ -154,18 +161,6 @@ interface FormRow {
   fpCreatedAt: Date | null;
 }
 
-/** What the investor has to do next, so the app can route them straight there. */
-function nextAction(row: FormRow): KycFormDto["nextAction"] {
-  if (row.status === KycFormStatus.CREATED) {
-    if (row.proofStatus !== "SUCCESSFUL") return "FETCH_PROOF";
-    if (!row.signatureProvided) return "UPLOAD_SIGNATURE";
-    if (row.fieldsNeeded.length > 0) return "PROVIDE_DETAILS";
-    return null;
-  }
-  if (row.status === KycFormStatus.AWAITING_ESIGN) return "ESIGN";
-  return null;
-}
-
 function toFormDto(row: FormRow): KycFormDto {
   return {
     id: row.id,
@@ -183,7 +178,7 @@ function toFormDto(row: FormRow): KycFormDto {
     proofStatus: row.proofStatus,
     esignUrl: row.esignUrl,
     esignStatus: row.esignStatus,
-    nextAction: nextAction(row),
+    nextAction: kycNextAction(row),
     expiresAt: row.expiresAt?.toISOString() ?? null,
     submittedAt: row.submittedAt?.toISOString() ?? null,
     failedAt: row.failedAt?.toISOString() ?? null,
@@ -267,14 +262,26 @@ export async function updateKycForm(
     const updated = await fpKycForms.updateKycForm({
       id: form.fpId,
       ...(input.email && { email_address: input.email }),
-      ...(input.mobile && { phone_number: { isd: input.mobile.isd, number: input.mobile.number } }),
+      // FP takes only "+91" here, and answers a bare "91" with a validation
+      // error on `phone_number.isd`. Normalised at the boundary, as every other
+      // FP spelling is, so no caller has to know.
+      ...(input.mobile && {
+        phone_number: {
+          isd: input.mobile.isd.startsWith("+") ? input.mobile.isd : `+${input.mobile.isd}`,
+          number: input.mobile.number,
+        },
+      }),
       ...(input.residentialStatus && { residential_status: input.residentialStatus }),
       ...(input.gender && { gender: input.gender }),
       ...(input.maritalStatus && { marital_status: input.maritalStatus }),
       // FP asks for exactly one of these, decided by marital status.
       ...(input.fatherName && { father_name: input.fatherName }),
       ...(input.spouseName && { spouse_name: input.spouseName }),
-      ...(input.occupationType && { occupation_type: input.occupationType }),
+      ...(input.occupationType && { occupation_type: ({
+        private_sector: "private_sector_service",
+        public_sector: "public_sector_service",
+        government_sector: "government_service",
+      } as Record<string, string>)[input.occupationType] ?? input.occupationType }),
       ...(input.aadhaarLast4 && { aadhaar_number: input.aadhaarLast4 }),
       ...(input.countryOfBirth && { country_of_birth: input.countryOfBirth }),
       ...(input.placeOfBirth && { place_of_birth: input.placeOfBirth }),
@@ -287,7 +294,13 @@ export async function updateKycForm(
       ...(input.taxResidencyOtherThanIndia !== undefined && {
         tax_residency_other_than_india: input.taxResidencyOtherThanIndia,
       }),
-      ...(input.geolocation && { geo_location: input.geolocation }),
+      ...(input.geolocation && { geolocation: input.geolocation }),
+      ...Object.fromEntries(([1, 2, 3] as const).flatMap((slot) => {
+        const residency = input[`nonIndianTaxResidency${slot}`];
+        return residency ? [[`non_indian_tax_residency_${slot}`, {
+          country: residency.country, taxid_number: residency.taxIdNumber,
+        }]] : [];
+      })),
     });
     await syncKycForm(updated, {
       userId: form.userId,

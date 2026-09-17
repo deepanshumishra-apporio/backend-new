@@ -104,6 +104,18 @@ export async function identityIsVerified(investorProfileId: string, pan: string 
   const check = await db.preVerification.findFirst({
     where: {
       investorIdentifier: pan,
+      // Only rows that actually carry a readiness verdict. A penny-drop opens a
+      // pre-verification of its own for the bank account, and that row has
+      // `readiness.status` null because it was never asked about the identity.
+      // Taken as "the newest check", it displaced the real verdict and closed
+      // the gate: an investor who verified a bank AFTER their readiness check
+      // silently lost `canTransact`, so an approved mandate could be selected on
+      // the SIP screen while "Review investment" stayed disabled with nothing
+      // saying why.
+      //
+      // A later *readiness* verdict still closes the gate, which is the point of
+      // taking the newest — a bank check simply is not one.
+      readinessStatus: { not: null },
       OR: [{ investorProfileId }, ...(owner ? [{ investorProfileId: null, userId: owner.userId }] : [])],
     },
     orderBy: { fpCreatedAt: "desc" },

@@ -105,6 +105,13 @@ export async function listPurchases(
  * Only valid when the failure was `payment_failure` inside the expiry window,
  * or `order_expiry` on an order that is not a plan installment. The order goes
  * back to `pending`.
+ *
+ * **Unreachable on this platform.** FP documents retry as "an upcoming facility
+ * for ondc gateway purchases … not available in sandbox or production yet", and
+ * we run exclusively on ONDC. Calling it answers
+ * `400 "Order is not eligible for retry"` whatever the failure code, so
+ * `order.service.ts` refuses before we get here. Kept wired for the day it
+ * ships.
  */
 export async function retryPurchase(id: string, requestId?: string): Promise<FpPurchase> {
   return fpRequest<FpPurchase>({

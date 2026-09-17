@@ -126,7 +126,12 @@ export interface UpdateKycFormPayload {
   non_indian_tax_residency_1?: FpNonIndianTaxResidency;
   non_indian_tax_residency_2?: FpNonIndianTaxResidency;
   non_indian_tax_residency_3?: FpNonIndianTaxResidency;
-  geo_location?: { latitude: number; longitude: number };
+  /**
+   * `geolocation`, not `geo_location`. FP rejects the whole body with a bare
+   * "Invalid JSON payload" for an unknown key, so the wrong spelling failed
+   * every PATCH that carried it and named no field.
+   */
+  geolocation?: { latitude: number; longitude: number };
 }
 
 /**
@@ -236,7 +241,9 @@ export interface FpBankAccountLookup {
   id: string;
   source_ref_id: string | null;
   phone_number: string;
-  status: "pending" | "successful" | "failed";
+  // The current API examples return `success`; older responses and the
+  // attribute table say `successful`. Accept both at this boundary.
+  status: "pending" | "success" | "successful" | "failed";
   data: {
     account_holder_name: string | null;
     account_number: string | null;

@@ -1,5 +1,75 @@
 import type { OnboardingStage } from "../../generated/prisma/enums.ts";
 
+/**
+ * The investor's own KYC answers, already translated into the profile's
+ * vocabulary so a client can drop them straight into the create form.
+ *
+ * Every field is optional because the KYC form itself leaves them optional
+ * until FP asks for them; `source` says how much to expect. There is no address
+ * here — see `kyc-prefill.service.ts`.
+ */
+export interface KycProfilePrefillDto {
+  source: "kyc_form" | "pre_verification";
+  pan: string;
+  name?: string;
+  dateOfBirth?: string;
+  taxStatus?: string;
+  email?: string;
+  mobile?: string;
+  gender?: string;
+  maritalStatus?: string;
+  fatherName?: string;
+  occupation?: string;
+  incomeSlab?: string;
+  pepDetails?: string;
+  placeOfBirth?: string;
+  countryOfBirth?: string;
+  nationalityCountry?: string;
+  citizenshipCountries?: string[];
+  aadhaarLast4?: string;
+}
+
+/**
+ * The three answers an MF investment account needs that a KYC form never
+ * carries, plus the payout bank once one is linked.
+ *
+ * Every other fact is read back from the KYC form. Each field is optional
+ * because the investor supplies them one screen at a time and provisioning is
+ * called after each — see `investor-provisioning.service.ts`.
+ */
+export interface ProvisionInput {
+  userId: string;
+  sourceOfWealth?: string;
+  countryOfBirth?: string;
+  address?: {
+    line1: string;
+    line2?: string;
+    city?: string;
+    state?: string;
+    postalCode: string;
+  };
+  nominee?: {
+    name: string;
+    relationship: string;
+    dateOfBirth?: string;
+    pan?: string;
+  };
+  /** The investor declined to nominate. A choice, not the absence of one. */
+  nominationOptOut?: boolean;
+  bankAccountId?: string;
+  ipAddress?: string;
+}
+
+export interface ProvisionResult {
+  investorProfileId: string | null;
+  mfInvestmentAccountId: string | null;
+  /** What this call created. Empty when everything was already in place. */
+  created: string[];
+  /** What the investor still owes before an order can be placed. */
+  missing: string[];
+  canTransact: boolean;
+}
+
 export interface CreateInvestorProfileInput {
   /** The app account this profile belongs to. */
   userId: string;
@@ -60,6 +130,18 @@ export interface AddBankAccountInput {
   /** savings, current, nre or nro. */
   type: string;
   ifscCode: string;
+}
+
+export interface BankAccountLookupDto {
+  id: string;
+  status: "PENDING" | "SUCCESSFUL" | "FAILED";
+  phoneLast4: string;
+  /** Present only after a successful lookup; never expose the full number. */
+  accountNumberLast4: string | null;
+  accountHolderName: string | null;
+  ifscCode: string | null;
+  accountType: string | null;
+  bankAccountId: string | null;
 }
 
 export interface AddNomineeInput {
@@ -154,6 +236,23 @@ export interface OnboardingStatusDto {
   stage: OnboardingStage | null;
   completedAt: string | null;
   lastError: string | null;
+  /**
+   * The KYC form, or null when none was ever opened. `outstanding` is what a
+   * client routes off: false means the identity journey is done with and the
+   * next step is the investor profile.
+   */
+  kyc: {
+    formId: string;
+    status: string;
+    nextAction: string | null;
+    outstanding: boolean;
+  } | null;
+  /**
+   * What the investor still owes before an order can be placed, in the same
+   * vocabulary `ProvisionResult.missing` uses — `address`, `nomination`,
+   * `bankAccount`. Derived from the rows that exist, so it needs no write.
+   */
+  accountMissing: string[];
   readiness: {
     hasProfile: boolean;
     hasAddress: boolean;

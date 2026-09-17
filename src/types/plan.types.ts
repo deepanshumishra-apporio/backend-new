@@ -44,6 +44,21 @@ export interface CreateStpInput extends PlanOrigin {
   units?: string;
 }
 
+/**
+ * The approved mandate a SIP is collected by.
+ *
+ * Only a SIP has one — an SWP and an STP move units that are already held, so
+ * there is nothing to debit. The UMRN is the registrar's identifier for the
+ * standing instruction and is what the investor's bank statement will show.
+ */
+export interface PlanMandateDto {
+  id: string;
+  status: string;
+  umrn: string | null;
+  bankName: string | null;
+  accountNumberLast4: string;
+}
+
 export interface PlanDto {
   id: string;
   fpId: string;
@@ -52,6 +67,8 @@ export interface PlanDto {
   isin: string;
   switchInIsin?: string;
   schemeName: string | null;
+  /** The scheme an STP transfers into. Only an STP carries one. */
+  switchInSchemeName?: string | null;
   /** false means FP generates ordinary lumpsum orders on a schedule instead. */
   systematic: boolean;
   frequency: string;
@@ -65,6 +82,8 @@ export interface PlanDto {
   nextInstallmentDate: string | null;
   previousInstallmentDate: string | null;
   folioNumber: string | null;
+  /** Null on an SWP or STP, and on a SIP raised before a mandate was chosen. */
+  mandate: PlanMandateDto | null;
   cancellationCode: string | null;
   reason: string | null;
   createdAt: string;

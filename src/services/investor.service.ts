@@ -10,10 +10,12 @@
 import {
   BavConfidence,
   BavStatus,
+  KycFormStatus,
   OnboardingStage,
   UserProfileRelationship,
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
+import { kycNextAction } from "../utils/kyc-steps.ts";
 import {
   bankIsVerified,
   investmentReadiness,
@@ -26,10 +28,13 @@ import {
   fpBankVerification,
   fpConfig,
   fpErrorToHttpError,
+  fpKycForms,
   fpProfiles,
 } from "../integrations/fp/index.ts";
+import { randomUUID } from "node:crypto";
 import { HttpError } from "../utils/http-error.ts";
 import { asAllocation, asDate } from "../utils/money.ts";
+import { bankAccountFingerprint } from "../utils/fp-mapping.ts";
 import {
   syncAddress,
   syncBankAccount,
@@ -47,6 +52,7 @@ import type {
   AddNomineeInput,
   AddPhoneInput,
   BankAccountDto,
+  BankAccountLookupDto,
   ContactDto,
   CreateInvestorProfileInput,
   FolioDefaultsInput,
@@ -55,6 +61,24 @@ import type {
   NomineeDto,
   OnboardingStatusDto,
 } from "../types/investor.types.ts";
+
+const BANK_LOOKUP_CONSENT =
+  "I allow this investment platform to fetch my bank account details using my phone number via Cybrilla and its partners.";
+
+function bankLookupStatus(status: string): BankAccountLookupDto["status"] {
+  const value = status.toLowerCase();
+  if (value === "success" || value === "successful") return "SUCCESSFUL";
+  if (value === "failed") return "FAILED";
+  return "PENDING";
+}
+
+async function requireOwnedProfile(userId: string, investorProfileId: string): Promise<void> {
+  const link = await db.userInvestorProfile.findUnique({
+    where: { userId_investorProfileId: { userId, investorProfileId } },
+    select: { id: true },
+  });
+  if (!link) throw HttpError.notFound("No such investor profile");
+}
 
 /** "ABCDE1234F" -> "ABCXXXX34F". Enough to recognise, not enough to reuse. */
 function maskPan(pan: string | null): string | null {
@@ -351,6 +375,181 @@ export async function addBankAccount(
   }
 }
 
+type StoredBankLookup = {
+  id: string;
+  status: string;
+  phoneLast4: string;
+  bankAccountId: string | null;
+};
+
+type LookupBankData = {
+  account_holder_name: string | null;
+  account_number: string | null;
+  ifsc_code: string | null;
+  type: string | null;
+} | null;
+
+function bankLookupDto(row: StoredBankLookup, data: LookupBankData = null): BankAccountLookupDto {
+  const number = data?.account_number?.replace(/\D/g, "") ?? "";
+  return {
+    id: row.id,
+    status: bankLookupStatus(row.status),
+    phoneLast4: row.phoneLast4,
+    accountNumberLast4: number.length >= 4 ? number.slice(-4) : null,
+    accountHolderName: data?.account_holder_name?.trim() || null,
+    ifscCode: data?.ifsc_code?.trim().toUpperCase() || null,
+    accountType: data?.type?.trim().toLowerCase() || null,
+    bankAccountId: row.bankAccountId,
+  };
+}
+
+/** Start consent-backed bank discovery using the login's verified phone. */
+export async function createBankAccountLookup(input: {
+  userId: string;
+  investorProfileId: string;
+  ipAddress: string;
+}): Promise<BankAccountLookupDto> {
+  await requireOwnedProfile(input.userId, input.investorProfileId);
+  const user = await db.user.findUnique({
+    where: { id: input.userId },
+    select: { phone: true },
+  });
+  if (!user) throw HttpError.notFound("No such investor account");
+  const digits = user.phone.replace(/\D/g, "");
+  const phone = digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;
+  if (!/^[6-9]\d{9}$/.test(phone)) {
+    throw HttpError.conflict("A verified Indian mobile number is required for bank discovery");
+  }
+
+  const consentedAt = new Date();
+  const sourceRefId = randomUUID();
+  try {
+    const lookup = await fpKycForms.createBankAccountLookup({
+      phone_number: phone,
+      source_ref_id: sourceRefId,
+      consent: {
+        collected_at: consentedAt.toISOString(),
+        text: BANK_LOOKUP_CONSENT,
+        mode: "checkbox",
+        ip_address: input.ipAddress,
+      },
+    });
+    const row = await db.bankAccountLookup.create({
+      data: {
+        fpId: lookup.id,
+        userId: input.userId,
+        investorProfileId: input.investorProfileId,
+        sourceRefId,
+        phoneLast4: phone.slice(-4),
+        status: bankLookupStatus(lookup.status),
+        consentedAt,
+      },
+      select: { id: true, status: true, phoneLast4: true, bankAccountId: true },
+    });
+    return bankLookupDto(row, lookup.data);
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
+/** Re-read a lookup. Full bank numbers are used only in-memory and never returned. */
+export async function refreshBankAccountLookup(
+  userId: string,
+  lookupId: string,
+): Promise<BankAccountLookupDto> {
+  const existing = await db.bankAccountLookup.findFirst({
+    where: { id: lookupId, userId },
+    select: { id: true, fpId: true, status: true, phoneLast4: true, bankAccountId: true },
+  });
+  if (!existing) throw HttpError.notFound("No such bank lookup");
+  if (existing.bankAccountId) return bankLookupDto(existing);
+  try {
+    const lookup = await fpKycForms.fetchBankAccountLookup(existing.fpId);
+    const row = await db.bankAccountLookup.update({
+      where: { id: existing.id },
+      data: { status: bankLookupStatus(lookup.status), syncedAt: new Date() },
+      select: { id: true, status: true, phoneLast4: true, bankAccountId: true },
+    });
+    return bankLookupDto(row, lookup.data);
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
+/** Link the bank the investor just reviewed. The provider remains the source of the full number. */
+export async function linkBankAccountLookup(
+  userId: string,
+  lookupId: string,
+): Promise<BankAccountDto> {
+  const existing = await db.bankAccountLookup.findFirst({
+    where: { id: lookupId, userId },
+    select: {
+      id: true,
+      fpId: true,
+      investorProfileId: true,
+      bankAccountId: true,
+    },
+  });
+  if (!existing) throw HttpError.notFound("No such bank lookup");
+  if (existing.bankAccountId) return getBankAccount(existing.bankAccountId);
+
+  try {
+    const lookup = await fpKycForms.fetchBankAccountLookup(existing.fpId);
+    if (bankLookupStatus(lookup.status) !== "SUCCESSFUL") {
+      throw HttpError.conflict(
+        lookup.status === "failed"
+          ? "No bank account could be found for this mobile number"
+          : "The bank lookup is still in progress",
+      );
+    }
+    const data = lookup.data;
+    const accountNumber = data?.account_number?.replace(/\D/g, "") ?? "";
+    const accountHolderName = data?.account_holder_name?.trim() ?? "";
+    const ifscCode = data?.ifsc_code?.trim().toUpperCase() ?? "";
+    const type = data?.type?.trim().toLowerCase() ?? "";
+    if (!/^\d{9,18}$/.test(accountNumber) || accountHolderName === "" ||
+        !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifscCode) ||
+        !["savings", "current", "nre", "nro"].includes(type)) {
+      throw HttpError.badGateway("The bank lookup returned incomplete account details");
+    }
+
+    // A second lookup can find the same account. Reuse the local/provider
+    // object instead of creating a duplicate at FP and then colliding with our
+    // unique fingerprint constraint.
+    const fingerprint = await bankAccountFingerprint(accountNumber, ifscCode);
+    const alreadyLinked = await db.bankAccount.findUnique({
+      where: {
+        investorProfileId_accountNumberFingerprint: {
+          investorProfileId: existing.investorProfileId,
+          accountNumberFingerprint: fingerprint,
+        },
+      },
+      select: { id: true },
+    });
+    if (alreadyLinked) {
+      await db.bankAccountLookup.update({
+        where: { id: existing.id },
+        data: { status: "SUCCESSFUL", bankAccountId: alreadyLinked.id, syncedAt: new Date() },
+      });
+      return getBankAccount(alreadyLinked.id);
+    }
+
+    const bank = await addBankAccount(existing.investorProfileId, {
+      accountNumber,
+      accountHolderName,
+      ifscCode,
+      type,
+    });
+    await db.bankAccountLookup.update({
+      where: { id: existing.id },
+      data: { status: "SUCCESSFUL", bankAccountId: bank.id, syncedAt: new Date() },
+    });
+    return bank;
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
 /**
  * Add a nominee.
  *
@@ -627,12 +826,40 @@ export async function getInvestmentAccount(id: string): Promise<InvestmentAccoun
  * `canTransact` is computed from the rows, not from the stage cursor, because
  * it gates money.
  */
-export async function getOnboardingStatus(userId: string): Promise<OnboardingStatusDto> {
-  const link = await db.userInvestorProfile.findFirst({
+/**
+ * Whether the investor still owes the KYC form anything.
+ *
+ * The app routes off this: a finished or impossible form means the next step is
+ * the investor profile, and sending them back into the KYC group instead is how
+ * "continue setup" ended up bouncing off `/all-set` for ever. `null` when no
+ * form was ever opened — a PAN already registered at the KRA never opens one.
+ */
+async function kycProgress(userId: string): Promise<OnboardingStatusDto["kyc"]> {
+  const form = await db.kycForm.findFirst({
     where: { userId },
-    orderBy: { isPrimary: "desc" },
-    select: { investorProfileId: true },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, status: true, fieldsNeeded: true, proofStatus: true, signatureProvided: true },
   });
+  if (!form) return null;
+  return {
+    formId: form.id,
+    status: form.status,
+    nextAction: kycNextAction(form),
+    // FAILED and EXPIRED are outstanding too: neither can advance, so the
+    // investor owes a brand new form before anything else matters.
+    outstanding: form.status !== KycFormStatus.SUBMITTED,
+  };
+}
+
+export async function getOnboardingStatus(userId: string): Promise<OnboardingStatusDto> {
+  const [link, kyc] = await Promise.all([
+    db.userInvestorProfile.findFirst({
+      where: { userId },
+      orderBy: { isPrimary: "desc" },
+      select: { investorProfileId: true },
+    }),
+    kycProgress(userId),
+  ]);
 
   if (!link) {
     return {
@@ -640,6 +867,9 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
       stage: null,
       completedAt: null,
       lastError: null,
+      kyc,
+      // Nothing exists yet, so everything after the identity journey is owed.
+      accountMissing: ["address", "nomination", "bankAccount"],
       readiness: {
         hasProfile: false,
         hasAddress: false,
@@ -660,7 +890,7 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
   const [onboarding, addresses, phones, emails, banks, nominees, account] = await Promise.all([
     db.investorOnboarding.findUnique({
       where: { investorProfileId },
-      select: { stage: true, completedAt: true, lastError: true },
+      select: { stage: true, completedAt: true, lastError: true, nominationOptOutAt: true },
     }),
     db.address.count({ where: { investorProfileId } }),
     db.phoneNumber.count({ where: { investorProfileId } }),
@@ -679,6 +909,8 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
             payoutBankAccountId: true,
           },
         },
+        // A nomination is a slot row, not a column on the defaults.
+        nominees: { select: { id: true }, take: 1 },
       },
     }),
   ]);
@@ -696,11 +928,25 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
   // then have the first order answer 409.
   const readiness = account ? await investmentReadiness(account.id) : null;
 
+  // The same vocabulary `provisionInvestor` returns, derived from the rows that
+  // exist rather than from a cursor — so a client can read it without a write,
+  // and the two can never disagree about what the investor still owes.
+  const accountMissing: string[] = [];
+  if (addresses === 0) accountMissing.push("address");
+  // A declared opt-out counts as answered. Without it there is no row to tell
+  // "declined" from "not asked", and the KYC resume route reads this list.
+  if ((account?.nominees.length ?? 0) === 0 && onboarding?.nominationOptOutAt == null) {
+    accountMissing.push("nomination");
+  }
+  if (!defaults?.payoutBankAccountId) accountMissing.push("bankAccount");
+
   return {
     investorProfileId,
     stage: onboarding?.stage ?? null,
     completedAt: onboarding?.completedAt?.toISOString() ?? null,
     lastError: onboarding?.lastError ?? null,
+    kyc,
+    accountMissing,
     readiness: {
       hasProfile: true,
       hasAddress: addresses > 0,

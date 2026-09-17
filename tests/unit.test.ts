@@ -8,6 +8,66 @@
 // what catches a validation or mapping regression in a second rather than in a
 // four-minute sandbox run.
 import { describe, expect, test } from "bun:test";
+import { Prisma } from "../generated/prisma/client.ts";
+import { assertSipMandate, assertSipSchedule } from "../src/services/sip-validation.ts";
+import { checkAmount } from "../src/services/scheme-rules.service.ts";
+
+describe("lump-sum amount validation", () => {
+  const limits = {
+    amountMin: new Prisma.Decimal("100.25"),
+    amountMax: new Prisma.Decimal("1100.25"),
+    amountMultiples: new Prisma.Decimal("500"),
+  };
+  test("uses exact decimal limits and steps from the minimum", () => {
+    for (const value of ["100.25", "600.25", "1100.25"])
+      expect(() => checkAmount(value, limits, "amount")).not.toThrow();
+    for (const value of ["100.24", "1100.26", "500", "600.26"])
+      expect(() => checkAmount(value, limits, "amount")).toThrow();
+  });
+  test("rejects invalid amounts even without catalogue thresholds", () => {
+    const absent = { amountMin: null, amountMax: null, amountMultiples: null };
+    for (const value of ["NaN", "Infinity", "-1", "0", "1.001", "bad"])
+      expect(() => checkAmount(value, absent, "amount")).toThrow();
+    expect(() => checkAmount("500.50", absent, "amount")).not.toThrow();
+  });
+});
+
+describe("SIP purchase safeguards", () => {
+  const now = new Date("2026-09-16T12:00:00Z");
+  const mandate = {
+    mandateStatus: "APPROVED", providerName: "CYBRILLAPOA",
+    mandateLimit: new Prisma.Decimal("1000.50"),
+    validFrom: new Date("2026-09-16"), validTo: new Date("2026-09-16"),
+  };
+  test("accepts exact debit limit and inclusive validity boundaries", () => {
+    expect(() => assertSipMandate(mandate, "1000.50", now)).not.toThrow();
+  });
+  test("rejects amounts above the limit without floating point rounding", () => {
+    expect(() => assertSipMandate(mandate, "1000.51", now)).toThrow("limit");
+    for (const amount of ["0", "-1", "1.001", "NaN", "Infinity"])
+      expect(() => assertSipMandate(mandate, amount, now)).toThrow();
+  });
+  test("rejects revoked, incompatible, future and expired mandates", () => {
+    for (const patch of [
+      { mandateStatus: "CANCELLED" }, { providerName: null }, { providerName: "RAZORPAY" },
+      { validFrom: new Date("2026-09-17") }, { validTo: new Date("2026-09-15") },
+    ]) expect(() => assertSipMandate({ ...mandate, ...patch }, "500", now)).toThrow();
+  });
+  test("requires a monthly debit day and bounded integer installments", () => {
+    for (const day of [undefined, 0, 29, 1.5])
+      expect(() => assertSipSchedule("MONTHLY", day, 12)).toThrow();
+    for (const count of [0, 1201, 1.5, NaN])
+      expect(() => assertSipSchedule("MONTHLY", 5, count)).toThrow();
+    expect(() => assertSipSchedule("MONTHLY", 28, 1200)).not.toThrow();
+  });
+  test("daily SIPs omit debit day and unsupported frequencies fail", () => {
+    expect(() => assertSipSchedule("DAILY", undefined, 12)).not.toThrow();
+    expect(() => assertSipSchedule("CALENDAR_DAY_DAILY", undefined, 12)).not.toThrow();
+    expect(() => assertSipSchedule("DAILY", 5, 12)).toThrow();
+    expect(() => assertSipSchedule("YEARLY", 5, 12)).toThrow();
+  });
+});
+import { codeMatches, generateCode, hashCode } from "../src/services/otp-channel.ts";
 import { HttpError } from "../src/utils/http-error.ts";
 import {
   asBody,
@@ -311,5 +371,47 @@ describe("ONDC provider vocabulary", () => {
     expect(ONDC_MANDATE_PROVIDER).toBe("CYBRILLAPOA");
     expect(ONDC_PAYMENT_PROVIDER).toBe("ONDC");
     expect(ONDC_MANDATE_PROVIDER).not.toBe(ONDC_PAYMENT_PROVIDER);
+  });
+});
+
+describe("email OTP codes", () => {
+  test("a code is exactly the requested length, leading zeros kept", () => {
+    // Trimming a leading zero would shrink the keyspace and produce a code the
+    // six-digit field cannot accept.
+    for (let i = 0; i < 400; i++) {
+      const code = generateCode(6);
+      expect(code).toMatch(/^\d{6}$/);
+    }
+  });
+
+  test("the same code hashes differently for different challenges", () => {
+    // The salt is what stops one rainbow table covering every row.
+    expect(hashCode("challenge-a", "123456")).not.toBe(hashCode("challenge-b", "123456"));
+  });
+
+  test("hashing is stable for one challenge", () => {
+    expect(hashCode("challenge-a", "123456")).toBe(hashCode("challenge-a", "123456"));
+  });
+
+  test("the right code matches and a wrong one does not", () => {
+    const stored = hashCode("c1", "123456");
+    expect(codeMatches("c1", "123456", stored)).toBe(true);
+    expect(codeMatches("c1", "123457", stored)).toBe(false);
+  });
+
+  test("a code from another challenge does not match", () => {
+    expect(codeMatches("c2", "123456", hashCode("c1", "123456"))).toBe(false);
+  });
+
+  test("a malformed stored hash fails closed rather than throwing", () => {
+    // timingSafeEqual throws on a length mismatch; the length guard is what
+    // keeps a truncated column from turning a failed login into a 500.
+    expect(codeMatches("c1", "123456", "")).toBe(false);
+    expect(codeMatches("c1", "123456", "abcd")).toBe(false);
+  });
+
+  test("generated codes are not all identical", () => {
+    const seen = new Set(Array.from({ length: 50 }, () => generateCode(6)));
+    expect(seen.size).toBeGreaterThan(1);
   });
 });

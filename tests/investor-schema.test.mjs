@@ -75,3 +75,31 @@ test('deleting an app user retains provider verification evidence', async () => 
   const { rows } = await db.query('SELECT "userId" FROM pre_verifications WHERE id = $1', [id]);
   assert.deepEqual(rows, [{ userId: null }]);
 });
+
+test('a declined nomination is recorded, and is distinguishable from never asked', async () => {
+  const profile = randomUUID();
+  await db.query(`INSERT INTO investor_profiles (id, "fpId", name, "taxStatus", "updatedAt")
+    VALUES ($1, $2, 'Test Investor', 'resident_individual', now())`,
+  [profile, `ip_${randomUUID()}`]);
+
+  // Never asked: the column is null, so "nomination" is still outstanding.
+  const asked = randomUUID();
+  await db.query(`INSERT INTO investor_onboardings (id, "investorProfileId", "updatedAt")
+    VALUES ($1, $2, now())`, [asked, profile]);
+  const { rows: [fresh] } = await db.query(
+    'SELECT "nominationOptOutAt" FROM investor_onboardings WHERE id = $1', [asked]);
+  assert.equal(fresh.nominationOptOutAt, null);
+
+  // Declined: a timestamp, which is what stops the resume route sending the
+  // investor back to the nominee screen for ever.
+  await db.query(`UPDATE investor_onboardings SET "nominationOptOutAt" = now() WHERE id = $1`, [asked]);
+  const { rows: [declined] } = await db.query(
+    'SELECT "nominationOptOutAt" FROM investor_onboardings WHERE id = $1', [asked]);
+  assert.notEqual(declined.nominationOptOutAt, null);
+
+  // Naming someone afterwards reverses it; the later answer is the real one.
+  await db.query(`UPDATE investor_onboardings SET "nominationOptOutAt" = NULL WHERE id = $1`, [asked]);
+  const { rows: [reversed] } = await db.query(
+    'SELECT "nominationOptOutAt" FROM investor_onboardings WHERE id = $1', [asked]);
+  assert.equal(reversed.nominationOptOutAt, null);
+});

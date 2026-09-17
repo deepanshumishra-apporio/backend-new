@@ -367,16 +367,27 @@ signature upload, esign, KRA submission. It is implemented in
 Its lifecycle is `under_review → created → awaiting_esign → awaiting_submission
 → submitted`, with `failed` and a 7-day `expired`. Two things to know:
 
-- **Eligibility is decided asynchronously, and is refused for everything in this
-  sandbox.** `fresh` is supposed to need a PAN with no KYC and `modify` one
-  already registered, with the wrong choice settling to `failed` a second or two
-  after the 200. But a sweep of 24 PAN/type combinations got
-  `ineligible_for_fresh_kyc` **and** `ineligible_for_kyc_modification` for the
-  *same* PAN — which is self-contradictory, since a PAN cannot both have and
-  lack KYC. So this is not PAN test-data: **KYC-form eligibility is simply not
-  enabled for this sandbox partner**, and no form can reach `created` until
-  Cybrilla enables it. Everything up to that point is verified working.
-  Always poll before showing the investor a form.
+- **Eligibility is decided asynchronously, and now passes** — it did not when
+  the sweep above this line was written, so treat an old "eligibility is not
+  enabled" note as stale. `fresh` needs a PAN with no KYC, which in this sandbox
+  is the digits **`3753`**: `BCDPE3753F` reaches `created` about three seconds
+  after the 201, carrying an 18-entry `fields_needed`. A `3751` PAN is already
+  KYC-compliant and has no business opening a fresh form. Always poll before
+  showing the investor a form.
+- **The form's vocabulary is not `investor_profile`'s.** Four values differ, and
+  FP names the field only for the first three — an unknown *key* comes back as a
+  bare `Invalid JSON payload` with nothing else in it.
+
+  | field | what the form takes |
+  |---|---|
+  | `pep_details` | `no_exposure` / `pep` / `related_pep` — **not** the profile's `not_applicable` / `pep_exposed` / `pep_related` |
+  | `residential_status` | `resident`, and only that — not `resident_individual` |
+  | `phone_number.isd` | `+91` with the plus; a bare `91` is refused |
+  | geolocation | the key is `geolocation`, **not** `geo_location` |
+
+  With those right, one PATCH takes the form from 18 outstanding fields to
+  `["address", "identity_proof", "signature"]` — the first two arrive from the
+  DigiLocker fetch, the third from the signature upload.
 - **There are no webhooks on this realm.** Eligibility, DigiLocker and esign all
   complete out of band, so the client polls `POST /kyc/forms/:id/refresh`.
 

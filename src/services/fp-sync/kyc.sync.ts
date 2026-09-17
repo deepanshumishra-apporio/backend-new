@@ -204,7 +204,9 @@ export async function syncKycForm(
     mobileIsd: fpText(form.phone_number?.isd, 4),
     mobileNumber: fpText(form.phone_number?.number, 20),
     proofFetchUrl: fpText(form.proof_details?.fetch_url, 1000),
-    proofStatus: fpEnum(DocumentFetchStatus, form.proof_details?.status, unknownValue("proof")),
+    proofStatus: form.proof_details?.status === "fetched"
+      ? DocumentFetchStatus.SUCCESSFUL
+      : fpEnum(DocumentFetchStatus, form.proof_details?.status, unknownValue("proof")),
     proofCallbackUrl: fpText(form.proof_details_callback_url, 1000),
     esignCallbackUrl: fpText(form.esign_callback_url, 1000),
     esignUrl: fpText(form.esign_details?.esign_url, 1000),

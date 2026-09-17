@@ -16,6 +16,8 @@ export interface KycReadinessDto {
   ready: boolean;
   readinessStatus: string | null;
   readinessCode: string | null;
+  /** Non-null when the KRA already holds a record for this PAN. */
+  modification: string | null;
   /** Per-field detail, for telling the investor what to fix. */
   checks: {
     pan: KycCheckResult;
@@ -62,6 +64,9 @@ export interface UpdateKycFormInput {
   citizenshipCountries?: string[];
   nationalityCountry?: string;
   taxResidencyOtherThanIndia?: boolean;
+  nonIndianTaxResidency1?: { country: string; taxIdNumber: string };
+  nonIndianTaxResidency2?: { country: string; taxIdNumber: string };
+  nonIndianTaxResidency3?: { country: string; taxIdNumber: string };
   geolocation?: { latitude: number; longitude: number };
 }
 

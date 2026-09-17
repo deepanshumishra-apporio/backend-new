@@ -946,6 +946,42 @@ try {
       body: { mfInvestmentAccountId: accountId, switchOutIsin: scheme.purchase, switchInIsin: scheme.switchIn, folioNumber, amount: "500", initiatedVia: "mobile_app" },
     });
     record("POST /orders/switches", switchOrder.status === 201 ? "PASS" : "INFO", `${switchOrder.status} ${summarise(switchOrder)}`);
+
+    // What the DTO carries matters as much as the status. The app renders a
+    // redemption's proceeds and a switch's far leg off these fields, and both
+    // used to be missing entirely — so assert the keys exist and read the way
+    // the screens expect even while the sandbox cannot allot.
+    const placedRedemption = redemption.body?.data;
+    if (placedRedemption) {
+      const fetched = await api("GET", `/api/v1/orders/${placedRedemption.id}`);
+      const dto = fetched.body?.data;
+      record(
+        "a redemption reports its mode and an unfiled payout",
+        dto?.type === "REDEMPTION" && dto?.redemptionMode === "NORMAL" && dto?.payout === null
+          ? "PASS"
+          : "FAIL",
+        `mode=${dto?.redemptionMode} payout=${JSON.stringify(dto?.payout)}`,
+      );
+    }
+    const placedSwitch = switchOrder.body?.data;
+    if (placedSwitch) {
+      const fetched = await api("GET", `/api/v1/orders/${placedSwitch.id}`);
+      const dto = fetched.body?.data;
+      // The switch-in name is what the order screen shows; before it was
+      // resolved server-side the app had to fetch the target scheme itself.
+      record(
+        "a switch names the scheme it buys into",
+        dto?.type === "SWITCH" && dto?.switchInIsin === scheme.switchIn && Boolean(dto?.switchInSchemeName)
+          ? "PASS"
+          : "FAIL",
+        `in=${dto?.switchInIsin} name=${dto?.switchInSchemeName}`,
+      );
+      record(
+        "an untraded switch reports no switch-in allotment",
+        dto?.switchedInUnits === null && dto?.switchedInAmount === null ? "PASS" : "FAIL",
+        `units=${dto?.switchedInUnits} amount=${dto?.switchedInAmount}`,
+      );
+    }
   } else {
     record("redemption / switch", "SKIP", "no folio exists yet — a purchase must settle first");
   }
@@ -1026,6 +1062,21 @@ try {
       );
       expectStatus("GET /plans/:id", await api("GET", `/api/v1/plans/${planId}`), 200);
       expectStatus("POST /plans/:id/refresh", await api("POST", `/api/v1/plans/${planId}/refresh`), 200);
+
+      // Installments are ordinary orders carrying the plan's id, and that link
+      // is only written when the order syncs. A plan with no installments yet
+      // must still answer with a list rather than a 404 — an empty list here
+      // and an empty list for a plan that never linked read identically, which
+      // is exactly how the missing link went unnoticed.
+      const installments = await api("GET", `/api/v1/plans/${planId}/installments`);
+      if (expectStatus("GET /plans/:id/installments", installments, 200)) {
+        const rows: any[] = installments.body?.data ?? [];
+        record(
+          "every installment points back at its plan",
+          rows.every((row) => row.planId === planId) ? "PASS" : "FAIL",
+          `${rows.length} installment(s)`,
+        );
+      }
 
       const list = await api("GET", `/api/v1/plans?mfInvestmentAccountId=${accountId}`);
       expectStatus("GET /plans?mfInvestmentAccountId=", list, 200);

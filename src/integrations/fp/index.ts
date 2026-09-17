@@ -30,5 +30,7 @@ export * as fpPreVerification from "./resources/preverification.ts";
 export * as fpKycForms from "./resources/kyc-forms.ts";
 export * as fpBankVerification from "./resources/bank-verification.ts";
 export * as fpSimulation from "./resources/simulation.ts";
+export * as fpTransactions from "./resources/transactions.ts";
+export * as fpSettlements from "./resources/settlements.ts";
 
 export type * from "./fp.types.ts";

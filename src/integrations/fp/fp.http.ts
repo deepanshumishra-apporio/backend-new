@@ -53,8 +53,23 @@ function randomId(): string {
   return crypto.randomUUID().replaceAll("-", "").slice(0, 16);
 }
 
+/**
+ * FP's unversioned top-level resources.
+ *
+ * Everything else lives under /v2, /api or /poa, but these three predate that
+ * and FP still serves them at the root. Named one by one rather than loosening
+ * the pattern to "any top-level path": the point of the check is that a path
+ * built from caller input cannot reach an endpoint nobody vetted.
+ *
+ * `/files` was already being called by `identity.uploadFile` and had never
+ * worked — the pattern rejected it before the request was built.
+ */
+const ROOT_RESOURCES = ["files", "file_operations", "transactions"] as const;
+const ROOT_PATH = new RegExp(`^/(?:${ROOT_RESOURCES.join("|")})(?:/[a-zA-Z0-9_-]+)*$`);
+
 function buildUrl(path: string, query: FpRequestOptions["query"], realm: FpRealm): string {
-  if (!/^\/(?:v2|api|poa)\/[a-zA-Z0-9_/-]+$/.test(path) || path.includes("..")) {
+  const allowed = /^\/(?:v2|api|poa)\/[a-zA-Z0-9_/-]+$/.test(path) || ROOT_PATH.test(path);
+  if (!allowed || path.includes("..")) {
     throw new Error("Invalid provider resource path");
   }
   const baseUrl = realm === "preverify" ? fpPreVerifyConfig().baseUrl : fpConfig().baseUrl;
@@ -93,10 +108,34 @@ function isRetryableStatus(status: number): boolean {
  * FpTransportError when no response arrived at all.
  */
 export async function fpRequest<T>(options: FpRequestOptions): Promise<T> {
-  if (options.method !== "GET" && options.path.startsWith("/v2/mf_settlement_details")) throw new Error("RTA settlements are disabled");
+  // The RTA route exists here for one reason: the ONDC gateway cannot be driven
+  // to an allotment in the sandbox. It refuses `/api/oms/simulate/orders/:id`
+  // ("ONDC gateway orders can't be simulated") and its RTA batch rejects
+  // everything, so no folio is ever issued and redemption and switch cannot be
+  // exercised at all. On the RTA route the same orders settle on demand, via a
+  // settlement detail and the order simulation.
+  //
+  // Gated on `simulationEnabled`, which is `hostname === "s.finprim.com" &&
+  // NODE_ENV !== "production"` — a computed fact, not a flag, so no environment
+  // variable can open this against production. Production stays ONDC-only.
+  const sandbox = fpConfig().simulationEnabled;
+  if (
+    options.method !== "GET" &&
+    options.path.startsWith("/v2/mf_settlement_details") &&
+    !sandbox
+  ) {
+    throw new Error("RTA settlements are disabled outside the sandbox");
+  }
   if (options.body && typeof options.body === "object" && !(options.body instanceof FormData)) {
     const body = options.body as Record<string, unknown>;
-    if (body.gateway !== undefined && !["ondc", "cybrillapoa"].includes(String(body.gateway))) throw new Error("Only ONDC routing is supported");
+    const routes = sandbox ? ["ondc", "cybrillapoa", "rta"] : ["ondc", "cybrillapoa"];
+    if (body.gateway !== undefined && !routes.includes(String(body.gateway))) {
+      throw new Error(
+        sandbox
+          ? "Only ONDC and (in the sandbox) RTA routing are supported"
+          : "Only ONDC routing is supported",
+      );
+    }
     // Defence in depth against a non-ONDC provider reaching a money call.
     // The two halves of /api/pg do not agree on what the ONDC gateway is
     // called — mandates want CYBRILLAPOA, payments want ONDC, and each rejects
@@ -115,7 +154,7 @@ export async function fpRequest<T>(options: FpRequestOptions): Promise<T> {
       }
     }
     if (options.method === "POST" && /^\/v2\/mf_(purchases|redemptions|switches|purchase_plans|redemption_plans|switch_plans)$/.test(options.path) && body.mf_investment_account) {
-      options = { ...options, body: { ...body, gateway: "cybrillapoa" } };
+      options = { ...options, body: { ...body, gateway: sandbox && body.gateway === "rta" ? "rta" : "cybrillapoa" } };
     }
   }
   const config = fpConfig();
@@ -162,9 +201,12 @@ export async function fpRequest<T>(options: FpRequestOptions): Promise<T> {
     } catch (cause) {
       // No response: DNS, TCP, TLS, or our AbortSignal fired.
       const isLast = !retryEnabled || attempt >= MAX_ATTEMPTS;
+      // The cause, not just the fact. Without it every transport failure logs
+      // the same line whether the token expired, DNS went, or we timed out.
       console.warn(
         `[fp] ${endpoint} transport failure (attempt ${attempt}) req=${requestId}` +
           (isLast ? "" : ", retrying"),
+        cause,
       );
       if (isLast) {
         throw new FpTransportError(`FP request failed: ${endpoint}`, endpoint, requestId, cause);

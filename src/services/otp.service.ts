@@ -4,6 +4,16 @@ import * as msg91 from "../integrations/msg91.client.ts";
 import { Msg91Error } from "../integrations/msg91.client.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { maskPhone, normalisePhone, toProviderFormat } from "../utils/phone.ts";
+import {
+  codeMatches,
+  deliverCodeByEmail,
+  devOtpCode,
+  generateCode,
+  hashCode,
+  usingDevOtp,
+  usingEmailOtp,
+} from "./otp-channel.ts";
+import { EmailError } from "../integrations/email.client.ts";
 import type {
   ConsumedVerification,
   RequestOtpDto,
@@ -47,6 +57,11 @@ const hashToken = (token: string) => createHash("sha256").update(token).digest("
 
 /** Translate a transport/config failure into a client-safe response. */
 function toHttpError(error: unknown): never {
+  if (error instanceof EmailError) {
+    throw error.retryable
+      ? HttpError.badGateway("Could not send the code, please try again")
+      : HttpError.serviceUnavailable("Code delivery is not configured");
+  }
   if (error instanceof Msg91Error) {
     // retryable = provider blip. Not retryable = our misconfiguration, which is
     // a 503 because the caller can do nothing about it.
@@ -134,7 +149,18 @@ export async function requestOtp(input: RequestOtpInput): Promise<RequestOtpDto>
 
   await assertSendBudget(phone);
 
-  const active = latest?.status === "PENDING" && latest.expiresAt > now ? latest : null;
+  let active = latest?.status === "PENDING" && latest.expiresAt > now ? latest : null;
+  // Older builds created transaction challenges without a resource context.
+  // They cannot authorise anything. Retire them rather than attaching an old
+  // code to a new transaction; lockout and phone-wide send budgets above remain.
+  if (active?.purpose === "TRANSACTION_APPROVAL" && active.context === null &&
+      input.purpose === "TRANSACTION_APPROVAL" && input.context) {
+    await db.phoneVerification.updateMany({
+      where: { id: active.id, status: "PENDING", context: null },
+      data: { status: "EXPIRED" },
+    });
+    active = null;
+  }
   if (active && (active.purpose !== input.purpose || active.context !== (input.context ?? null))) {
     throw HttpError.conflict("Complete or wait for the current OTP challenge before starting another action");
   }
@@ -149,17 +175,49 @@ export async function requestOtp(input: RequestOtpInput): Promise<RequestOtpDto>
       });
     }
 
-    const result = await msg91.resendOtp(providerPhone).catch(toHttpError);
-    if (!result.ok) throw mapSendFailure(result);
+    let updated;
+    if (usingDevOtp()) {
+      const code = devOtpCode();
+      if (code === null) throw new Error("OTP_DEV_CODE disappeared between checks");
+      // Nothing to deliver — the code is constant. The challenge is still
+      // touched so the cooldown and send budget behave exactly as they would
+      // with a real provider.
+      updated = await db.phoneVerification.update({
+        where: { id: active.id },
+        data: { sendCount: { increment: 1 }, lastSentAt: now, codeHash: hashCode(active.id, code) },
+      });
+    } else if (usingEmailOtp()) {
+      // A fresh code on every resend rather than redelivering the old one: we
+      // store only a hash, so there is nothing to re-send, and rotating costs
+      // nothing. The challenge itself is untouched, so attempts and expiry
+      // carry over exactly as they would with MSG91.
+      const code = generateCode(POLICY.otpLength);
+      updated = await db.phoneVerification.update({
+        where: { id: active.id },
+        data: {
+          sendCount: { increment: 1 },
+          lastSentAt: now,
+          codeHash: hashCode(active.id, code),
+        },
+      });
+      await deliverCodeByEmail({
+        code,
+        maskedPhone: maskPhone(phone),
+        expiryMinutes: POLICY.ttlMinutes,
+      }).catch(toHttpError);
+    } else {
+      const result = await msg91.resendOtp(providerPhone).catch(toHttpError);
+      if (!result.ok) throw mapSendFailure(result);
 
-    const updated = await db.phoneVerification.update({
-      where: { id: active.id },
-      data: {
-        sendCount: { increment: 1 },
-        lastSentAt: now,
-        ...(result.requestId && { providerRequestId: result.requestId }),
-      },
-    });
+      updated = await db.phoneVerification.update({
+        where: { id: active.id },
+        data: {
+          sendCount: { increment: 1 },
+          lastSentAt: now,
+          ...(result.requestId && { providerRequestId: result.requestId }),
+        },
+      });
+    }
 
     await writeAudit("OTP_RESENT", updated.id, { phone, ipAddress: input.ipAddress, userAgent: input.userAgent }, {
       purpose: input.purpose,
@@ -175,23 +233,68 @@ export async function requestOtp(input: RequestOtpInput): Promise<RequestOtpDto>
     };
   }
 
-  const result = await msg91
-    .sendOtp(providerPhone, { otpLength: POLICY.otpLength, expiryMinutes: POLICY.ttlMinutes })
-    .catch(toHttpError);
-  if (!result.ok) throw mapSendFailure(result);
+  const challenge = {
+    phone,
+    purpose: input.purpose,
+    // Persisted, not just audited. `verifyOtp` looks the challenge up by
+    // `context`, and `consumeVerificationToken` refuses a token whose context
+    // does not match the thing being approved — so a challenge stored without
+    // one could never be verified for a transaction, and `confirmPlan` could
+    // never be reached. Every SIP ever created sat unconfirmed because of this.
+    context: input.context ?? null,
+    status: "PENDING" as const,
+    expiresAt: new Date(now.getTime() + POLICY.ttlMinutes * 60_000),
+    lastSentAt: now,
+    ipAddress: input.ipAddress ?? null,
+    userAgent: input.userAgent?.slice(0, 300) ?? null,
+  };
 
-  const created = await db.phoneVerification.create({
-    data: {
-      phone,
-      purpose: input.purpose,
-      status: "PENDING",
-      expiresAt: new Date(now.getTime() + POLICY.ttlMinutes * 60_000),
-      lastSentAt: now,
-      providerRequestId: result.requestId,
-      ipAddress: input.ipAddress ?? null,
-      userAgent: input.userAgent?.slice(0, 300) ?? null,
-    },
-  });
+  let created;
+  if (usingDevOtp()) {
+    const code = devOtpCode();
+    if (code === null) throw new Error("OTP_DEV_CODE disappeared between checks");
+    created = await db.phoneVerification.create({ data: challenge });
+    created = await db.phoneVerification.update({
+      where: { id: created.id },
+      data: { codeHash: hashCode(created.id, code) },
+    });
+  } else if (usingEmailOtp()) {
+    // The hash is salted with the row id, so the row has to exist first. The
+    // window between the two writes holds a challenge whose code cannot match
+    // anything — `codeMatches` fails closed on a null hash — so a crash here
+    // leaves a dead challenge that expires, never an open one.
+    const code = generateCode(POLICY.otpLength);
+    created = await db.phoneVerification.create({ data: challenge });
+    created = await db.phoneVerification.update({
+      where: { id: created.id },
+      data: { codeHash: hashCode(created.id, code) },
+    });
+
+    try {
+      await deliverCodeByEmail({
+        code,
+        maskedPhone: maskPhone(phone),
+        expiryMinutes: POLICY.ttlMinutes,
+      });
+    } catch (error) {
+      // Undeliverable: retire the challenge so it does not occupy the "active"
+      // slot and block the caller from trying again for the full TTL.
+      await db.phoneVerification.update({
+        where: { id: created.id },
+        data: { status: "EXPIRED" },
+      });
+      toHttpError(error);
+    }
+  } else {
+    const result = await msg91
+      .sendOtp(providerPhone, { otpLength: POLICY.otpLength, expiryMinutes: POLICY.ttlMinutes })
+      .catch(toHttpError);
+    if (!result.ok) throw mapSendFailure(result);
+
+    created = await db.phoneVerification.create({
+      data: { ...challenge, providerRequestId: result.requestId },
+    });
+  }
 
   await writeAudit("OTP_SENT", created.id, { phone, ipAddress: input.ipAddress, userAgent: input.userAgent }, { purpose: input.purpose });
 
@@ -274,9 +377,18 @@ export async function verifyOtp(input: VerifyOtpInput): Promise<VerifyOtpDto> {
     });
   }
 
-  const result = await msg91
-    .verifyOtp(toProviderFormat(phone), input.otp)
-    .catch(toHttpError);
+  /*
+   * Which side holds the code decides which side checks it. `codeHash` is set
+   * only by the email path, so its presence — not the current environment — is
+   * what routes this. A challenge created under one channel therefore still
+   * verifies correctly if the deployment is switched while it is in flight.
+   */
+  const result: msg91.VerifyOtpResult =
+    challenge.codeHash !== null
+      ? codeMatches(challenge.id, input.otp, challenge.codeHash)
+        ? { ok: true }
+        : { ok: false, reason: "MISMATCH", message: "Incorrect code" }
+      : await msg91.verifyOtp(toProviderFormat(phone), input.otp).catch(toHttpError);
 
   if (!result.ok) {
     const attemptsRemaining = Math.max(0, POLICY.maxAttempts - attempts);

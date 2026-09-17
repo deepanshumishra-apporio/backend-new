@@ -1,5 +1,7 @@
 import type { Request, Response } from "express";
 import * as investorService from "../services/investor.service.ts";
+import { kycProfilePrefill } from "../services/kyc-prefill.service.ts";
+import { provisionInvestor } from "../services/investor-provisioning.service.ts";
 import {
   asBody,
   clientIpv4,
@@ -54,7 +56,10 @@ const INCOME_SLABS = [
   "above_1cr",
 ] as const;
 const PEP_VALUES = ["pep_exposed", "pep_related", "not_applicable"] as const;
-const MARITAL_STATUSES = ["married", "unmarried", "others"] as const;
+// `single`, not the KYC form's `unmarried`: /v2/investor_profiles answers
+// "should be one of married, single, others" and rejects the whole create.
+// The two vocabularies are mapped in `kycProfilePrefill`.
+const MARITAL_STATUSES = ["married", "single", "others"] as const;
 const BANK_ACCOUNT_TYPES = ["savings", "current", "nre", "nro"] as const;
 const ADDRESS_NATURES = ["residential", "business_location"] as const;
 const NOMINEE_RELATIONSHIPS = [
@@ -117,6 +122,64 @@ export async function createProfile(req: Request, res: Response) {
       pepDetails: oneOf(body, "pepDetails", PEP_VALUES, false),
       // Taken from the connection, not the body: client-supplied audit data is
       // worthless.
+      ipAddress: clientIpv4({}, req.ip ?? req.socket.remoteAddress),
+    }),
+  });
+}
+
+/**
+ * What the investor already answered during KYC, in the profile's vocabulary.
+ *
+ * `null` when there is nothing to carry over. The client fills its form with
+ * this; it never creates the profile on the investor's behalf, because FP
+ * freezes most of these fields the moment the profile exists.
+ */
+export async function getProfilePrefill(req: Request, res: Response) {
+  res.json({ data: await kycProfilePrefill(investorId(req)) });
+}
+
+/**
+ * Build as much of the investor account as the answers so far allow.
+ *
+ * Called after each identity-journey screen rather than once at the end, so a
+ * half-finished journey still leaves FP holding everything it was told. Safe to
+ * repeat — see `investor-provisioning.service.ts`.
+ */
+export async function provision(req: Request, res: Response) {
+  const body = asBody(req.body);
+  const address = body["address"] == null ? null : asBody(body["address"]);
+  const nominee = body["nominee"] == null ? null : asBody(body["nominee"]);
+
+  res.json({
+    data: await provisionInvestor({
+      userId: investorId(req),
+      sourceOfWealth: oneOf(body, "sourceOfWealth", SOURCES_OF_WEALTH, false),
+      countryOfBirth: optionalString(body, "countryOfBirth", { maxLength: 2 }),
+      ...(address && {
+        address: {
+          line1: requiredString(address, "line1", { maxLength: 120 }),
+          line2: optionalString(address, "line2", { maxLength: 120 }),
+          city: optionalString(address, "city", { maxLength: 60 }),
+          state: optionalString(address, "state", { maxLength: 60 }),
+          postalCode: requiredString(address, "postalCode", {
+            pattern: /^\d{6}$/,
+            patternHint: "postalCode must be a 6-digit Indian PIN code",
+          }),
+        },
+      }),
+      ...(nominee && {
+        nominee: {
+          name: requiredString(nominee, "name", { maxLength: 40 }),
+          relationship: oneOf(nominee, "relationship", NOMINEE_RELATIONSHIPS) as string,
+          dateOfBirth: optionalDate(nominee, "dateOfBirth"),
+          pan: nominee["pan"] === undefined ? undefined : requiredPan(nominee),
+        },
+      }),
+      ...(typeof body["nominationOptOut"] === "boolean" && {
+        nominationOptOut: body["nominationOptOut"],
+      }),
+      bankAccountId: optionalString(body, "bankAccountId"),
+      // From the connection, never the body.
       ipAddress: clientIpv4({}, req.ip ?? req.socket.remoteAddress),
     }),
   });
@@ -199,6 +262,38 @@ export async function addBankAccount(req: Request<ProfileParams>, res: Response)
         patternHint: "ifscCode must be a valid IFSC, e.g. HDFC0001330",
       }),
     }),
+  });
+}
+
+export async function createBankAccountLookup(req: Request<ProfileParams>, res: Response) {
+  const body = asBody(req.body);
+  if (body["consentAccepted"] !== true) {
+    throw HttpError.badRequest("Consent is required to find a bank account by mobile number");
+  }
+  res.status(202).json({
+    data: await investorService.createBankAccountLookup({
+      userId: investorId(req),
+      investorProfileId: req.params.profileId,
+      ipAddress: clientIpv4({}, req.ip ?? req.socket.remoteAddress),
+    }),
+  });
+}
+
+export async function refreshBankAccountLookup(
+  req: Request<{ lookupId: string }>,
+  res: Response,
+) {
+  res.json({
+    data: await investorService.refreshBankAccountLookup(investorId(req), req.params.lookupId),
+  });
+}
+
+export async function linkBankAccountLookup(
+  req: Request<{ lookupId: string }>,
+  res: Response,
+) {
+  res.status(201).json({
+    data: await investorService.linkBankAccountLookup(investorId(req), req.params.lookupId),
   });
 }
 

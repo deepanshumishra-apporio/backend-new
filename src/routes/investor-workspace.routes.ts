@@ -9,7 +9,7 @@ import { HttpError } from "../utils/http-error.ts";
 export const investorWorkspaceRouter = Router();
 investorWorkspaceRouter.get("/workspace", async (req, res) => {
   const userId = investorId(req);
-  const [profiles, onboarding, resources] = await Promise.all([
+  const [profiles, onboarding, resources, contacts] = await Promise.all([
     listProfilesForUser(userId), getOnboardingStatus(userId),
     db.investorProfile.findMany({
       where: { userLinks: { some: { userId, relationship: "SELF" } } },
@@ -21,8 +21,22 @@ investorWorkspaceRouter.get("/workspace", async (req, res) => {
         primaryFor: { where: { holdingPattern: "SINGLE" }, select: { id: true } },
       },
     }),
+    db.user.findUniqueOrThrow({
+      where: { id: userId },
+      // `createdAt` is the profile header's "member since"; it is the account's
+      // own age, which no investor_profile row carries.
+      select: { email: true, phone: true, fullName: true, createdAt: true },
+    }),
   ]);
-  res.json({ data: { profiles, onboarding, resources } });
+  res.json({
+    data: {
+      profiles, onboarding, resources,
+      contacts: {
+        email: contacts.email, phone: contacts.phone, fullName: contacts.fullName,
+        memberSince: contacts.createdAt.toISOString(),
+      },
+    },
+  });
 });
 
 investorWorkspaceRouter.get("/watchlist", async (req, res) => {

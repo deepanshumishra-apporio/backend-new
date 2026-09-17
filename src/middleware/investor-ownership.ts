@@ -3,6 +3,7 @@ import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { investorId } from "./investor-auth.ts";
 import { validateCallback } from "./api-security.ts";
+import { fpConfig } from "../integrations/fp/fp.config.ts";
 
 function uuid(id: unknown): asserts id is string {
   if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
@@ -78,7 +79,8 @@ export async function ownResource(userId: string, kind: string, id: string): Pro
           db.mfSwitchPlan.findUnique({ where: { id }, select: routedSelect }),
         ]);
     const row = rows.find(Boolean);
-    if (!row || row.gateway !== "CYBRILLAPOA") throw HttpError.notFound();
+    if (!row || (row.gateway !== "CYBRILLAPOA" &&
+        !(row.gateway === "RTA" && fpConfig().simulationEnabled))) throw HttpError.notFound();
     return ownAccount(userId, row.mfInvestmentAccountId);
   }
   if (kind === "paymentId") {

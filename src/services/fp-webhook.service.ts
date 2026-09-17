@@ -181,7 +181,13 @@ async function applyEvent(type: string, objectFpId: string | null): Promise<bool
         const order = await fpOrders.fetchRedemption(objectFpId);
         const accountId = await accountIdByFpId(order.mf_investment_account);
         if (!accountId) return false;
-        await syncRedemption(order, accountId);
+        const row = await syncRedemption(order, accountId);
+        // Nothing announces a payout — there is no `mf_payout_detail` event —
+        // so the redemption's own success event is the trigger for looking.
+        if (order.state === "successful") {
+          const { pullRedemptionPayout } = await import("./order.service.ts");
+          await pullRedemptionPayout(row.id, order.id);
+        }
         return true;
       }
       case "mf_switch": {
