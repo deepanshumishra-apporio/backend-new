@@ -1,16 +1,3 @@
-// Bank account verification (BAV) — does this account exist, and does it belong
-// to this investor?
-//
-// Not optional on the cybrillapoa gateway. An order whose payout account has
-// not been verified is submitted, then fails with
-// `payout_account_verification_pending` — after the payment has already been
-// taken. So verification belongs in onboarding, before the first order, not as
-// a reaction to a failed one.
-//
-// Asynchronous: a create comes back `pending` and settles a moment later.
-//
-// Sandbox simulation: an account number matching `31XX` fails; anything else
-// succeeds.
 import { fpList, fpRequest } from "../fp.http.ts";
 
 export type BavStatus = "pending" | "completed" | "failed";
@@ -41,7 +28,6 @@ export async function createBankAccountVerification(
     method: "POST",
     path: "/v2/bank_account_verifications",
     body: { bank_account: bankAccountFpId },
-    // A penny-drop costs money and is not idempotent at FP.
     retry: false,
     ...(requestId && { requestId }),
   });
@@ -65,13 +51,6 @@ export async function listBankAccountVerifications(
   return fpList<FpBankAccountVerification>("/v2/bank_account_verifications", query, requestId);
 }
 
-/**
- * Is this account good enough to transact against?
- *
- * Completion alone is not enough — a completed verification can still come back
- * `low` or `zero`, meaning the account probably is not the investor's. Only
- * high confidence is treated as verified.
- */
 export function isVerified(bav: FpBankAccountVerification): boolean {
   return (
     bav.status === "completed" &&

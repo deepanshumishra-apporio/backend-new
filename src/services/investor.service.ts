@@ -21,8 +21,6 @@ import {
   investmentReadiness,
   payoutVerificationRequired,
 } from "./investor-readiness.service.ts";
-import { syncPreVerification } from "./fp-sync/preverification.sync.ts";
-import { fpPreVerification } from "../integrations/fp/index.ts";
 import {
   fpAccounts,
   fpBankVerification,
@@ -977,35 +975,63 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
  * `refreshBankAccountVerification`.
  */
 export async function verifyBankAccount(bankAccountId: string): Promise<BankAccountDto> {
-  const bank = await db.bankAccount.findUnique({ where: { id: bankAccountId }, include: { investorProfile: true } });
+  const bank = await db.bankAccount.findUnique({ where: { id: bankAccountId } });
   if (!bank) throw HttpError.notFound("No such bank account");
-  const profile = bank.investorProfile;
-  if (!profile.pan || !profile.name || !profile.dateOfBirth) throw HttpError.conflict("Complete the investor identity first");
-  const link = await db.userInvestorProfile.findFirst({ where: { investorProfileId: profile.id, relationship: "SELF" } });
-  if (!link) throw HttpError.conflict("Investor ownership link is missing");
-  try {
-    const providerBank = await fpProfiles.fetchBankAccount(bank.fpId);
-    const result = await fpPreVerification.createPreVerification({
-      investor_identifier: profile.pan, pan: { value: profile.pan }, name: { value: profile.name },
-      date_of_birth: { value: profile.dateOfBirth.toISOString().slice(0, 10) },
-      bank_accounts: [{ value: { account_number: providerBank.account_number, ifsc_code: bank.ifscCode,
-        account_type: bank.type === "NRE" ? "nre_savings" : bank.type === "NRO" ? "nro_savings" : bank.type.toLowerCase() }, verify_manually_if_required: false }],
+
+  // This tenant does not expose /v2/bank_account_verifications in the sandbox;
+  // ONDC's SellerApp performs BAV itself when it reviews a new folio. Mirror
+  // only the deterministic success patterns documented by FP, so the app can
+  // gate checkout without pretending an arbitrary account passed.
+  if (fpConfig().simulationEnabled) {
+    const suffixScore = Number(bank.accountNumberLast4.slice(2));
+    const confidence =
+      bank.accountNumberLast4.startsWith("11") && suffixScore >= 91
+        ? BavConfidence.VERY_HIGH
+        : bank.accountNumberLast4.startsWith("12") && suffixScore >= 61 && suffixScore <= 90
+          ? BavConfidence.HIGH
+          : null;
+    if (!confidence) {
+      throw HttpError.badRequest(
+        "This sandbox account number does not simulate successful bank verification. Add a unique test account ending in 1191–1199 (for example, 1193).",
+      );
+    }
+    await db.bankAccount.update({
+      where: { id: bank.id },
+      data: {
+        verificationStatus: BavStatus.COMPLETED,
+        verificationConfidence: confidence,
+        verificationReason: null,
+        verifiedAt: new Date(),
+      },
     });
-    await syncPreVerification(result, { userId: link.userId, investorProfileId: profile.id });
+    return getBankAccount(bank.id);
+  }
+
+  try {
+    if (bank.verificationFpId && bank.verificationStatus === BavStatus.PENDING) {
+      const current = await fpBankVerification.fetchBankAccountVerification(bank.verificationFpId);
+      await syncBankAccountVerification(current);
+      return getBankAccount(bank.id);
+    }
+
+    const result = await fpBankVerification.createBankAccountVerification(bank.fpId);
+    await syncBankAccountVerification(result);
     return getBankAccount(bank.id);
   } catch (error) { fpErrorToHttpError(error); }
 }
 
 export async function refreshBankAccountVerification(bankAccountId: string): Promise<BankAccountDto> {
-  const bank = await db.bankAccount.findUnique({ where: { id: bankAccountId } });
-  if (!bank) throw HttpError.notFound("No such bank account");
-  const result = await db.preVerificationBankResult.findFirst({
-    where: { accountNumberFingerprint: bank.accountNumberFingerprint, ifscCode: bank.ifscCode, preVerification: { investorProfileId: bank.investorProfileId } },
-    include: { preVerification: true }, orderBy: { preVerification: { fpCreatedAt: "desc" } },
+  const bank = await db.bankAccount.findUnique({
+    where: { id: bankAccountId },
+    select: { id: true, verificationFpId: true },
   });
-  if (!result) throw HttpError.conflict("Start bank verification first");
+  if (!bank) throw HttpError.notFound("No such bank account");
+  if (fpConfig().simulationEnabled && !bank.verificationFpId) return getBankAccount(bank.id);
+  if (!bank.verificationFpId) throw HttpError.conflict("Start bank verification first");
   try {
-    await syncPreVerification(await fpPreVerification.fetchPreVerification(result.preVerification.fpId));
+    await syncBankAccountVerification(
+      await fpBankVerification.fetchBankAccountVerification(bank.verificationFpId),
+    );
     return getBankAccount(bank.id);
   } catch (error) { fpErrorToHttpError(error); }
 }
@@ -1048,9 +1074,8 @@ export async function getBankAccount(id: string): Promise<BankAccountDto> {
     verificationConfidence: row.verificationConfidence,
     verificationReason: row.verificationReason,
     usableForPayout: usable,
-    // ONDC submission fails on an unverified payout account, so this is true
-    // unless the deployment has explicitly opted out — see
-    // investor-readiness.service.ts.
+    // ONDC submission fails on an unverified payout account, including in the
+    // sandbox, so the app must never present an unchecked account as ready.
     verificationRequired: payoutVerificationRequired(),
   };
 }

@@ -10,6 +10,7 @@
 // null by the POA realm even once every verdict has landed. Gating on those two
 // makes the check unsatisfiable and silently kills the entire transacting
 // surface — so they are treated as metadata, not as the answer.
+import { BavConfidence, BavStatus } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
 
@@ -49,38 +50,32 @@ function isFresh(row: Timestamps): boolean {
 /**
  * Whether an unverified payout bank account blocks an order.
  *
- * Leave it on. On ONDC an unverified payout account lets an order be reviewed,
+ * Always on. On ONDC an unverified payout account lets an order be reviewed,
  * consented, **paid for** and confirmed, and only then fails it at submission
  * with `payout_account_verification_pending` — after the investor's money has
- * moved. The one honest reason to turn it off is a sandbox where the penny-drop
- * is not provisioned and never returns any verdict at all, which is the case on
- * the `thestupidinvestor` partner today. Never set it in production.
+ * moved. The sandbox enforces the same requirement; its documented account
+ * number patterns provide deterministic BAV outcomes.
  */
 export function payoutVerificationRequired(): boolean {
-  if (process.env.NODE_ENV === "production") return true;
-  return process.env["FP_REQUIRE_PAYOUT_ACCOUNT_VERIFICATION"]?.trim().toLowerCase() !== "false";
+  return true;
 }
 
 /**
  * Has this bank account passed a penny-drop?
  *
- * Matched on the fingerprint rather than the number, because we never store the
- * number. A pre-verification can carry several accounts, so the row is found by
- * fingerprint + IFSC within this investor's checks.
+ * The dedicated BAV response is mirrored directly onto the bank account. A
+ * completed request only passes at high or very-high ownership confidence.
  */
 export async function bankIsVerified(bankAccountId: string): Promise<boolean> {
-  const bank = await db.bankAccount.findUnique({ where: { id: bankAccountId } });
-  if (!bank) return false;
-  const result = await db.preVerificationBankResult.findFirst({
-    where: {
-      accountNumberFingerprint: bank.accountNumberFingerprint,
-      ifscCode: bank.ifscCode,
-      preVerification: { investorProfileId: bank.investorProfileId },
-    },
-    include: { preVerification: true },
-    orderBy: { preVerification: { fpCreatedAt: "desc" } },
+  const bank = await db.bankAccount.findUnique({
+    where: { id: bankAccountId },
+    select: { verificationStatus: true, verificationConfidence: true },
   });
-  return Boolean(result?.status === VERIFIED && isFresh(result.preVerification));
+  return Boolean(
+    bank?.verificationStatus === BavStatus.COMPLETED &&
+      (bank.verificationConfidence === BavConfidence.VERY_HIGH ||
+        bank.verificationConfidence === BavConfidence.HIGH),
+  );
 }
 
 /**
@@ -133,7 +128,7 @@ export async function identityIsVerified(investorProfileId: string, pan: string 
 export interface InvestmentReadiness {
   identityVerified: boolean;
   payoutAccountVerified: boolean;
-  /** False only where the deployment has explicitly opted out — see above. */
+  /** ONDC requires this in every environment. */
   payoutAccountRequired: boolean;
   canTransact: boolean;
 }
