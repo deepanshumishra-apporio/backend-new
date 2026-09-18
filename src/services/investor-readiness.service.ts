@@ -47,6 +47,33 @@ function isFresh(row: Timestamps): boolean {
   return decidedAt(row).getTime() > Date.now() - MAX_CHECK_AGE_MS;
 }
 
+interface IdentityCheck extends Timestamps {
+  readinessStatus: string | null;
+  panStatus: string | null;
+  nameStatus: string | null;
+  dateOfBirthStatus: string | null;
+}
+
+function identityCheckPassed(check: IdentityCheck | null): boolean {
+  return Boolean(
+    check &&
+      check.readinessStatus === VERIFIED &&
+      check.panStatus === VERIFIED &&
+      check.nameStatus === VERIFIED &&
+      check.dateOfBirthStatus === VERIFIED &&
+      isFresh(check),
+  );
+}
+
+/** A verified pre-profile user must resume after PAN, not restart at PAN. */
+export async function userIdentityIsVerified(userId: string): Promise<boolean> {
+  const check = await db.preVerification.findFirst({
+    where: { userId, readinessStatus: { not: null } },
+    orderBy: { fpCreatedAt: "desc" },
+  });
+  return identityCheckPassed(check);
+}
+
 /**
  * Whether an unverified payout bank account blocks an order.
  *
@@ -115,14 +142,7 @@ export async function identityIsVerified(investorProfileId: string, pan: string 
     },
     orderBy: { fpCreatedAt: "desc" },
   });
-  return Boolean(
-    check &&
-      check.readinessStatus === VERIFIED &&
-      check.panStatus === VERIFIED &&
-      check.nameStatus === VERIFIED &&
-      check.dateOfBirthStatus === VERIFIED &&
-      isFresh(check),
-  );
+  return identityCheckPassed(check);
 }
 
 export interface InvestmentReadiness {

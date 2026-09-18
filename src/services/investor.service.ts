@@ -20,6 +20,7 @@ import {
   bankIsVerified,
   investmentReadiness,
   payoutVerificationRequired,
+  userIdentityIsVerified,
 } from "./investor-readiness.service.ts";
 import {
   fpAccounts,
@@ -860,6 +861,7 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
   ]);
 
   if (!link) {
+    const identityVerified = await userIdentityIsVerified(userId);
     return {
       investorProfileId: null,
       stage: null,
@@ -877,7 +879,7 @@ export async function getOnboardingStatus(userId: string): Promise<OnboardingSta
         hasNominee: false,
         hasInvestmentAccount: false,
         folioDefaultsComplete: false,
-        identityVerified: false,
+        identityVerified,
         payoutAccountVerified: false,
         canTransact: false,
       },
