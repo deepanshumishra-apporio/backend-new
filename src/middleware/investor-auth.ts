@@ -36,6 +36,24 @@ export const sessionRouter = Router();
  */
 const SANDBOX_OTP = '1234';
 
+// Resolve the linked phone only after checking the email code. Sandbox codes
+// deliberately do not stamp production verification timestamps.
+sessionRouter.post('/sandbox/email/verify', async (req, res) => {
+  assertSandboxAuth();
+  const body = asBody(req.body);
+  const email = requiredString(body, 'email', { maxLength: 255 }).trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    throw HttpError.badRequest('Enter a valid email address');
+  if (body.otp !== SANDBOX_OTP)
+    throw new HttpError(401, 'INVALID_OTP', 'Incorrect code. Please try again.');
+  const user = await db.user.findUnique({ where: { email } });
+  if (user && (user.deletedAt || user.role !== 'INVESTOR' ||
+      !['ACTIVE', 'PENDING_VERIFICATION'].includes(user.status)))
+    throw new HttpError(403, 'ACCOUNT_UNAVAILABLE', 'This account cannot sign in. Contact support.');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ data: { existing: Boolean(user), phone: user?.phone ?? null } });
+});
+
 sessionRouter.post('/sandbox', async (req, res) => {
   assertSandboxAuth();
   const body = asBody(req.body);

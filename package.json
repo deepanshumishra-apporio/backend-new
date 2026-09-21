@@ -6,7 +6,7 @@
   "scripts": {
     "//test": "test:unit is offline and fast; test:schema needs pglite; test:e2e talks to the live FP sandbox. `test` runs the two that need no network.",
     "test": "bun run test:unit && bun run test:schema",
-    "test:unit": "bun test tests/unit.test.ts tests/sandbox-auth.test.ts tests/kyc-prefill.test.ts && bun test tests/kyc-flow.test.ts && bun test tests/otp-context.test.ts && bun test tests/redemption-settle.test.ts",
+    "test:unit": "bun test tests/unit.test.ts tests/sandbox-auth.test.ts tests/kyc-prefill.test.ts && bun test tests/kyc-flow.test.ts && bun test tests/email-login.test.ts && bun test tests/otp-context.test.ts && bun test tests/redemption-settle.test.ts",
     "test:schema": "node --test --test-isolation=none tests/investor-schema.test.mjs",
     "//e2e": "Live end-to-end run against the FP ONDC sandbox and the configured database. Creates real objects; never point it at production.",
     "test:e2e": "bun run tests/e2e-ondc.ts",
