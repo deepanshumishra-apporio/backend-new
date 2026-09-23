@@ -27,6 +27,12 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
   if (
     !["POST", "PATCH", "PUT", "DELETE"].includes(req.method) ||
     req.path.endsWith("/refresh") ||
+    // A pure transform with no persistent side effect: it encrypts a PDF the
+    // client already rendered and returns it. Recording the response would
+    // persist the whole statement (base64) as a command row per download —
+    // unbounded growth of large rows holding the investor's financial data —
+    // for no idempotency benefit, since there is no write to protect.
+    req.path.endsWith("/statements/lock") ||
     req.path === "/investors/provision" ||
     req.path.startsWith("/transaction-otp")
   ) return next();

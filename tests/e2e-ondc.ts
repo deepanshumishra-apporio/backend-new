@@ -24,6 +24,7 @@
 // FP has not accepted has not been tested.
 import { createHash, randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import { PDFDocument } from "@cantoo/pdf-lib";
 import { createApp } from "../src/app.ts";
 import { db, disconnectDatabase } from "../src/db/client.ts";
 import { fpConfig } from "../src/integrations/fp/fp.config.ts";
@@ -1169,6 +1170,84 @@ try {
   expectStatus("GET /portfolio/:id/returns", await api("GET", `/api/v1/portfolio/${accountId}/returns`), 200);
   expectStatus("GET /portfolio/:id/capital-gains", await api("GET", `/api/v1/portfolio/${accountId}/capital-gains`), 200);
   expectStatus("POST /portfolio/:id/refresh", await api("POST", `/api/v1/portfolio/${accountId}/refresh`), 200);
+
+  // Portfolio Performance (account-wise returns) and the Transaction Statement.
+  const performance = await api("GET", `/api/v1/portfolio/${accountId}/performance`);
+  expectStatus("GET /portfolio/:id/performance", performance, 200);
+  record(
+    "account-wise returns come back as report rows",
+    Array.isArray(performance.body?.data) ? "PASS" : "FAIL",
+    summarise(performance),
+  );
+  const transactions = await api("GET", `/api/v1/portfolio/${accountId}/transactions`);
+  expectStatus("GET /portfolio/:id/transactions", transactions, 200);
+  record(
+    "the transaction list comes back as report rows",
+    Array.isArray(transactions.body?.data) ? "PASS" : "FAIL",
+    summarise(transactions),
+  );
+  expectStatus(
+    "the transaction statement honours its filters",
+    await api(
+      "GET",
+      `/api/v1/portfolio/${accountId}/transactions?type=purchase&from=2000-01-01&to=2099-12-31`,
+    ),
+    200,
+  );
+  expectStatus(
+    "an unknown transaction type is refused",
+    await api("GET", `/api/v1/portfolio/${accountId}/transactions?type=not_a_type`),
+    400,
+  );
+
+  // The statement PDF is locked with the account holder's PAN. Render a
+  // throwaway PDF, send it to the lock endpoint, and prove the result opens
+  // only with the PAN — the guarantee the feature exists for.
+  await resetRateLimit();
+  const draft = await PDFDocument.create();
+  draft.addPage([320, 200]).drawText("E2E statement", { x: 30, y: 120 });
+  const draftBase64 = Buffer.from(await draft.save()).toString("base64");
+  const lockResponse = await fetch(`${baseUrl}/api/v1/portfolio/${accountId}/statements/lock`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "text/plain",
+      "idempotency-key": randomBytes(16).toString("hex"),
+      accept: "application/json",
+    },
+    body: draftBase64,
+  });
+  const lockBody = (await lockResponse.json().catch(() => null)) as { data?: { pdfBase64?: string } } | null;
+  const lockedBase64 = lockBody?.data?.pdfBase64;
+  record(
+    "POST /portfolio/:id/statements/lock",
+    lockResponse.status === 200 && typeof lockedBase64 === "string" ? "PASS" : "FAIL",
+    `${lockResponse.status}${lockedBase64 ? "" : " (no pdf returned)"}`,
+  );
+  if (lockedBase64) {
+    const locked = Buffer.from(lockedBase64, "base64");
+    let rejectedWithoutPassword = false;
+    try {
+      await PDFDocument.load(locked);
+    } catch {
+      rejectedWithoutPassword = true;
+    }
+    let openedWithPan = false;
+    try {
+      await PDFDocument.load(locked, { password: PAN.toUpperCase() });
+      openedWithPan = true;
+    } catch {
+      openedWithPan = false;
+    }
+    record("the locked statement refuses to open without a password", rejectedWithoutPassword ? "PASS" : "FAIL", "");
+    record("the locked statement opens with the holder's PAN", openedWithPan ? "PASS" : "FAIL", "");
+  }
+  // A statement with no PDF body is a client error, not an upstream failure.
+  expectStatus(
+    "the lock endpoint rejects an empty body",
+    await api("POST", `/api/v1/portfolio/${accountId}/statements/lock`),
+    400,
+  );
 
   // -------------------------------------------------------------------------
   section("16. Webhooks");

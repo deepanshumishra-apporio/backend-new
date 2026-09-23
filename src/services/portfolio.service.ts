@@ -276,13 +276,63 @@ export async function getSchemeReturns(
 
 export async function getCapitalGains(
   mfInvestmentAccountId: string,
-  filters: { isin?: string; from?: string; to?: string } = {},
+  filters: { isin?: string; folio?: string; from?: string; to?: string } = {},
 ): Promise<Record<string, unknown>[]> {
   const account = await requireAccount(mfInvestmentAccountId);
   try {
     const report = await fpAccounts.fetchCapitalGains({
       mf_investment_account: account.fpId,
       ...(filters.isin && { scheme: filters.isin }),
+      ...(filters.folio && { folios: [filters.folio] }),
+      ...(filters.from && { traded_on_from: filters.from }),
+      ...(filters.to && { traded_on_to: filters.to }),
+    });
+    return fpAccounts.rowsToObjects(report);
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
+/**
+ * Account-level returns — the Portfolio Performance summary.
+ *
+ * Total invested, current value, unrealised gain, absolute return, CAGR and
+ * XIRR, all computed by FP from the full transaction history. Kept separate
+ * from `getSchemeReturns` (the per-scheme breakdown) because the two are
+ * different report endpoints; a screen that wants both asks for both.
+ */
+export async function getAccountReturns(
+  mfInvestmentAccountId: string,
+): Promise<Record<string, unknown>[]> {
+  const account = await requireAccount(mfInvestmentAccountId);
+  try {
+    const report = await fpAccounts.fetchAccountReturns({
+      mf_investment_account: account.fpId,
+    });
+    return fpAccounts.rowsToObjects(report);
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
+/**
+ * The Transaction Statement — every trade the registrar has reported.
+ *
+ * A `type` filter narrows it to one bucket, which is how the same endpoint
+ * serves the IDCW statement (`dividend_payout` / `dividend_reinvestment`).
+ * Figures are FP's and are returned as-is.
+ */
+export async function getTransactions(
+  mfInvestmentAccountId: string,
+  filters: { isin?: string; folio?: string; type?: string; from?: string; to?: string } = {},
+): Promise<Record<string, unknown>[]> {
+  const account = await requireAccount(mfInvestmentAccountId);
+  try {
+    const report = await fpAccounts.fetchTransactionList({
+      mf_investment_account: account.fpId,
+      ...(filters.isin && { scheme: filters.isin }),
+      ...(filters.folio && { folios: [filters.folio] }),
+      ...(filters.type && { type: filters.type }),
       ...(filters.from && { traded_on_from: filters.from }),
       ...(filters.to && { traded_on_to: filters.to }),
     });

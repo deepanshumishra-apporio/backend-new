@@ -166,6 +166,36 @@ export async function fetchCapitalGains(
   });
 }
 
+/**
+ * Every trade the registrar has reported for an account, as a tabular report.
+ *
+ * This is the source for the investor's Transaction Statement, and — filtered
+ * to `type` `dividend_payout` / `dividend_reinvestment` — for the IDCW
+ * statement. `scheme` is an ISIN, matching `capital_gains`; FP names the field
+ * `scheme` on these report endpoints even though it carries an ISIN.
+ */
+export async function fetchTransactionList(
+  payload: {
+    mf_investment_account: string;
+    folios?: string[];
+    scheme?: string;
+    /** purchase, redemption, switch_in/out, transfer_in/out, dividend_*. */
+    type?: string;
+    traded_on_from?: string;
+    traded_on_to?: string;
+  },
+  requestId?: string,
+): Promise<FpTabularReport> {
+  return fpRequest<FpTabularReport>({
+    method: "POST",
+    path: "/v2/transactions/reports/transaction_list",
+    body: payload,
+    // A report is a read; retrying one is safe.
+    retry: true,
+    ...(requestId && { requestId }),
+  });
+}
+
 /** Turn FP's column/row matrix into objects keyed by column name. */
 export function rowsToObjects(report: FpTabularReport): Record<string, unknown>[] {
   const columns = report.data.columns.map((column) => column.trim());
