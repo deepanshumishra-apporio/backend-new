@@ -36,7 +36,7 @@ import { db } from "../db/client.ts";
 import { assertInvestmentReady } from "./investor-readiness.service.ts";
 import { assertFolioAtSchemeAmc, resolvePurchaseFolio } from "./folio-resolution.service.ts";
 import { FpApiError, fpConfig, fpErrorToHttpError, fpOrders } from "../integrations/fp/index.ts";
-import { isOndcRoute } from "../utils/gateway.ts";
+import { canMoveMoney, isOndcRoute, LEGACY_GATEWAY_MESSAGE } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, asNav, asUnits } from "../utils/money.ts";
 import { consumeVerificationToken } from "./otp.service.ts";
@@ -486,6 +486,11 @@ export async function confirmPurchase(id: string): Promise<OrderDto> {
 
   if (!isOndcRoute(order.gateway)) {
     throw HttpError.conflict("Only ONDC orders can be confirmed", { gateway: order.gateway });
+  }
+  // Confirming sends the order to be settled; on the old gateway that never
+  // happens, so it would only lock in a payment for nothing.
+  if (!canMoveMoney(order.gateway)) {
+    throw HttpError.conflict(LEGACY_GATEWAY_MESSAGE, { gateway: order.gateway, retryable: false });
   }
 
   if (!order.consentAt) {

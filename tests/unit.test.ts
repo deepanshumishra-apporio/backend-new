@@ -415,3 +415,14 @@ describe("email OTP codes", () => {
     expect(seen.size).toBeGreaterThan(1);
   });
 });
+
+describe("which gateway may move money", () => {
+  test("only ondc; an old cybrillapoa order stays readable but is never paid or confirmed", async () => {
+    const { canMoveMoney, isOndcRoute } = await import("../src/utils/gateway.ts");
+    expect(canMoveMoney("ONDC")).toBe(true);
+    expect(isOndcRoute("CYBRILLAPOA")).toBe(true);
+    expect(canMoveMoney("CYBRILLAPOA")).toBe(false);
+    expect(canMoveMoney("RTA")).toBe(false);
+    expect(canMoveMoney(null)).toBe(false);
+  });
+});

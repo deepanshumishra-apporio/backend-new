@@ -1,4 +1,5 @@
 import { db } from "../db/client.ts";
+import { refreshIfStale } from "./scheme-availability.service.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, asNav, asPercent, asUnits } from "../utils/money.ts";
 import type { Prisma } from "../../generated/prisma/client.ts";
@@ -141,7 +142,17 @@ export async function listSchemes(q: ListSchemesQuery): Promise<Paginated<Scheme
   };
 }
 
+/**
+ * One scheme, with its capability flags re-checked at FP when they are stale.
+ *
+ * This is the read behind the fund screen, where the investor decides to
+ * invest — so a fund the AMC has closed must show as closed here, not only
+ * when the order is refused. See scheme-availability.service.ts.
+ */
 export async function getScheme(isin: string): Promise<SchemeDetailDto> {
+  const stamp = await db.mfScheme.findUnique({ where: { isin }, select: { syncedAt: true } });
+  if (!stamp) throw HttpError.notFound(`No scheme with ISIN ${isin}`);
+  await refreshIfStale(isin, stamp.syncedAt);
   const scheme = await db.mfScheme.findUnique({ where: { isin }, select: detailSelect });
   if (!scheme) throw HttpError.notFound(`No scheme with ISIN ${isin}`);
   return toDetailDto(scheme);

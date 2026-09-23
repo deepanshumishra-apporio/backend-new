@@ -1,6 +1,6 @@
 // The server's recurring work.
 //
-// Six jobs, one loop:
+// Seven jobs, one loop:
 //   - apply pending FP webhook deliveries, which `receive` only records;
 //   - collect SIP installments: mirror each live plan's installments and debit
 //     its mandate for every unpaid one (FP never debits them itself);
@@ -10,7 +10,9 @@
 //   - reconcile in-flight redemptions and switches, and pull redemption payouts;
 //   - mirror SWP and STP installments, which FP announces only by webhook;
 //   - re-read payments FP has not settled, so a funded order never shows its
-//     payment as pending after it has been allotted.
+//     payment as pending after it has been allotted;
+//   - keep the catalogue's capability flags current, so a fund the AMC has
+//     closed drops out of the fund list instead of failing at order time.
 //
 // One tick at a time: a tick that outlives the interval makes the next one
 // wait instead of overlapping it, so a slow FP never piles up concurrent sweeps.
@@ -22,6 +24,7 @@ import {
   reconcileOpenPayments,
 } from "./order-reconciler.service.ts";
 import { processPending } from "./fp-webhook.service.ts";
+import { refreshCatalogueFlags } from "./scheme-availability.service.ts";
 
 const DEFAULT_INTERVAL_MS = 30_000;
 
@@ -50,14 +53,16 @@ async function tick(): Promise<void> {
     const exitPlans = await collectExitPlanInstallments();
     const exits = await reconcileExits();
     const payments = await reconcileOpenPayments();
-    if (orders.checked > 0 || exits.checked > 0 || sips.plans > 0 || exitPlans.plans > 0 || payments.checked > 0 || webhooks.processed > 0 || webhooks.failed > 0) {
+    const catalogue = await refreshCatalogueFlags();
+    if (orders.checked > 0 || exits.checked > 0 || sips.plans > 0 || exitPlans.plans > 0 || payments.checked > 0 || catalogue.checked > 0 || webhooks.processed > 0 || webhooks.failed > 0) {
       console.log(
         `[jobs] webhooks processed=${webhooks.processed} failed=${webhooks.failed}; ` +
           `sips=${sips.plans} installments=${sips.installmentsSeen} debited=${sips.debited} failed=${sips.failed}; ` +
           `swps/stps=${exitPlans.plans} installments=${exitPlans.installmentsSeen} failed=${exitPlans.failed}; ` +
           `purchases checked=${orders.checked} settled=${orders.settled} failed=${orders.failed}; ` +
           `redemptions/switches checked=${exits.checked} settled=${exits.settled} failed=${exits.failed}; ` +
-          `payments checked=${payments.checked} settled=${payments.settled} failed=${payments.failed}`,
+          `payments checked=${payments.checked} settled=${payments.settled} failed=${payments.failed}; ` +
+          `schemes checked=${catalogue.checked} failed=${catalogue.failed}`,
       );
     }
   } catch (error) {

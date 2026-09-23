@@ -17,7 +17,7 @@ import {
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
-import { fpCatalogue, fpErrorToHttpError } from "../integrations/fp/index.ts";
+import { assertLiveCapability } from "./scheme-availability.service.ts";
 
 type ThresholdType = (typeof SchemeThresholdType)[keyof typeof SchemeThresholdType];
 type ThresholdFrequency =
@@ -170,14 +170,9 @@ export async function validatePurchase(
   amount: string,
   hasFolio: boolean,
 ): Promise<void> {
-  try {
-    const live = await fpCatalogue.fetchFundScheme(isin);
-    if (!live.purchase_allowed || !live.active || live.merged) {
-      throw HttpError.badRequest("This scheme is currently unavailable for purchase. Choose another scheme.", { isin });
-    }
-  } catch (error) {
-    fpErrorToHttpError(error);
-  }
+  // FP first, and written back: our catalogue can still call a fund open that
+  // the AMC has closed, and this is the check that tells the investor why.
+  await assertLiveCapability(isin, "purchase");
   const scheme = await requireTradableScheme(isin);
   if (!scheme.purchaseAllowed) {
     throw HttpError.badRequest(`${scheme.name} is not open for purchases`);
@@ -287,6 +282,7 @@ export async function validateRedemption(
   amount: string | undefined,
   units: string | undefined,
 ): Promise<void> {
+  await assertLiveCapability(isin, "redemption");
   const scheme = await requireTradableScheme(isin);
   if (!scheme.redemptionAllowed) {
     throw HttpError.badRequest(`${scheme.name} is not open for redemptions`);
@@ -374,6 +370,8 @@ export async function validateSwitch(
 ): Promise<void> {
   await assertSwitchPair(switchOutIsin, switchInIsin);
   assertAmountOrUnits(amount, units, "A switch");
+  await assertLiveCapability(switchOutIsin, "switch_out");
+  await assertLiveCapability(switchInIsin, "switch_in");
 
   const outThreshold = await loadThreshold(switchOutIsin, SchemeThresholdType.SWITCH_OUT);
   if (outThreshold) {
@@ -407,6 +405,12 @@ export async function validatePlan(
   type: ThresholdType,
   input: PlanValidationInput,
 ): Promise<void> {
+  // A plan is checked against FP's live flags as a purchase is — a fund the
+  // AMC has closed must be refused before the investor chooses a mandate and
+  // a date, not by FP after the plan is created.
+  if (type === SchemeThresholdType.SIP) await assertLiveCapability(input.isin, "sip");
+  if (type === SchemeThresholdType.SWP) await assertLiveCapability(input.isin, "redemption");
+  if (type === SchemeThresholdType.STP) await assertLiveCapability(input.isin, "switch_out");
   const scheme = await requireTradableScheme(input.isin);
   if (type === SchemeThresholdType.SIP && !scheme.sipAllowed) {
     throw HttpError.badRequest(`${scheme.name} does not support SIPs`);

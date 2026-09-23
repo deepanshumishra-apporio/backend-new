@@ -18,3 +18,21 @@ import { OrderGateway } from "../../generated/prisma/enums.ts";
 export function isOndcRoute(gateway: string | null | undefined): boolean {
   return gateway === OrderGateway.ONDC || gateway === OrderGateway.CYBRILLAPOA;
 }
+
+/**
+ * Whether money may be moved for an order on this gateway.
+ *
+ * Narrower than `isOndcRoute`, on purpose: an old `cybrillapoa` order stays
+ * readable, but it is never allotted — so paying for it, confirming it, or
+ * debiting a mandate for it takes the investor's money for units that never
+ * arrive. It happened: a server still on the old code placed one, the UPI
+ * payment was refused (422 "Provider ONDC not configured"), and the AutoPay
+ * fallback then debited the mandate for it.
+ */
+export function canMoveMoney(gateway: string | null | undefined): boolean {
+  return gateway === OrderGateway.ONDC;
+}
+
+/** What to tell an investor whose order is on a gateway that never completes. */
+export const LEGACY_GATEWAY_MESSAGE =
+  "This order was placed on an older route that the fund house never completes, so it cannot be paid for or confirmed. Nothing further will happen to it — place a new order instead.";

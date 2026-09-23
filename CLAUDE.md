@@ -91,6 +91,14 @@ with an `fpId`.
   the order API will accept it, and a scheme publishes `allowedDates` for daily
   frequencies that FP then refuses to accept. The thresholds are the truth;
   the booleans are a hint.
+- **Our catalogue's flags go stale; FP's live flags refuse.** Every order and
+  plan asks FP first through `assertLiveCapability`
+  (`scheme-availability.service.ts`), which writes the answer back, so a fund
+  the AMC closed leaves the fund list. `GET /schemes/:isin` and the background
+  loop refresh stale flags too. A live `false` refuses; a live `true` still has
+  to pass the thresholds.
+- **Never debit an installment that is not on `ondc`.** A `cybrillapoa` plan
+  is never allotted, so collecting its mandate takes money for no units.
 - **A claim on money is released only when FP definitely created nothing.**
   `paymentSubmission` is written before the FP call and kept on an unknown
   outcome — a second attempt could debit twice. But an FP 4xx, or a guard that

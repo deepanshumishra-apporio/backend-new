@@ -12,6 +12,7 @@
 import {
   MandateStatus,
   MfOrderState,
+  OrderGateway,
   PaymentStatus,
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
@@ -24,7 +25,7 @@ import {
   fpPayments,
   fpSimulation,
 } from "../integrations/fp/index.ts";
-import { isOndcRoute } from "../utils/gateway.ts";
+import { canMoveMoney, isOndcRoute, LEGACY_GATEWAY_MESSAGE } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, istToday } from "../utils/money.ts";
 import { syncMandate, syncPayment } from "./fp-sync/index.ts";
@@ -522,7 +523,9 @@ async function resolvePayableOrders(mfPurchaseIds: string[]) {
     select: { id: true, fpOldId: true, state: true, gateway: true, mfInvestmentAccountId: true, consentAt: true, folioNumber: true, amount: true },
   });
   if (orders.length !== mfPurchaseIds.length) throw HttpError.notFound("Unknown order");
-  if (orders.some(order => !isOndcRoute(order.gateway) || !order.consentAt)) throw HttpError.conflict("Only consented ONDC orders can be paid");
+  const legacy = orders.find((order) => isOndcRoute(order.gateway) && !canMoveMoney(order.gateway));
+  if (legacy) throw HttpError.conflict(LEGACY_GATEWAY_MESSAGE, { orderId: legacy.id, gateway: legacy.gateway, retryable: false });
+  if (orders.some(order => !canMoveMoney(order.gateway) || !order.consentAt)) throw HttpError.conflict("Only consented ONDC orders can be paid");
   // This API creates single orders. Batch checkout requires FP batch-order creation.
   if (orders.length !== 1) throw HttpError.badRequest("Use one order per payment; batch-order creation is not exposed");
   for (const order of orders) await assertInvestmentReady(order.mfInvestmentAccountId, order.folioNumber);
@@ -825,7 +828,15 @@ export async function debitInstallment(mfPurchaseId: string): Promise<Installmen
       plan: { select: { mandateId: true, paymentSourceRef: true, state: true } },
     },
   });
-  if (!order?.plan || order.fpOldId === null || !isOndcRoute(order.gateway)) return "not_debitable";
+  if (!order?.plan || order.fpOldId === null) return "not_debitable";
+  // `ondc` only, not every ONDC-looking route. An installment on the old
+  // `cybrillapoa` gateway is never allotted (utils/gateway.ts), so debiting its
+  // mandate would take the investor's money for units that never arrive.
+  // Those plans stay readable; they are just not collected.
+  if (!canMoveMoney(order.gateway)) {
+    console.warn(`[sip] installment ${mfPurchaseId} is on the ${order.gateway} gateway, which never allots; not debiting`);
+    return "not_debitable";
+  }
   if (!DEBITABLE_INSTALLMENT_STATES.includes(order.state)) return "not_debitable";
   if (order.paymentSubmission || order.payments.length > 0) return "already_claimed";
 

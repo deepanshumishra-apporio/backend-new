@@ -50,6 +50,15 @@ mock.module("../src/db/client.ts", () => ({ db: {
   mfInvestmentAccount: { findFirst: async () => ({ id: "acc" }) },
 } }));
 
+// FP's live flags are their own concern (scheme-availability tests); here every
+// scheme is open at FP unless a test closes it.
+const closedAtFp = new Set<string>();
+mock.module("../src/services/scheme-availability.service.ts", () => ({
+  assertLiveCapability: async (isin: string, capability: string) => {
+    if (closedAtFp.has(`${isin}:${capability}`)) throw new Error(`closed at FP: ${capability}`);
+  },
+}));
+
 const { assertAmountOrUnits, validatePlan, validateSwitch } = await import("../src/services/scheme-rules.service.ts");
 const { assertExitPlanSchedule, planCancellationPayload } = await import("../src/services/sip-validation.ts");
 const { ownResource } = await import("../src/middleware/investor-ownership.ts");
@@ -65,6 +74,7 @@ beforeEach(() => {
   schemes = { [OUT]: open(OUT), [IN]: open(IN) };
   thresholds = { [`${OUT}:SWP`]: threshold(null), [`${OUT}:STP`]: threshold(null) };
   payment = null;
+  closedAtFp.clear();
 });
 
 describe("amount or units", () => {
@@ -105,6 +115,15 @@ describe("STP target scheme", () => {
   });
   test("amount and units together are refused", async () => {
     await expect(validatePlan("STP", plan({ switchInIsin: IN, units: "2" }))).rejects.toThrow("not both");
+  });
+});
+
+describe("FP's live flags gate plans and switches", () => {
+  test("a fund FP reports closed is refused before anything else", async () => {
+    closedAtFp.add(`${OUT}:redemption`);
+    await expect(validatePlan("SWP", plan())).rejects.toThrow("closed at FP");
+    closedAtFp.add(`${IN}:switch_in`);
+    await expect(validateSwitch(OUT, IN, "1000", undefined)).rejects.toThrow("closed at FP");
   });
 });
 
