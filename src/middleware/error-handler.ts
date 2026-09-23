@@ -112,8 +112,9 @@ export function errorHandler(
   res.status(500).json({
     error: {
       code: "INTERNAL_SERVER_ERROR",
+      // A fixed, generic message in every environment: the detail is in the
+      // server log above, never in the response body.
       message: "An unexpected error occurred",
-      // Non-production only, and only the message — never the stack.
     },
   });
 }

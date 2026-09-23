@@ -258,12 +258,26 @@ enum Gender {
   @@map("gender")
 }
 
+/// kyc_request.marital_status. FP's KYC vocabulary uses `unmarried`; the
+/// investor profile uses `single` for the same idea — see ProfileMaritalStatus.
+/// Two vocabularies, like Occupation / KycOccupationType. Do not merge them.
 enum MaritalStatus {
   MARRIED   @map("married")
   UNMARRIED @map("unmarried")
   OTHERS    @map("others")
 
   @@map("marital_status")
+}
+
+/// investor_profile.marital_status. Same idea as MaritalStatus, different
+/// spelling: FP's profile object returns `single`, never `unmarried`. Mirroring
+/// a profile through the KYC enum silently dropped this field to null.
+enum ProfileMaritalStatus {
+  MARRIED @map("married")
+  SINGLE  @map("single")
+  OTHERS  @map("others")
+
+  @@map("profile_marital_status")
 }
 
 /// investor_profile.occupation. Note the spelling differs from
@@ -1365,7 +1379,7 @@ model InvestorProfile {
   name          String?        @db.VarChar(70)
   dateOfBirth   DateTime?      @db.Date
   gender        Gender?
-  maritalStatus MaritalStatus?
+  maritalStatus ProfileMaritalStatus?
   occupation    Occupation?
   /// Full PAN — required by FP and the folio join key. See KycCheck.pan.
   pan           String?        @db.VarChar(10)

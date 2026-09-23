@@ -75,15 +75,56 @@ async function claimPayment(orderIds: string[]): Promise<void> {
  * A transport error is the opposite — no response arrived, FP may well have
  * created the payment — so the claim stays and the order waits for a human.
  */
+/**
+ * Did a *failed* payment-create call prove that FP created nothing?
+ *
+ * Only two outcomes are safe to release a claim on: an FP 4xx (received and
+ * rejected — 429 excluded, since a rate limit is not a verdict), and a non-FP
+ * error, which the transport's own guards throw before the request is ever sent.
+ * An FP 5xx or a transport error is an *unknown* outcome — the payment may well
+ * exist — so the claim is kept and the order waits for reconciliation.
+ *
+ * This only ever sees errors from the create call itself: post-create bookkeeping
+ * runs outside `createPaymentOrReleaseClaim`, so a database error there can never
+ * reach here and wrongly release a claim on money already submitted.
+ */
+export function createFailureCreatedNothing(error: unknown): boolean {
+  if (error instanceof FpApiError) return error.isClientError;
+  return !(error instanceof FpTransportError);
+}
+
 async function releaseClaimIfNothingHappened(orderIds: string[], error: unknown): Promise<void> {
-  const definitelyRejected =
-    error instanceof FpApiError
-      ? error.isClientError
-      : // Anything that is not an FP error at all never reached the network:
-        // the transport's own guards throw plain Errors before sending.
-        !(error instanceof FpTransportError);
-  if (!definitelyRejected) return;
+  if (!createFailureCreatedNothing(error)) return;
   await db.paymentSubmission.deleteMany({ where: { orderId: { in: orderIds }, fpPaymentId: null } });
+}
+
+/**
+ * Create the payment at FP, releasing the claim ONLY if that call itself proves
+ * nothing was created.
+ *
+ * The release boundary is deliberately drawn around the create call and nothing
+ * else. Once it returns, FP has created the payment — and, on a mandate, is
+ * already auto-debiting it — so everything after (recording the provider id,
+ * fetching, syncing) is bookkeeping. A failure there is a reconciliation task,
+ * never a reason to hand back a claim on money that has already been submitted:
+ * doing so is precisely what would let a retry debit the investor twice, and FP
+ * does not dedupe payments. Keeping those steps out of this try is the fix.
+ *
+ * `onError` runs on failure only, before the error is translated — the
+ * netbanking path uses it to turn "provider not configured" into an outage.
+ */
+async function createPaymentOrReleaseClaim<T>(
+  orderIds: string[],
+  create: () => Promise<T>,
+  onError?: (error: unknown) => void,
+): Promise<T> {
+  try {
+    return await create();
+  } catch (error) {
+    await releaseClaimIfNothingHappened(orderIds, error);
+    onError?.(error);
+    fpErrorToHttpError(error);
+  }
 }
 
 async function recordSubmittedPayment(orderIds: string[], fpPaymentId: number): Promise<void> {
@@ -98,7 +139,7 @@ import type {
 } from "../types/payment.types.ts";
 
 /** Payment statuses from which no further money movement will happen. */
-const TERMINAL_PAYMENT_STATUSES = [PaymentStatus.FAILED, PaymentStatus.REJECTED];
+const TERMINAL_PAYMENT_STATUSES: PaymentStatus[] = [PaymentStatus.FAILED, PaymentStatus.REJECTED];
 
 const mandateSelect = {
   id: true,
@@ -405,26 +446,66 @@ function toPaymentDto(row: {
 }
 
 /**
- * Refuse to pay for an order that already has a live payment.
+ * Refuse to pay for an order that already has a payment against it.
  *
  * FP performs no such check, so without this a double-tapped button debits the
- * investor twice for one purchase.
+ * investor twice for one purchase. Two distinct cases, two distinct answers:
+ *
+ *  - A live (non-terminal) payment: one is already under way, so a second must
+ *    not start.
+ *  - A payment that already ran and failed: on this ONDC route FP does not
+ *    support re-paying the same order — its retry facility is not available
+ *    here (see `retryPurchase`), and a failed purchase stays failed. The remedy
+ *    is a new order, not another payment. Saying so here is what stops the
+ *    caller meeting the claim's primary-key collision as an opaque "already
+ *    submitted" 409 and being unable to tell that a new order is the way out.
+ *
+ * One query, branched in memory: the payment path is a deliberate, low-volume
+ * action, not a hot read.
  */
+export type ExistingPaymentVerdict = "none" | "live" | "failed";
+
+/**
+ * Classify the payments already recorded against an order.
+ *
+ * `live` (a non-terminal payment exists) takes precedence over `failed`: while
+ * one attempt is in flight, that is the fact that must block a second, whatever
+ * else happened before it.
+ */
+export function classifyExistingPayments(statuses: PaymentStatus[]): ExistingPaymentVerdict {
+  if (statuses.length === 0) return "none";
+  if (statuses.some((status) => !TERMINAL_PAYMENT_STATUSES.includes(status))) return "live";
+  return "failed";
+}
+
 async function assertNotAlreadyPaid(mfPurchaseIds: string[]): Promise<void> {
-  const live = await db.paymentPurchase.findFirst({
-    where: {
-      mfPurchaseId: { in: mfPurchaseIds },
-      payment: { status: { notIn: TERMINAL_PAYMENT_STATUSES } },
-    },
+  const links = await db.paymentPurchase.findMany({
+    where: { mfPurchaseId: { in: mfPurchaseIds } },
     select: { mfPurchaseId: true, payment: { select: { id: true, status: true } } },
   });
-  if (live) {
+
+  const verdict = classifyExistingPayments(links.map((link) => link.payment.status));
+  if (verdict === "none") return;
+
+  if (verdict === "live") {
+    const live = links.find((link) => !TERMINAL_PAYMENT_STATUSES.includes(link.payment.status))!;
     throw HttpError.conflict("A payment is already in progress for this order", {
       orderId: live.mfPurchaseId,
       paymentId: live.payment.id,
       paymentStatus: live.payment.status,
     });
   }
+
+  const failed = links[0]!;
+  throw HttpError.conflict(
+    "This order's payment did not go through, and it cannot be retried on this route. Place a new order instead.",
+    {
+      orderId: failed.mfPurchaseId,
+      paymentId: failed.payment.id,
+      paymentStatus: failed.payment.status,
+      retryable: false,
+    },
+  );
 }
 
 /** Resolve our order ids to the integer ids the payment gateway understands. */
@@ -529,43 +610,49 @@ export async function payByNetbanking(input: PayOrdersInput): Promise<PaymentDto
   }
   await claimPayment(input.orderIds);
 
-  try {
-    const created = await createNetbankingWithRetry({
-      amc_order_ids: orders.map((order) => order.fpOldId),
-      // Mandatory on the ONDC provider, and its absence is reported terribly:
-      // FP answers `400 "payment method has to present for ondc provider"`, or
-      // in some combinations the actively misleading
-      // `422 "Provider ONDC not configured"`, which reads as though the whole
-      // gateway were switched off. NETBANKING is the default because it is the
-      // one every bank supports; UPI is the caller's opt-in.
-      method: input.method ?? "NETBANKING",
-      ...(input.postbackUrl && { payment_postback_url: input.postbackUrl }),
-      ...(bankAccount?.fpOldId && { bank_account_id: bankAccount.fpOldId }),
-      // NOT the mandate's provider name. The payments half of /api/pg rejects
-      // CYBRILLAPOA outright — see ONDC_PAYMENT_PROVIDER.
-      provider_name: fpPayments.ONDC_PAYMENT_PROVIDER,
-    });
+  const created = await createPaymentOrReleaseClaim(
+    input.orderIds,
+    () =>
+      createNetbankingWithRetry({
+        amc_order_ids: orders.map((order) => order.fpOldId),
+        // Mandatory on the ONDC provider, and its absence is reported terribly:
+        // FP answers `400 "payment method has to present for ondc provider"`, or
+        // in some combinations the actively misleading
+        // `422 "Provider ONDC not configured"`, which reads as though the whole
+        // gateway were switched off. NETBANKING is the default because it is the
+        // one every bank supports; UPI is the caller's opt-in.
+        method: input.method ?? "NETBANKING",
+        ...(input.postbackUrl && { payment_postback_url: input.postbackUrl }),
+        ...(bankAccount?.fpOldId && { bank_account_id: bankAccount.fpOldId }),
+        // NOT the mandate's provider name. The payments half of /api/pg rejects
+        // CYBRILLAPOA outright — see ONDC_PAYMENT_PROVIDER.
+        provider_name: fpPayments.ONDC_PAYMENT_PROVIDER,
+      }),
+    rejectUnconfiguredProvider,
+  );
 
-    await recordSubmittedPayment(input.orderIds, created.id);
-
-    const payment = await fpPayments.fetchPayment(created.id);
-    const row = await syncPayment(payment);
-    // The redirect URL is only in the create response, never in a fetch.
-    if (created.token_url) {
-      await db.payment.update({ where: { id: row.id }, data: { tokenUrl: created.token_url } });
-    }
-    return getPayment(row.id);
-  } catch (error) {
-    await releaseClaimIfNothingHappened(input.orderIds, error);
-    rejectUnconfiguredProvider(error);
-    fpErrorToHttpError(error);
+  // FP has created the payment; the claim is now permanent. Every step below is
+  // bookkeeping — a failure here is reconciled, never released.
+  await recordSubmittedPayment(input.orderIds, created.id);
+  const payment = await fpPayments.fetchPayment(created.id);
+  const row = await syncPayment(payment);
+  // The redirect URL is only in the create response, never in a fetch.
+  if (created.token_url) {
+    await db.payment.update({ where: { id: row.id }, data: { tokenUrl: created.token_url } });
   }
+  return getPayment(row.id);
 }
 
 /** Is this FP's "the ONDC payment provider is not wired up" answer? */
-function isUnconfiguredProvider(error: unknown): boolean {
+export function isUnconfiguredProvider(error: unknown): boolean {
   return (
     error instanceof FpApiError &&
+    // A 4xx, and only a 4xx. Retrying the create POST is safe exclusively
+    // because FP received the request and rejected it, so nothing was created.
+    // A 5xx (or a 429) carrying the same wording is an unknown outcome — the
+    // payment may exist — and must never be retried, or the investor is debited
+    // twice. Matching on the message alone would have let that through.
+    error.isClientError &&
     (error.code === "NO_PAYMENT_PROVIDER" ||
       /provider\s+\S+\s+not configured/i.test(error.message))
   );
@@ -581,10 +668,11 @@ function isUnconfiguredProvider(error: unknown): boolean {
  *
  * Retrying a payment POST is normally the one thing never to do, because a
  * request that actually succeeded upstream would debit twice. It is safe here
- * and only here: this is a 4xx, which means FP received the request, rejected
- * it and created nothing — the same reasoning `releaseClaimIfNothingHappened`
- * already relies on to hand the claim back. Every other failure, including any
- * transport error, falls straight through untouched.
+ * and only here: `isUnconfiguredProvider` matches only a 4xx, which means FP
+ * received the request, rejected it and created nothing — the same reasoning
+ * `releaseClaimIfNothingHappened` already relies on to hand the claim back.
+ * Every other failure, including a 5xx and any transport error, falls straight
+ * through untouched.
  */
 async function createNetbankingWithRetry(
   payload: Parameters<typeof fpPayments.createNetbankingPayment>[0],
@@ -658,19 +746,21 @@ export async function payByMandate(
   }
 
   await claimPayment(orderIds);
-  try {
-    const created = await fpPayments.createMandatePayment({
+
+  const created = await createPaymentOrReleaseClaim(orderIds, () =>
+    fpPayments.createMandatePayment({
       mandate_id: mandate.fpId,
       amc_order_ids: orders.map((order) => order.fpOldId),
-    });
-    await recordSubmittedPayment(orderIds, created.id);
-    const payment = await fpPayments.fetchPayment(created.id);
-    const row = await syncPayment(payment);
-    return getPayment(row.id);
-  } catch (error) {
-    await releaseClaimIfNothingHappened(orderIds, error);
-    fpErrorToHttpError(error);
-  }
+    }),
+  );
+
+  // FP has created the payment and is auto-debiting the mandate; the claim is
+  // now permanent. A failure in the bookkeeping below is reconciled, never
+  // released — releasing here is exactly what would let a retry debit twice.
+  await recordSubmittedPayment(orderIds, created.id);
+  const payment = await fpPayments.fetchPayment(created.id);
+  const row = await syncPayment(payment);
+  return getPayment(row.id);
 }
 
 export async function getPayment(id: string): Promise<PaymentDto> {
