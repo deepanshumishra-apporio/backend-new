@@ -20,9 +20,11 @@ import {
   FpTransportError,
   fpConfig,
   fpErrorToHttpError,
+  fpOrders,
   fpPayments,
   fpSimulation,
 } from "../integrations/fp/index.ts";
+import { isOndcRoute } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, istToday } from "../utils/money.ts";
 import { syncMandate, syncPayment } from "./fp-sync/index.ts";
@@ -520,7 +522,7 @@ async function resolvePayableOrders(mfPurchaseIds: string[]) {
     select: { id: true, fpOldId: true, state: true, gateway: true, mfInvestmentAccountId: true, consentAt: true, folioNumber: true, amount: true },
   });
   if (orders.length !== mfPurchaseIds.length) throw HttpError.notFound("Unknown order");
-  if (orders.some(order => order.gateway !== "CYBRILLAPOA" || !order.consentAt)) throw HttpError.conflict("Only consented ONDC orders can be paid");
+  if (orders.some(order => !isOndcRoute(order.gateway) || !order.consentAt)) throw HttpError.conflict("Only consented ONDC orders can be paid");
   // This API creates single orders. Batch checkout requires FP batch-order creation.
   if (orders.length !== 1) throw HttpError.badRequest("Use one order per payment; batch-order creation is not exposed");
   for (const order of orders) await assertInvestmentReady(order.mfInvestmentAccountId, order.folioNumber);
@@ -608,6 +610,10 @@ export async function payByNetbanking(input: PayOrdersInput): Promise<PaymentDto
   if (payoutVerificationRequired() && !(await bankIsVerified(bankAccountId))) {
     throw HttpError.conflict("Verify the selected bank account before making a payment");
   }
+  // Where FP sends the investor once they have paid. Defaults to our own return
+  // endpoint, which reads the order straight back — on ONDC it is often already
+  // `successful`, with its folio, by the time the investor lands there.
+  const postbackUrl = input.postbackUrl ?? paymentReturnUrl(orders[0]!.id);
   await claimPayment(input.orderIds);
 
   const created = await createPaymentOrReleaseClaim(
@@ -622,7 +628,7 @@ export async function payByNetbanking(input: PayOrdersInput): Promise<PaymentDto
         // gateway were switched off. NETBANKING is the default because it is the
         // one every bank supports; UPI is the caller's opt-in.
         method: input.method ?? "NETBANKING",
-        ...(input.postbackUrl && { payment_postback_url: input.postbackUrl }),
+        ...(postbackUrl && { payment_postback_url: postbackUrl }),
         ...(bankAccount?.fpOldId && { bank_account_id: bankAccount.fpOldId }),
         // NOT the mandate's provider name. The payments half of /api/pg rejects
         // CYBRILLAPOA outright — see ONDC_PAYMENT_PROVIDER.
@@ -767,6 +773,167 @@ export async function getPayment(id: string): Promise<PaymentDto> {
   const row = await db.payment.findUnique({ where: { id }, select: paymentSelect });
   if (!row) throw HttpError.notFound("No such payment");
   return toPaymentDto(row);
+}
+
+/** Every payment attempted against one purchase, newest first. One query. */
+export async function listOrderPayments(mfPurchaseId: string): Promise<PaymentDto[]> {
+  const rows = await db.payment.findMany({
+    where: { purchases: { some: { mfPurchaseId } } },
+    select: paymentSelect,
+    orderBy: { createdAt: "desc" },
+  });
+  return rows.map(toPaymentDto);
+}
+
+// ---------------------------------------------------------------------------
+// SIP installments
+// ---------------------------------------------------------------------------
+
+/** Installment states in which FP is still waiting for the money. */
+const DEBITABLE_INSTALLMENT_STATES: MfOrderState[] = [
+  MfOrderState.PENDING,
+  MfOrderState.CONFIRMED,
+  MfOrderState.SUBMITTED,
+];
+
+export type InstallmentDebitOutcome = "debited" | "already_claimed" | "not_debitable";
+
+/**
+ * Debit the SIP's mandate for one installment.
+ *
+ * FP generates each installment as an ordinary purchase but does NOT collect
+ * it: without a `POST /api/pg/payments/nach` for the installment's `old_id`,
+ * it is never paid and expires. The plan's consent covers every installment,
+ * so no fresh OTP is involved — which is also why this cannot go through
+ * `payByMandate`, whose rules are for one-off orders the investor approves.
+ *
+ * Exactly once per installment, across retries and processes: the
+ * `paymentSubmission` claim is keyed on the order, and a debit whose outcome
+ * is unknown keeps it, exactly as a one-off payment does. A debit FP rejects
+ * outright (4xx) releases it, so the next sweep tries again.
+ */
+export async function debitInstallment(mfPurchaseId: string): Promise<InstallmentDebitOutcome> {
+  const order = await db.mfPurchase.findUnique({
+    where: { id: mfPurchaseId },
+    select: {
+      fpOldId: true,
+      state: true,
+      gateway: true,
+      amount: true,
+      paymentSubmission: { select: { orderId: true } },
+      payments: { select: { paymentId: true }, take: 1 },
+      plan: { select: { mandateId: true, paymentSourceRef: true, state: true } },
+    },
+  });
+  if (!order?.plan || order.fpOldId === null || !isOndcRoute(order.gateway)) return "not_debitable";
+  if (!DEBITABLE_INSTALLMENT_STATES.includes(order.state)) return "not_debitable";
+  if (order.paymentSubmission || order.payments.length > 0) return "already_claimed";
+
+  // The plan row links our mandate when we created the plan; a plan mirrored
+  // from elsewhere only carries FP's mandate id in `payment_source`.
+  const mandate = await db.mandate.findFirst({
+    where: order.plan.mandateId
+      ? { id: order.plan.mandateId }
+      : { fpId: Number(order.plan.paymentSourceRef ?? Number.NaN) },
+    select: { id: true, fpId: true, mandateStatus: true, mandateLimit: true },
+  });
+  if (!mandate || mandate.mandateStatus !== MandateStatus.APPROVED) {
+    console.warn(`[sip] installment ${mfPurchaseId} has no approved mandate to debit`);
+    return "not_debitable";
+  }
+  if (mandate.mandateLimit.lessThan(order.amount)) {
+    console.warn(`[sip] installment ${mfPurchaseId} exceeds its mandate's limit`);
+    return "not_debitable";
+  }
+
+  try {
+    await claimPayment([mfPurchaseId]);
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 409) return "already_claimed";
+    throw error;
+  }
+
+  const created = await createPaymentOrReleaseClaim([mfPurchaseId], () =>
+    fpPayments.createMandatePayment({ mandate_id: mandate.fpId, amc_order_ids: [order.fpOldId as number] }),
+  );
+  // FP has created the debit; from here on the claim is permanent.
+  await recordSubmittedPayment([mfPurchaseId], created.id);
+  await syncPayment(await fpPayments.fetchPayment(created.id));
+  return "debited";
+}
+
+// ---------------------------------------------------------------------------
+// Returning from the payment page
+// ---------------------------------------------------------------------------
+
+/**
+ * `PUBLIC_API_BASE_URL`: this server's origin as the investor's browser can
+ * reach it. Unset means no default postback, and FP falls back to its own page.
+ * HTTPS is required in production, where the URL is handed to a third party.
+ */
+function publicApiBaseUrl(): string | undefined {
+  const raw = process.env["PUBLIC_API_BASE_URL"]?.trim().replace(/\/+$/, "");
+  if (!raw) return undefined;
+  const url = new URL(raw);
+  if (process.env.NODE_ENV === "production" && url.protocol !== "https:") {
+    throw new Error("PUBLIC_API_BASE_URL must be https in production");
+  }
+  return url.origin + url.pathname.replace(/\/+$/, "");
+}
+
+/** Our return endpoint for one order, or undefined when not configured. */
+export function paymentReturnUrl(orderId: string): string | undefined {
+  const base = publicApiBaseUrl();
+  return base ? `${base}/api/v1/payments/return/${encodeURIComponent(orderId)}` : undefined;
+}
+
+/**
+ * Where to send the investor after the return has been handled: the app, when
+ * `PAYMENT_RETURN_REDIRECT_URL` names it (a deep link such as
+ * `risips://payment-return`), with only our order id attached.
+ */
+export function paymentReturnRedirect(orderId: string): string | undefined {
+  const raw = process.env["PAYMENT_RETURN_REDIRECT_URL"]?.trim();
+  if (!raw) return undefined;
+  const url = new URL(raw);
+  url.searchParams.set("orderId", orderId);
+  return url.toString();
+}
+
+/**
+ * The investor is back from the payment page: read the payment and the order
+ * straight back from FP.
+ *
+ * Reached by an unauthenticated browser redirect, so it only ever pulls FP's
+ * own state into the mirror — it changes nothing FP has not already decided,
+ * returns nothing, and an unknown or foreign id is simply a no-op. Best-effort
+ * by design: a slow FP must not strand the investor on an error page, and the
+ * background reconciler picks up whatever this misses.
+ */
+export async function handlePaymentReturn(orderId: string): Promise<void> {
+  const order = await db.mfPurchase.findUnique({
+    where: { id: orderId },
+    select: {
+      fpId: true,
+      gateway: true,
+      mfInvestmentAccountId: true,
+      payments: { select: { payment: { select: { fpId: true } } } },
+    },
+  });
+  if (!order || !isOndcRoute(order.gateway)) return;
+
+  try {
+    for (const link of order.payments) {
+      await syncPayment(await fpPayments.fetchPayment(link.payment.fpId));
+    }
+    const { applyPurchaseUpdate } = await import("./order.service.ts");
+    await applyPurchaseUpdate(await fpOrders.fetchPurchase(order.fpId), order.mfInvestmentAccountId);
+  } catch (error) {
+    console.warn(
+      `[payments] return for order ${orderId} could not be refreshed; the reconciler will retry:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
 }
 
 export async function refreshPayment(id: string): Promise<PaymentDto> {

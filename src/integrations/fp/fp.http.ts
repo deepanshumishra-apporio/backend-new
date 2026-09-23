@@ -154,7 +154,9 @@ export async function fpRequest<T>(options: FpRequestOptions): Promise<T> {
       }
     }
     if (options.method === "POST" && /^\/v2\/mf_(purchases|redemptions|switches|purchase_plans|redemption_plans|switch_plans)$/.test(options.path) && body.mf_investment_account) {
-      options = { ...options, body: { ...body, gateway: sandbox && body.gateway === "rta" ? "rta" : "cybrillapoa" } };
+      // Every order and plan goes out on `ondc`, whatever the caller sent —
+      // `cybrillapoa` orders can be neither paid nor allotted (utils/gateway.ts).
+      options = { ...options, body: { ...body, gateway: sandbox && body.gateway === "rta" ? "rta" : fpConfig().orderGateway } };
     }
   }
   const config = fpConfig();

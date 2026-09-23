@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import * as orderService from "../services/order.service.ts";
+import { listOrderPayments as listPaymentsForOrder } from "../services/payment.service.ts";
 import {
   asBody,
   clientIpv4,
@@ -138,6 +139,10 @@ export async function cancelPurchase(req: Request<OrderParams>, res: Response) {
 
 export async function getOrder(req: Request<OrderParams>, res: Response) {
   res.json({ data: await orderService.getOrder(req.params.orderId) });
+}
+
+export async function listOrderPayments(req: Request<OrderParams>, res: Response) {
+  res.json({ data: await listPaymentsForOrder(req.params.orderId) });
 }
 
 export async function refreshOrder(req: Request<OrderParams>, res: Response) {

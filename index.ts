@@ -4,6 +4,7 @@
 import { createApp } from "./src/app.ts";
 import { disconnectDatabase } from "./src/db/client.ts";
 import { closeEmailTransport } from "./src/integrations/email.client.ts";
+import { startBackgroundJobs, stopBackgroundJobs } from "./src/services/background-jobs.service.ts";
 
 const port = Number(process.env["PORT"] ?? 3000);
 if (!Number.isInteger(port) || port <= 0) {
@@ -12,6 +13,9 @@ if (!Number.isInteger(port) || port <= 0) {
 
 const server = createApp().listen(port, () => {
   console.log(`[server] listening on http://localhost:${port}`);
+  // Reconcile paid orders (so their folio is saved even when nobody is looking)
+  // and apply pending FP webhooks.
+  if (startBackgroundJobs()) console.log("[jobs] order reconciliation and webhook processing started");
 });
 
 /**
@@ -35,6 +39,8 @@ async function shutdown(signal: string): Promise<void> {
   forceExit.unref();
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  // Before the pool closes: a tick in progress still needs the database.
+  await stopBackgroundJobs();
   await closeEmailTransport();
   await disconnectDatabase();
   clearTimeout(forceExit);

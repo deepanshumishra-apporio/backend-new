@@ -58,7 +58,11 @@ interface RawEvent {
 export async function receive(payload: unknown): Promise<ReceivedEvent> {
   const incoming = payload as RawEvent;
   const eventId = typeof incoming?.id === "string" ? incoming.id : null;
-  if (!eventId || !/^evt_[A-Za-z0-9]{16,64}$/.test(eventId)) throw HttpError.badRequest("Invalid FP event identifier");
+  // A shape check only, to keep junk out of the FP lookup below — that lookup
+  // is what authenticates the event. Underscores and hyphens are allowed: an id
+  // rejected here is a delivery lost for good, and the redemptions, switches
+  // and SWP/STP installments it announces then move only when polled.
+  if (!eventId || !/^evt_[A-Za-z0-9_-]{16,64}$/.test(eventId)) throw HttpError.badRequest("Invalid FP event identifier");
   // The notification is only a hint. Authenticate the event through our tenant
   // before allowing its id to occupy the durable deduplication key.
   const event = await fpEvents.fetchEvent(eventId).catch(fpErrorToHttpError);
@@ -174,7 +178,10 @@ async function applyEvent(type: string, objectFpId: string | null): Promise<bool
         const order = await fpOrders.fetchPurchase(objectFpId);
         const accountId = await accountIdByFpId(order.mf_investment_account);
         if (!accountId) return false;
-        await syncPurchase(order, accountId);
+        // Also absorbs the allotment — folio and holdings — the first time the
+        // order turns successful, so the next order at this AMC reuses the folio.
+        const { applyPurchaseUpdate } = await import("./order.service.ts");
+        await applyPurchaseUpdate(order, accountId);
         return true;
       }
       case "mf_redemption": {

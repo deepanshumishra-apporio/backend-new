@@ -123,6 +123,8 @@ export async function listSchemes(q: ListSchemesQuery): Promise<Paginated<Scheme
       ...(q.planType && { planType: q.planType }),
       ...(q.investmentOption && { investmentOption: q.investmentOption }),
       ...(q.sipOnly && { sipAllowed: true }),
+      ...(q.switchInOnly && { switchInAllowed: true }),
+      ...(q.sameAmcAs && { amc: { schemes: { some: { isin: q.sameAmcAs } } } }),
     },
     select: listSelect,
     orderBy: { isin: "asc" },

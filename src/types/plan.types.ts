@@ -27,6 +27,11 @@ export interface CreateSipInput extends PlanOrigin {
   /** Our mandate id. The mandate must be APPROVED. */
   mandateId?: string;
   purpose?: string;
+  /**
+   * Place installment 1 immediately instead of on the plan's first date. The
+   * background collector debits it on its next pass, like any installment.
+   */
+  firstInstallmentNow?: boolean;
 }
 
 export interface CreateSwpInput extends PlanOrigin {

@@ -12,14 +12,13 @@ export interface FpConfig {
   /** Refresh the token this many seconds before `expires_in` runs out. */
   readonly tokenRefreshSkewSeconds: number;
   /**
-   * Which order gateway to route through.
+   * Which order gateway to route through: always `ondc`.
    *
-   * `cybrillapoa` is FP's ONDC implementation and the default here. Never
-   * left to FP's tenant default, because the two gateways have genuinely
-   * different order sequences (see order.service.ts) and silently getting the
-   * other one produces orders the code cannot progress.
+   * Sent explicitly rather than left to FP's tenant default. `cybrillapoa` is
+   * NOT an alias for it — FP's ONDC payment provider refuses `cybrillapoa`
+   * orders and they are never allotted. See src/utils/gateway.ts.
    */
-  readonly orderGateway: "cybrillapoa";
+  readonly orderGateway: "ondc";
   /**
    * Simulation endpoints (`/api/oms/simulate/*`) exist only in the sandbox.
    * Derived from the base URL rather than configured, so production can never
@@ -58,16 +57,15 @@ export interface FpPreVerifyConfig {
   readonly clientSecret: string;
 }
 
-function orderGateway(): "cybrillapoa" {
+function orderGateway(): "ondc" {
   const raw = process.env["FP_ORDER_GATEWAY"]?.trim().toLowerCase();
-  if (raw === undefined || raw === "") return "cybrillapoa";
-  // "ondc" is the protocol; "cybrillapoa" is the gateway name the order APIs
-  // actually take. Accept the former as an alias so a stale config still works.
-  if (raw === "ondc") return "cybrillapoa";
-  if (raw !== "cybrillapoa") {
-    throw new Error('Only ONDC is supported: FP_ORDER_GATEWAY must be "cybrillapoa"');
-  }
-  return raw;
+  if (raw === undefined || raw === "" || raw === "ondc") return "ondc";
+  // Refused loudly rather than mapped: a config still saying `cybrillapoa`
+  // was written under the old belief that it is the ONDC gateway, and orders
+  // on it can be neither paid by UPI/netbanking nor allotted.
+  throw new Error(
+    'Only ONDC is supported: FP_ORDER_GATEWAY must be "ondc" ("cybrillapoa" is a different FP gateway whose orders cannot be paid or allotted)',
+  );
 }
 
 let cached: FpConfig | undefined;

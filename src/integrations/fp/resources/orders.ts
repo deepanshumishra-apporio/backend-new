@@ -8,6 +8,7 @@
 // seen. So every create here REQUIRES one, and the transport layer is told not
 // to auto-retry these calls — a retry after a response we never saw would
 // otherwise be indistinguishable from a fresh order.
+import { FpApiError } from "../fp.errors.ts";
 import { fpList, fpRequest } from "../fp.http.ts";
 import type {
   FpConsent,
@@ -259,14 +260,28 @@ export async function listSwitches(
 // collects through FP's own Payments API. The transport refuses to write to that
 // path at all, so the wrapper would be unreachable as well as wrong.
 
-/** Only ever populated for successful instant-redemption payouts. */
+/**
+ * The payout filed against a redemption, if there is one yet.
+ *
+ * FP answers "not filed yet" as `400 no payout details found with give
+ * reference` rather than an empty list — for the whole day or two between the
+ * units going and the registrar paying out — so that answer is an empty list
+ * here and nothing else is.
+ */
 export async function listPayoutDetails(
   mfRedemption: string,
   requestId?: string,
 ): Promise<FpPayoutDetail[]> {
-  return fpList<FpPayoutDetail>(
-    "/v2/mf_payout_details",
-    { mf_redemption: mfRedemption },
-    requestId,
-  );
+  try {
+    return await fpList<FpPayoutDetail>(
+      "/v2/mf_payout_details",
+      { mf_redemption: mfRedemption },
+      requestId,
+    );
+  } catch (error) {
+    if (error instanceof FpApiError && error.status === 400 && /no payout details found/i.test(error.message)) {
+      return [];
+    }
+    throw error;
+  }
 }

@@ -268,7 +268,7 @@ try {
 
   record(
     "order gateway is ONDC only",
-    fpConfig().orderGateway === "cybrillapoa" ? "PASS" : "FAIL",
+    fpConfig().orderGateway === "ondc" ? "PASS" : "FAIL",
     `FP_ORDER_GATEWAY resolves to "${fpConfig().orderGateway}"`,
   );
 
@@ -1005,6 +1005,10 @@ try {
       body: {
         mfInvestmentAccountId: accountId,
         isin: noSipScheme.isin,
+        // A mandate, when there is one, so the refusal is about the scheme and
+        // not about the missing field.
+        ...(mandateId && { mandateId }),
+        installmentDay: 5,
         amount: "1000",
         frequency: "MONTHLY",
         numberOfInstallments: 12,
@@ -1053,13 +1057,30 @@ try {
     expectStatus(
       "an installment day on a daily plan is refused",
       await api("POST", "/api/v1/plans/sips", {
-        body: { ...planBody, frequency: "DAILY", installmentDay: 1 },
+        body: { ...planBody, ...(mandateId && { mandateId }), frequency: "DAILY", installmentDay: 1 },
       }),
       400,
     );
 
-    const sip = await api("POST", "/api/v1/plans/sips", { body: planBody });
-    if (expectStatus("POST /plans/sips", sip, 201)) {
+    // A SIP is funded by an APPROVED mandate and nothing else. Nothing in the
+    // sandbox reaches a bank, so approval comes from the sandbox-only simulate
+    // route; without one the create below is refused and SIP confirm is never
+    // exercised at all.
+    let approvedMandateId: string | null = null;
+    if (mandateId) {
+      const approved = await api("POST", `/api/v1/payments/mandates/${mandateId}/simulate`, { body: { status: "APPROVED" } });
+      if (expectStatus("POST /payments/mandates/:id/simulate", approved, 200) && approved.body?.data?.status === "APPROVED") {
+        approvedMandateId = mandateId;
+      } else {
+        record("mandate approved for the SIP", "INFO", `status=${approved.body?.data?.status ?? approved.status}`);
+      }
+    }
+
+    const sip = approvedMandateId
+      ? await api("POST", "/api/v1/plans/sips", { body: { ...planBody, mandateId: approvedMandateId } })
+      : null;
+    if (!sip) record("POST /plans/sips", "SKIP", "no approved mandate to fund it");
+    if (sip && expectStatus("POST /plans/sips", sip, 201)) {
       const planId = sip.body.data.id;
       record(
         "plan opens systematic, on the ONDC route",
@@ -1068,6 +1089,33 @@ try {
       );
       expectStatus("GET /plans/:id", await api("GET", `/api/v1/plans/${planId}`), 200);
       expectStatus("POST /plans/:id/refresh", await api("POST", `/api/v1/plans/${planId}/refresh`), 200);
+
+      // Review, then confirm with the investor’s 2FA consent — the step that
+      // registers the SIP. A consent for another number must not count.
+      let reviewed = sip.body.data.state;
+      for (let attempt = 0; attempt < 10 && reviewed === "CREATED"; attempt++) {
+        await sleep(2000);
+        reviewed = (await api("POST", `/api/v1/plans/${planId}/refresh`)).body?.data?.state ?? reviewed;
+      }
+      if (reviewed === "REVIEW_COMPLETED") {
+        const wrongPlanToken = await mintVerificationToken("+919000000009", "TRANSACTION_APPROVAL", `plan:${planId}`);
+        expectStatus(
+          "SIP consent from a different number is refused",
+          await api("POST", `/api/v1/plans/${planId}/confirm`, { body: { verificationToken: wrongPlanToken } }),
+          400,
+        );
+        const planToken = await mintVerificationToken(phone, "TRANSACTION_APPROVAL", `plan:${planId}`);
+        const confirmed = await api("POST", `/api/v1/plans/${planId}/confirm`, { body: { verificationToken: planToken } });
+        if (expectStatus("POST /plans/:id/confirm", confirmed, 200)) {
+          record(
+            "SIP confirmed with consent",
+            ["CONFIRMED", "SUBMITTED", "ACTIVE"].includes(confirmed.body.data.state) ? "PASS" : "FAIL",
+            `state=${confirmed.body.data.state}`,
+          );
+        }
+      } else {
+        record("POST /plans/:id/confirm", "SKIP", `plan did not complete review (state=${reviewed})`);
+      }
 
       // Installments are ordinary orders carrying the plan's id, and that link
       // is only written when the order syncs. A plan with no installments yet
@@ -1130,6 +1178,7 @@ try {
         amount: "1000",
         frequency: "MONTHLY",
         numberOfInstallments: 6,
+        installmentDay: 5,
       },
     });
     expectStatus("an SWP on a folio this account does not own is refused", swp, 400);
@@ -1142,6 +1191,7 @@ try {
         amount: "1000",
         frequency: "MONTHLY",
         numberOfInstallments: 6,
+        installmentDay: 5,
       },
     });
     expectStatus("an STP on a folio this account does not own is refused", stp, 400);
@@ -1288,7 +1338,7 @@ try {
   // -------------------------------------------------------------------------
   section("17. ONDC-only guards");
 
-  const rtaOrder = await db.mfPurchase.findFirst({ where: { gateway: { not: "CYBRILLAPOA" } }, select: { id: true, gateway: true } });
+  const rtaOrder = await db.mfPurchase.findFirst({ where: { gateway: { notIn: ["ONDC", "CYBRILLAPOA"] } }, select: { id: true, gateway: true } });
   if (rtaOrder) {
     expectStatus(`a legacy ${rtaOrder.gateway} order is not reachable`, await api("GET", `/api/v1/orders/${rtaOrder.id}`), 404);
   } else {

@@ -37,10 +37,12 @@ with an `fpId`.
   translation. Add a typed wrapper in `resources/` instead.
 - **Retry is GET-only by default.** Do not set `retry: true` on a write. A
   retried POST that actually succeeded upstream places a second order.
-- **This platform is ONDC only.** The gateway is `cybrillapoa` (FP's ONDC
-  implementation), from `FP_ORDER_GATEWAY`, which accepts nothing else — `ondc`
-  is taken as an alias for it and any other value fails at boot. Never left to
-  FP's tenant default.
+- **This platform is ONDC only.** Orders and plans go out with `gateway: "ondc"`,
+  from `FP_ORDER_GATEWAY`, which accepts nothing else. **`cybrillapoa` is not an
+  alias** — FP routes it separately, its orders are refused by the ONDC payment
+  provider (`422 Provider ONDC not configured`) and never allotted. Rows already
+  stored as `CYBRILLAPOA` stay readable; check the route with `isOndcRoute`
+  (`src/utils/gateway.ts`), never by comparing to one value.
 - **There is one purchase sequence**, in `order.service.ts`; read its header
   before touching it:
 
@@ -100,6 +102,21 @@ with an `fpId`.
 - Catch nothing from FP in a controller. Services call `fpErrorToHttpError`,
   which turns a 4xx caused by the caller into a 4xx and everything else into a
   502 — we never blame the caller for FP being down.
+
+## Allotment, folio and the background loop
+
+- A purchase carries its `folio_number` (and units, NAV) only once it is
+  `successful`. `applyPurchaseUpdate` (`order.service.ts`) is the one place a
+  fetched purchase is applied; on first success it pulls folios + holdings so
+  the next order at that AMC reuses the folio (`folio-resolution.service.ts`).
+  Never apply a purchase with bare `syncPurchase` from a new path.
+- UPI / netbanking payments default `payment_postback_url` to
+  `/api/v1/payments/return/:orderId` (needs `PUBLIC_API_BASE_URL`). That route
+  is public — FP redirects the investor's browser there — so it only pulls FP's
+  state and returns no order data.
+- `index.ts` starts `background-jobs.service.ts`: every
+  `ORDER_RECONCILE_INTERVAL_MS` it re-reads paid, in-flight purchases and runs
+  the webhook processor. Idempotent, so several instances may run it.
 
 ## Webhooks
 

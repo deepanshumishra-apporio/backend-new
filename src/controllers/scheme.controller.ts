@@ -48,6 +48,10 @@ export async function list(req: Request, res: Response) {
   if (search !== undefined && (typeof search !== "string" || search.length > 100)) throw HttpError.badRequest("q must be at most 100 characters");
   const cursor = typeof req.query["cursor"] === "string" ? req.query["cursor"] : undefined;
   const sipOnly = parseBoolean(req.query["sipOnly"], "sipOnly");
+  const switchInOnly = parseBoolean(req.query["switchInOnly"], "switchInOnly");
+  const rawSameAmc = req.query["sameAmcAs"];
+  if (rawSameAmc !== undefined && typeof rawSameAmc !== "string") throw HttpError.badRequest("sameAmcAs must be one ISIN");
+  const sameAmcAs = rawSameAmc === undefined ? undefined : parseIsin(rawSameAmc);
 
   res.json(
     await schemeService.listSchemes({
@@ -60,6 +64,8 @@ export async function list(req: Request, res: Response) {
         "investmentOption",
       ),
       ...(sipOnly !== undefined && { sipOnly }),
+      ...(switchInOnly !== undefined && { switchInOnly }),
+      ...(sameAmcAs && { sameAmcAs }),
       limit: Math.min(parseCount(req.query["limit"], "limit", 20), 100),
       ...(cursor && { cursor }),
     }),

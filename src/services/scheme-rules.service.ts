@@ -37,6 +37,8 @@ const thresholdSelect = {
 export interface SchemeForOrder {
   isin: string;
   name: string;
+  /** The fund house. A folio, and so every switch, lives inside one. */
+  amcId: string;
   isActive: boolean;
   merged: boolean;
   purchaseAllowed: boolean;
@@ -53,6 +55,7 @@ export async function requireTradableScheme(isin: string): Promise<SchemeForOrde
     select: {
       isin: true,
       name: true,
+      amcId: true,
       isActive: true,
       merged: true,
       mergedToIsin: true,
@@ -251,6 +254,34 @@ export async function assertRedeemable(
   }
 }
 
+/**
+ * Refuse a withdrawal or transfer plan on a folio that holds none of the scheme.
+ *
+ * Deliberately weaker than `assertRedeemable`: a plan pays out over months, so
+ * units under lock-in today may be free by a later installment and must not
+ * block it. A folio holding nothing, though, can never fund a single one — FP
+ * accepts such a plan and then fails every installment. Unmirrored holdings
+ * pass through to FP, as with `assertRedeemable`.
+ */
+export async function assertHoldsScheme(
+  mfInvestmentAccountId: string,
+  folioNumber: string,
+  isin: string,
+): Promise<void> {
+  const holdings = await db.mfHolding.findMany({
+    where: { mfInvestmentAccountId },
+    select: { folioNumber: true, schemeIsin: true, units: true },
+  });
+  if (holdings.length === 0) return;
+  const holding = holdings.find((h) => h.folioNumber === folioNumber && h.schemeIsin === isin);
+  if (!holding || holding.units.lessThanOrEqualTo(0)) {
+    throw HttpError.badRequest("This folio holds no units of this scheme to withdraw or transfer", {
+      folioNumber,
+      isin,
+    });
+  }
+}
+
 export async function validateRedemption(
   isin: string,
   amount: string | undefined,
@@ -270,48 +301,93 @@ export async function validateRedemption(
   // Neither given is valid and means "redeem everything".
 }
 
-export async function validateSwitch(
-  switchOutIsin: string,
-  switchInIsin: string,
+/**
+ * Exactly one of amount and units. Neither is only legal on a one-off
+ * redemption, where it means "everything" — so every other caller says so.
+ */
+export function assertAmountOrUnits(
   amount: string | undefined,
   units: string | undefined,
-): Promise<void> {
+  what: string,
+): void {
+  if (amount !== undefined && units !== undefined) {
+    throw HttpError.badRequest("Give either amount or units, not both");
+  }
+  if (amount === undefined && units === undefined) {
+    throw HttpError.badRequest(`${what} needs either an amount or a number of units`);
+  }
+}
+
+/**
+ * Can money move from one scheme into the other at all?
+ *
+ * Shared by the one-off switch and the STP. A switch moves units between two
+ * schemes of one folio, and a folio belongs to one fund house — so both schemes
+ * must be at the same AMC; across fund houses the only route is a redemption
+ * and a fresh purchase. An STP is a switch repeated on a schedule, and the target scheme's rules apply to every installment just the
+ * same — checking only the source, as the STP path did, let a plan into a fund
+ * that refuses switch-ins (or into itself) be created, reviewed and confirmed,
+ * and then fail every installment.
+ */
+export async function assertSwitchPair(switchOutIsin: string, switchInIsin: string): Promise<void> {
   if (switchOutIsin === switchInIsin) {
     throw HttpError.badRequest("Cannot switch a scheme into itself");
   }
-  const source = await requireTradableScheme(switchOutIsin);
-  const target = await requireTradableScheme(switchInIsin);
+  const [source, target] = await Promise.all([
+    requireTradableScheme(switchOutIsin),
+    requireTradableScheme(switchInIsin),
+  ]);
   if (!source.switchOutAllowed) {
     throw HttpError.badRequest(`${source.name} does not allow switching out`);
   }
   if (!target.switchInAllowed) {
     throw HttpError.badRequest(`${target.name} does not allow switching in`);
   }
-  if (amount !== undefined && units !== undefined) {
-    throw HttpError.badRequest("Give either amount or units, not both");
+  if (source.amcId !== target.amcId) {
+    throw HttpError.badRequest(
+      `${source.name} and ${target.name} are with different fund houses. A switch stays within one fund house — redeem and invest instead.`,
+      { switchOutIsin, switchInIsin },
+    );
   }
-  if (amount === undefined && units === undefined) {
-    throw HttpError.badRequest("A switch needs either an amount or a number of units");
+}
+
+/**
+ * The target scheme's entry minimum, checked against a switch amount.
+ *
+ * FP rejects a switch whose value lands below it, late in the flow and in
+ * words that name neither scheme. Units cannot be checked here — their value
+ * depends on a NAV that is not known until the switch is processed.
+ */
+async function checkSwitchInMinimum(switchInIsin: string, amount: string | undefined): Promise<void> {
+  if (amount === undefined) return;
+  const inThreshold = await loadThreshold(switchInIsin, SchemeThresholdType.SWITCH_IN);
+  if (inThreshold?.amountMin) {
+    checkAmount(amount, { ...inThreshold, amountMax: null, amountMultiples: null }, "amount");
   }
+}
+
+export async function validateSwitch(
+  switchOutIsin: string,
+  switchInIsin: string,
+  amount: string | undefined,
+  units: string | undefined,
+): Promise<void> {
+  await assertSwitchPair(switchOutIsin, switchInIsin);
+  assertAmountOrUnits(amount, units, "A switch");
 
   const outThreshold = await loadThreshold(switchOutIsin, SchemeThresholdType.SWITCH_OUT);
   if (outThreshold) {
     if (amount !== undefined) checkAmount(amount, outThreshold, "amount");
     if (units !== undefined) checkUnits(units, outThreshold, "units");
   }
-  // The switch-in minimum is checked against the amount too: FP rejects a
-  // switch whose value lands below the target scheme's entry minimum, which is
-  // otherwise a confusing failure late in the flow.
-  if (amount !== undefined) {
-    const inThreshold = await loadThreshold(switchInIsin, SchemeThresholdType.SWITCH_IN);
-    if (inThreshold?.amountMin) {
-      checkAmount(amount, { ...inThreshold, amountMax: null, amountMultiples: null }, "amount");
-    }
-  }
+  await checkSwitchInMinimum(switchInIsin, amount);
 }
 
 export interface PlanValidationInput {
+  /** The scheme the plan buys (SIP), sells (SWP) or switches out of (STP). */
   isin: string;
+  /** STP only: the scheme each installment switches into. */
+  switchInIsin?: string | undefined;
   amount?: string | undefined;
   units?: string | undefined;
   frequency: ThresholdFrequency;
@@ -334,6 +410,21 @@ export async function validatePlan(
   const scheme = await requireTradableScheme(input.isin);
   if (type === SchemeThresholdType.SIP && !scheme.sipAllowed) {
     throw HttpError.badRequest(`${scheme.name} does not support SIPs`);
+  }
+  // Every SWP installment is a redemption and every STP installment a switch,
+  // so the one-off order's scheme rules hold for each of them. Without these a
+  // plan on a closed scheme passes review and fails every installment.
+  if (type === SchemeThresholdType.SWP) {
+    if (!scheme.redemptionAllowed) {
+      throw HttpError.badRequest(`${scheme.name} is not open for redemptions`);
+    }
+    assertAmountOrUnits(input.amount, input.units, "A withdrawal plan");
+  }
+  if (type === SchemeThresholdType.STP) {
+    if (!input.switchInIsin) throw HttpError.badRequest("A transfer plan needs a target scheme");
+    await assertSwitchPair(input.isin, input.switchInIsin);
+    assertAmountOrUnits(input.amount, input.units, "A transfer plan");
+    await checkSwitchInMinimum(input.switchInIsin, input.amount);
   }
 
   const supported = await db.mfSchemeThreshold.findMany({

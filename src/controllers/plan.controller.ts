@@ -89,8 +89,16 @@ export async function createSip(req: Request, res: Response) {
       folioNumber: optionalString(body, "folioNumber", { maxLength: 30 }),
       mandateId: requiredString(body, "mandateId"),
       purpose: oneOf(body, "purpose", PURPOSES, false),
+      firstInstallmentNow: optionalBoolean(body, "firstInstallmentNow"),
     }),
   });
+}
+
+function optionalBoolean(body: Record<string, unknown>, field: string): boolean | undefined {
+  const value = body[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw HttpError.badRequest(`${field} must be true or false`);
+  return value;
 }
 
 export async function createSwp(req: Request, res: Response) {

@@ -1,7 +1,8 @@
 // Placing and progressing mutual fund orders on the ONDC route.
 //
 // The platform runs exclusively on FP's ONDC gateway, whose API value is
-// `cybrillapoa`. The sequence is fixed and each step fails loudly if taken out
+// `ondc` (FP_ORDER_GATEWAY; `cybrillapoa` is a different gateway — see
+// utils/gateway.ts). The sequence is fixed and each step fails loudly if taken out
 // of turn — every rule below was established by making FP reject the
 // alternative:
 //
@@ -33,7 +34,9 @@ import {
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
 import { assertInvestmentReady } from "./investor-readiness.service.ts";
+import { assertFolioAtSchemeAmc, resolvePurchaseFolio } from "./folio-resolution.service.ts";
 import { FpApiError, fpConfig, fpErrorToHttpError, fpOrders } from "../integrations/fp/index.ts";
+import { isOndcRoute } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, asNav, asUnits } from "../utils/money.ts";
 import { consumeVerificationToken } from "./otp.service.ts";
@@ -44,7 +47,9 @@ import {
   validateRedemption,
   validateSwitch,
 } from "./scheme-rules.service.ts";
+import { refreshPortfolio } from "./portfolio.service.ts";
 import type { Prisma } from "../../generated/prisma/client.ts";
+import type { FpPurchase } from "../integrations/fp/index.ts";
 import type {
   CreatePurchaseInput,
   CreateRedemptionInput,
@@ -237,8 +242,11 @@ async function requireAccount(mfInvestmentAccountId: string) {
  * So this is resolved from stored data, never from caller input — a caller who
  * could name the contact could route the OTP away from the investor.
  *
- * An order on an existing folio uses that folio's registered details; a fresh
- * purchase has no folio yet, so it uses the account's folio defaults.
+ * An order on an existing folio uses that folio's registered details. A fresh
+ * purchase has no folio yet, so it uses the account's folio defaults — and so
+ * does an order on a folio whose record carries no contacts at all: FP's folio
+ * API can return `email_addresses: []` / `mobile_numbers: []` (every sandbox
+ * folio does), and the folio defaults are what that folio was opened with.
  */
 export async function resolveConsentContact(
   mfInvestmentAccountId: string,
@@ -257,7 +265,11 @@ export async function resolveConsentContact(
       const match = /^\+?(\d{1,3})(\d{10})$/.exec(mobile.replace(/[\s-]/g, ""));
       if (match) return { email, isdCode: match[1] ?? "91", mobile: match[2] ?? "" };
     }
-    throw HttpError.conflict("Refresh the folio's registered contact details before requesting consent");
+    // A folio that does name contacts, but not in a usable form, must not be
+    // silently swapped for the defaults — the registrar holds something else.
+    if (!folio || folio.emailAddresses.length > 0 || folio.mobileNumbers.length > 0) {
+      throw HttpError.conflict("Refresh the folio's registered contact details before requesting consent");
+    }
   }
 
   const defaults = await db.mfFolioDefaults.findUnique({
@@ -356,7 +368,10 @@ async function requireConsentProof(
 export async function createPurchase(input: CreatePurchaseInput): Promise<OrderDto> {
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
   const account = await requireAccount(input.mfInvestmentAccountId);
-  await validatePurchase(input.isin, input.amount, Boolean(input.folioNumber));
+  // Reuse the investor's folio at this AMC even when the caller did not name
+  // one; omitting it opens a duplicate folio. See folio-resolution.service.ts.
+  const folioNumber = await resolvePurchaseFolio(account.id, input.isin, input.folioNumber);
+  await validatePurchase(input.isin, input.amount, Boolean(folioNumber));
 
   // FP rejects a repeat of a source_ref_id it has seen, which is what makes a
   // retried request safe. Generating one here means even a caller that forgets
@@ -369,7 +384,7 @@ export async function createPurchase(input: CreatePurchaseInput): Promise<OrderD
       mf_investment_account: account.fpId,
       scheme: input.isin,
       amount: Number(input.amount),
-      ...(input.folioNumber && { folio_number: input.folioNumber }),
+      ...(folioNumber && { folio_number: folioNumber }),
       source_ref_id: sourceRefId,
       user_ip: input.userIp,
       ...(input.serverIp && { server_ip: input.serverIp }),
@@ -469,7 +484,7 @@ export async function confirmPurchase(id: string): Promise<OrderDto> {
     throw HttpError.conflict("Only a pending order can be confirmed", { state: order.state });
   }
 
-  if (order.gateway !== OrderGateway.CYBRILLAPOA) {
+  if (!isOndcRoute(order.gateway)) {
     throw HttpError.conflict("Only ONDC orders can be confirmed", { gateway: order.gateway });
   }
 
@@ -495,7 +510,7 @@ export async function confirmPurchase(id: string): Promise<OrderDto> {
 
   try {
     const updated = await fpOrders.updatePurchase({ id: order.fpId, state: "confirmed" });
-    await syncPurchase(updated, order.mfInvestmentAccountId);
+    await applyPurchaseUpdate(updated, order.mfInvestmentAccountId);
     return loadPurchase(order.fpId);
   } catch (error) {
     fpErrorToHttpError(error);
@@ -560,7 +575,7 @@ export async function retryPurchase(id: string): Promise<OrderDto> {
     );
   }
 
-  if (order.gateway === OrderGateway.CYBRILLAPOA) {
+  if (isOndcRoute(order.gateway)) {
     throw HttpError.conflict(
       "Retrying an order is not supported on this route yet. Place a new order instead.",
       { gateway: order.gateway, retryable: false },
@@ -602,6 +617,7 @@ export async function createRedemption(input: CreateRedemptionInput): Promise<Or
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
   const account = await requireAccount(input.mfInvestmentAccountId);
   await validateRedemption(input.isin, input.amount, input.units);
+  await assertFolioAtSchemeAmc(account.id, input.folioNumber, input.isin);
   // FP's step 3: the folio must actually be able to give up what is asked.
   await assertRedeemable(
     account.id,
@@ -636,10 +652,41 @@ export async function createRedemption(input: CreateRedemptionInput): Promise<Or
 }
 
 /**
+ * Refuse to confirm an exit order that FP would fail after the consent.
+ *
+ * Runs before the OTP token is spent. Redemption proceeds land in the payout
+ * account, and an unverified one fails the order at submission
+ * (`payout_account_verification_pending`) — so readiness, which can lapse
+ * between create and confirm, is asked again.
+ *
+ * The holding is deliberately *not* re-checked: FP's `redeemable_units`
+ * excludes units committed to pending orders, which includes this one, so a
+ * holding refreshed since the create would refuse the very order it funds.
+ * `assertRedeemable` ran at create; FP is the authority from here.
+ */
+async function assertExitConfirmable(order: {
+  mfInvestmentAccountId: string;
+  folioNumber: string | null;
+}): Promise<void> {
+  await assertInvestmentReady(order.mfInvestmentAccountId, order.folioNumber);
+}
+
+/** What confirming an exit order records on its row: the 2FA audit trail. */
+function consentAudit(contact: ConsentContact) {
+  return {
+    consentEmail: contact.email,
+    consentIsdCode: contact.isdCode,
+    consentMobile: contact.mobile,
+    consentAt: new Date(),
+  };
+}
+
+/**
  * Confirm a redemption.
  *
- * Unlike a purchase this needs no settlement — the money flows the other way —
- * so consent and confirm can travel together, which the sandbox accepts.
+ * Unlike a purchase there is no payment — the money flows the other way — so
+ * consent and `state: confirmed` travel in one PATCH, which is FP's documented
+ * ONDC redemption call.
  */
 export async function confirmRedemption(
   id: string,
@@ -653,6 +700,7 @@ export async function confirmRedemption(
   if (order.state !== MfOrderState.PENDING) {
     throw HttpError.conflict("Only a pending order can be confirmed", { state: order.state });
   }
+  await assertExitConfirmable(order);
 
   const contact = await resolveConsentContact(order.mfInvestmentAccountId, order.folioNumber);
   await requireConsentProof(input, contact, id);
@@ -667,15 +715,7 @@ export async function confirmRedemption(
       fpOrders.updateRedemption({ id: order.fpId, state: "confirmed", consent }),
     );
     await syncRedemption(updated, order.mfInvestmentAccountId);
-    await db.mfRedemption.update({
-      where: { id },
-      data: {
-        consentEmail: contact.email,
-        consentIsdCode: contact.isdCode,
-        consentMobile: contact.mobile,
-        consentAt: new Date(),
-      },
-    });
+    await db.mfRedemption.update({ where: { id }, data: consentAudit(contact) });
     return loadRedemption(order.fpId);
   } catch (error) {
     fpErrorToHttpError(error);
@@ -686,6 +726,9 @@ export async function createSwitch(input: CreateSwitchInput): Promise<OrderDto> 
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
   const account = await requireAccount(input.mfInvestmentAccountId);
   await validateSwitch(input.switchOutIsin, input.switchInIsin, input.amount, input.units);
+  // One folio, one fund house: `validateSwitch` has already proved both schemes
+  // share an AMC, so the folio only has to be at the source's.
+  await assertFolioAtSchemeAmc(account.id, input.folioNumber, input.switchOutIsin);
   // A switch redeems from the source scheme, so the same eligibility applies.
   await assertRedeemable(
     account.id,
@@ -719,6 +762,7 @@ export async function createSwitch(input: CreateSwitchInput): Promise<OrderDto> 
   }
 }
 
+/** Confirm a switch. Like a redemption, consent and confirm travel together. */
 export async function confirmSwitch(id: string, input: OrderConsentInput): Promise<OrderDto> {
   const order = await db.mfSwitch.findUnique({
     where: { id },
@@ -728,6 +772,7 @@ export async function confirmSwitch(id: string, input: OrderConsentInput): Promi
   if (order.state !== MfOrderState.PENDING) {
     throw HttpError.conflict("Only a pending order can be confirmed", { state: order.state });
   }
+  await assertExitConfirmable(order);
 
   const contact = await resolveConsentContact(order.mfInvestmentAccountId, order.folioNumber);
   await requireConsentProof(input, contact, id);
@@ -737,15 +782,7 @@ export async function confirmSwitch(id: string, input: OrderConsentInput): Promi
       fpOrders.updateSwitch({ id: order.fpId, state: "confirmed", consent }),
     );
     await syncSwitch(updated, order.mfInvestmentAccountId);
-    await db.mfSwitch.update({
-      where: { id },
-      data: {
-        consentEmail: contact.email,
-        consentIsdCode: contact.isdCode,
-        consentMobile: contact.mobile,
-        consentAt: new Date(),
-      },
-    });
+    await db.mfSwitch.update({ where: { id }, data: consentAudit(contact) });
     return loadSwitch(order.fpId);
   } catch (error) {
     fpErrorToHttpError(error);
@@ -784,6 +821,52 @@ export async function pullRedemptionPayout(
 // ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
+
+/**
+ * Mirror a purchase FP has reported, and absorb its allotment the first time it
+ * has one.
+ *
+ * The lifecycle FP walks an ONDC purchase through, and where the folio lands:
+ *
+ *   under_review → pending → (consent, payment) → confirmed → submitted
+ *     → successful   ← `folio_number`, units, NAV and NAV date appear here
+ *
+ * Nothing before `successful` carries a folio — not payment SUCCESS, not
+ * `submitted`. When the order gets there, the folio is new to us, so pull the
+ * account's folios and holdings: the folio row holds the registered contacts
+ * the next order's consent is checked against, and the next purchase or SIP at
+ * this AMC must find it to reuse it (folio-resolution.service.ts).
+ *
+ * Repeats until the folio is actually linked, so an allotment whose portfolio
+ * pull failed is retried by the next poll or webhook rather than lost. The pull
+ * is best-effort: the order row is already correct, and failing the investor's
+ * status check because the portfolio report was slow would be wrong.
+ */
+export async function applyPurchaseUpdate(fresh: FpPurchase, mfInvestmentAccountId: string): Promise<void> {
+  const before = await db.mfPurchase.findUnique({
+    where: { fpId: fresh.id },
+    select: { state: true, mfFolioId: true },
+  });
+  const row = await syncPurchase(fresh, mfInvestmentAccountId);
+  if (fresh.state !== "successful" || !fresh.folio_number) return;
+
+  // Pull on the transition to successful — a top-up into a folio we already
+  // know still changes the holdings — and keep pulling until the folio links.
+  const linked = await db.mfPurchase.findUnique({ where: { id: row.id }, select: { mfFolioId: true } });
+  if (before?.state === MfOrderState.SUCCESSFUL && linked?.mfFolioId) return;
+
+  try {
+    await refreshPortfolio(mfInvestmentAccountId);
+    // Re-sync now the folio row exists, so the order links to it.
+    await syncPurchase(fresh, mfInvestmentAccountId);
+  } catch (error) {
+    console.warn(
+      `[orders] purchase ${fresh.id} allotted into folio ${fresh.folio_number}, but the portfolio pull failed; ` +
+        "the next refresh retries it",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
 
 async function loadPurchase(fpId: string): Promise<OrderDto> {
   const row = await db.mfPurchase.findUnique({ where: { fpId }, select: purchaseSelect });
@@ -827,7 +910,7 @@ export async function refreshOrder(id: string): Promise<OrderDto> {
   if (purchase) {
     try {
       const fresh = await fpOrders.fetchPurchase(purchase.fpId);
-      await syncPurchase(fresh, purchase.mfInvestmentAccountId);
+      await applyPurchaseUpdate(fresh, purchase.mfInvestmentAccountId);
       return loadPurchase(purchase.fpId);
     } catch (error) {
       fpErrorToHttpError(error);

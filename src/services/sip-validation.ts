@@ -35,3 +35,39 @@ export function assertSipSchedule(frequency: string, day: number | undefined, co
     if (day !== undefined) throw HttpError.badRequest("A daily SIP takes no installment day");
   } else throw HttpError.badRequest("ONDC SIP supports monthly and daily frequencies only");
 }
+
+/**
+ * The schedule an SWP or STP may run on over ONDC.
+ *
+ * The gateway takes these plans monthly only, and a monthly plan needs the day
+ * it pays out on: sent without one, FP either refuses it at review or picks a
+ * day the investor never chose. Checked here, with SIP's bounds, so both halves
+ * of the plan surface agree on what a valid monthly schedule is.
+ */
+export function assertExitPlanSchedule(
+  kind: "SWP" | "STP",
+  frequency: string,
+  day: number | undefined,
+  count: number,
+): void {
+  if (frequency !== "MONTHLY") throw HttpError.badRequest(`ONDC ${kind} supports monthly frequency only`);
+  assertSipSchedule(frequency, day, count);
+}
+
+/**
+ * What FP's plan-cancel endpoints accept.
+ *
+ * Free text travels only with `custom_reason`; FP rejects a reason alongside
+ * any other code. The SIP path already dropped it — the SWP and STP paths
+ * forwarded it, so an investor who picked a stock reason and typed a note got
+ * a validation error for trying to cancel.
+ */
+export function planCancellationPayload(
+  cancellationCode: string,
+  cancellationReason: string | undefined,
+): { cancellation_code: string; cancellation_reason?: string } {
+  return {
+    cancellation_code: cancellationCode,
+    ...(cancellationCode === "custom_reason" && cancellationReason && { cancellation_reason: cancellationReason }),
+  };
+}

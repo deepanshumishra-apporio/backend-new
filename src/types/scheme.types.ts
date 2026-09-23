@@ -11,6 +11,14 @@ export interface ListSchemesQuery {
   investmentOption?: SchemeInvestmentOption;
   /** Only schemes an SIP can be registered against. */
   sipOnly?: boolean;
+  /**
+   * Only schemes of the same fund house as this ISIN. A switch or STP moves
+   * units inside one folio, and a folio belongs to one fund house, so these
+   * are the only possible targets.
+   */
+  sameAmcAs?: string;
+  /** Only schemes that accept switch-ins. */
+  switchInOnly?: boolean;
   limit: number;
   cursor?: string;
 }

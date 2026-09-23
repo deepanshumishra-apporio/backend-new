@@ -73,6 +73,15 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
     if (sending) return res;
     sending = true;
     const statusCode = res.statusCode;
+    // A 503 the service marked `retryable` is a *known* non-write: it is only
+    // raised once the upstream answered with a refusal that created nothing
+    // (the ONDC payment provider being briefly unconfigured). Keeping the
+    // claim would answer every retry of the same key with "requires
+    // reconciliation" — while the message tells the investor to try again.
+    if (statusCode === 503 && isRetryableRefusal(body)) {
+      void db.investorCommand.delete({ where: { id } }).then(() => send(body), () => send(body));
+      return res;
+    }
     if (statusCode >= 500) { send(body); return res; }
     // A 4xx is a *known* failure: the write did not happen, so the invariant
     // this middleware exists for — never retry an unknown write — does not
@@ -102,3 +111,13 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
   }) as typeof res.json;
   next();
 };
+
+/**
+ * An error envelope whose service said the attempt created nothing upstream.
+ * The error handler spreads `details` onto `error`, so the flag sits there.
+ */
+export function isRetryableRefusal(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const error = (body as { error?: unknown }).error;
+  return !!error && typeof error === "object" && (error as { retryable?: unknown }).retryable === true;
+}

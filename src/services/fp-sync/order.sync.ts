@@ -41,6 +41,28 @@ import type {
   FpSwitchPlan,
 } from "../../integrations/fp/fp.types.ts";
 
+/**
+ * The update half of an order or plan upsert: everything except its scheme.
+ *
+ * An order's scheme is fixed when it is placed, but FP rewrites it on some
+ * failed sandbox orders to the placeholder `INF109K099999` — thirteen
+ * characters, not a catalogue ISIN. Even inside an upsert PostgreSQL rejects it
+ * against the column ("value too long"), so those orders could never be marked
+ * failed and sat as `confirmed` / `submitted` in the mirror for ever. Such a
+ * payload is applied as an update of the existing row (see `allIsins`).
+ */
+function fixedScheme<T extends Record<string, unknown>>(
+  data: T,
+): Omit<T, "schemeIsin" | "switchOutSchemeIsin" | "switchInSchemeIsin"> {
+  const { schemeIsin: _s, switchOutSchemeIsin: _o, switchInSchemeIsin: _i, ...rest } = data;
+  return rest;
+}
+
+/** Every value is a well-formed 12-character ISIN (what the scheme columns hold). */
+function allIsins(...values: (string | null | undefined)[]): boolean {
+  return values.every((value) => typeof value === "string" && /^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(value));
+}
+
 /** FP sent a value our enums do not model yet. Loud, but never fatal. */
 function unknownValue(field: string) {
   return (value: string) => console.warn(`[fp-sync] unmapped ${field}: "${value}"`);
@@ -51,7 +73,7 @@ function orderCommon(order: FpPurchase | FpRedemption | FpSwitch) {
   return {
     fpOldId: fpInt(order.old_id),
     state: fpEnumOr(MfOrderState, order.state, MfOrderState.PENDING, unknownValue("order state")),
-    gateway: fpEnumOr(OrderGateway, order.gateway, OrderGateway.CYBRILLAPOA, unknownValue("gateway")),
+    gateway: fpEnumOr(OrderGateway, order.gateway, OrderGateway.ONDC, unknownValue("gateway")),
     folioNumber: fpText(order.folio_number, 30),
     sourceRefId: fpText(order.source_ref_id, 64),
     userIp: fpText(order.user_ip, 45),
@@ -143,9 +165,13 @@ export async function syncPurchase(
     retriedAt: fpDateTime(order.retried_at),
   };
 
+  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  if (!allIsins(order.scheme)) {
+    return db.mfPurchase.update({ where: { fpId: order.id }, data: fixedScheme(data), select: { id: true } });
+  }
   return db.mfPurchase.upsert({
     where: { fpId: order.id },
-    update: data,
+    update: fixedScheme(data),
     create: { fpId: order.id, ...data },
     select: { id: true },
   });
@@ -184,9 +210,13 @@ export async function syncRedemption(
     redemptionBankAccountIfsc: fpText(order.redemption_bank_account_ifsc_code, 11),
   };
 
+  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  if (!allIsins(order.scheme)) {
+    return db.mfRedemption.update({ where: { fpId: order.id }, data: fixedScheme(data), select: { id: true } });
+  }
   return db.mfRedemption.upsert({
     where: { fpId: order.id },
-    update: data,
+    update: fixedScheme(data),
     create: { fpId: order.id, ...data },
     select: { id: true },
   });
@@ -219,9 +249,13 @@ export async function syncSwitch(
     switchedInPrice: fpNav(order.switched_in_price),
   };
 
+  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  if (!allIsins(order.switch_out_scheme, order.switch_in_scheme)) {
+    return db.mfSwitch.update({ where: { fpId: order.id }, data: fixedScheme(data), select: { id: true } });
+  }
   return db.mfSwitch.upsert({
     where: { fpId: order.id },
-    update: data,
+    update: fixedScheme(data),
     create: { fpId: order.id, ...data },
     select: { id: true },
   });
@@ -235,7 +269,7 @@ function planCommon(plan: FpPurchasePlan | FpRedemptionPlan | FpSwitchPlan) {
   return {
     fpOldId: fpInt(plan.old_id),
     state: fpEnumOr(PlanState, plan.state, PlanState.CREATED, unknownValue("plan state")),
-    gateway: fpEnumOr(OrderGateway, plan.gateway, OrderGateway.CYBRILLAPOA, unknownValue("gateway")),
+    gateway: fpEnumOr(OrderGateway, plan.gateway, OrderGateway.ONDC, unknownValue("gateway")),
     folioNumber: fpText(plan.folio_number, 30),
     systematic: plan.systematic,
     frequency: fpEnumOr(
@@ -298,9 +332,13 @@ export async function syncPurchasePlan(
     purpose: fpEnum(PlanPurpose, plan.purpose, unknownValue("plan purpose")),
   };
 
+  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  if (!allIsins(plan.scheme)) {
+    return db.mfPurchasePlan.update({ where: { fpId: plan.id }, data: fixedScheme(data), select: { id: true } });
+  }
   return db.mfPurchasePlan.upsert({
     where: { fpId: plan.id },
-    update: data,
+    update: fixedScheme(data),
     create: { fpId: plan.id, ...data },
     select: { id: true },
   });
@@ -318,9 +356,13 @@ export async function syncRedemptionPlan(
     units: fpUnits(plan.units),
   };
 
+  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  if (!allIsins(plan.scheme)) {
+    return db.mfRedemptionPlan.update({ where: { fpId: plan.id }, data: fixedScheme(data), select: { id: true } });
+  }
   return db.mfRedemptionPlan.upsert({
     where: { fpId: plan.id },
-    update: data,
+    update: fixedScheme(data),
     create: { fpId: plan.id, ...data },
     select: { id: true },
   });
@@ -339,9 +381,13 @@ export async function syncSwitchPlan(
     units: fpUnits(plan.units),
   };
 
+  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  if (!allIsins(plan.switch_out_scheme, plan.switch_in_scheme)) {
+    return db.mfSwitchPlan.update({ where: { fpId: plan.id }, data: fixedScheme(data), select: { id: true } });
+  }
   return db.mfSwitchPlan.upsert({
     where: { fpId: plan.id },
-    update: data,
+    update: fixedScheme(data),
     create: { fpId: plan.id, ...data },
     select: { id: true },
   });

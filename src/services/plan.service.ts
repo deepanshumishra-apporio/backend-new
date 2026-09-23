@@ -7,7 +7,7 @@
 // then answers "selected frequency is not supported" after the investor has
 // already chosen an amount and a date. scheme-rules catches it first.
 import {
-
+  OtpPurpose,
   PlanState,
   SchemeThresholdFrequency,
   SchemeThresholdType,
@@ -15,13 +15,21 @@ import {
 import { Prisma } from "../../generated/prisma/client.ts";
 import { db } from "../db/client.ts";
 import { assertInvestmentReady } from "./investor-readiness.service.ts";
-import { fpErrorToHttpError, fpPlans } from "../integrations/fp/index.ts";
+import { assertFolioAtSchemeAmc, resolvePurchaseFolio } from "./folio-resolution.service.ts";
+import { fpConfig, fpErrorToHttpError, fpPlans } from "../integrations/fp/index.ts";
+import { isOndcRoute } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, asUnits } from "../utils/money.ts";
 import { consumeVerificationToken } from "./otp.service.ts";
 import { resolveConsentContact, sendConsent } from "./order.service.ts";
 import { syncPurchasePlan, syncRedemptionPlan, syncSwitchPlan } from "./fp-sync/index.ts";
-import { validatePlan } from "./scheme-rules.service.ts";
+import { assertHoldsScheme, validatePlan } from "./scheme-rules.service.ts";
+import {
+  assertExitPlanSchedule,
+  assertSipMandate,
+  assertSipSchedule,
+  planCancellationPayload,
+} from "./sip-validation.ts";
 import type {
   PlanDto,
   PlanMandateDto,
@@ -29,10 +37,6 @@ import type {
   CreateStpInput,
   CreateSwpInput,
 } from "../types/plan.types.ts";
-
-import { assertSipMandate, assertSipSchedule } from "./sip-validation.ts";
-
-const GATEWAY = "cybrillapoa";
 
 /** The three plan tables share an id space, so a lookup has to try each. */
 const planIdentitySelect = {
@@ -43,15 +47,28 @@ const planIdentitySelect = {
   mfInvestmentAccountId: true,
 } as const;
 
+type PlanKind = "sip" | "swp" | "stp";
+
+/**
+ * Find a plan in whichever table holds it, with what confirm and cancel need.
+ *
+ * `isin` is the scheme the plan draws on: bought by a SIP, sold by an SWP,
+ * switched out of by an STP. Confirm re-checks the folio still holds it.
+ */
 async function resolvePlan(id: string) {
   const [sip, swp, stp] = await Promise.all([
-    db.mfPurchasePlan.findUnique({ where: { id }, select: { ...planIdentitySelect, mandateId: true, amount: true } }),
-    db.mfRedemptionPlan.findUnique({ where: { id }, select: planIdentitySelect }),
-    db.mfSwitchPlan.findUnique({ where: { id }, select: planIdentitySelect }),
+    db.mfPurchasePlan.findUnique({
+      where: { id },
+      select: { ...planIdentitySelect, mandateId: true, amount: true, schemeIsin: true },
+    }),
+    db.mfRedemptionPlan.findUnique({ where: { id }, select: { ...planIdentitySelect, schemeIsin: true } }),
+    db.mfSwitchPlan.findUnique({ where: { id }, select: { ...planIdentitySelect, switchOutSchemeIsin: true } }),
   ]);
   const row = sip ?? swp ?? stp;
-  if (!row || row.gateway !== "CYBRILLAPOA") throw HttpError.notFound("No such ONDC plan");
-  return { row, kind: sip ? "sip" : swp ? "swp" : "stp", mandateId: sip?.mandateId, amount: sip?.amount };
+  if (!row || !isOndcRoute(row.gateway)) throw HttpError.notFound("No such ONDC plan");
+  const kind: PlanKind = sip ? "sip" : swp ? "swp" : "stp";
+  const isin = sip?.schemeIsin ?? swp?.schemeIsin ?? stp?.switchOutSchemeIsin ?? "";
+  return { row, kind, isin, mandateId: sip?.mandateId, amount: sip?.amount };
 }
 export async function getPlan(id: string): Promise<PlanDto> {
   const { kind } = await resolvePlan(id);
@@ -66,19 +83,42 @@ export async function refreshPlan(id: string): Promise<PlanDto> {
     return getPlan(id);
   } catch (error) { fpErrorToHttpError(error); }
 }
+/**
+ * Confirm a reviewed plan with the investor's 2FA consent.
+ *
+ * Every check that can refuse runs before the OTP token is spent, so a refusal
+ * never costs the investor a fresh OTP. The readiness check matters for every
+ * kind, not only a SIP: an SWP pays out to the payout account and an STP is
+ * refused at submission if that account never passed verification — after the
+ * investor has consented.
+ */
 export async function confirmPlan(id: string, verificationToken: string): Promise<PlanDto> {
   await refreshPlan(id);
-  const { row, kind, mandateId, amount } = await resolvePlan(id);
-  if (["ACTIVE", "SUBMITTED", "CONFIRMED"].includes(row.state)) return getPlan(id);
-  if (row.state !== "REVIEW_COMPLETED") throw HttpError.conflict("Wait for the plan review to complete");
-  if (kind === "sip") {
-    if (!mandateId) throw HttpError.conflict("Create the SIP with an approved mandate before confirming");
-    await assertInvestmentReady(row.mfInvestmentAccountId, row.folioNumber ?? undefined);
-    await resolveMandate(mandateId, row.mfInvestmentAccountId, amount!.toString());
+  const { row, kind, isin, mandateId, amount } = await resolvePlan(id);
+  if (row.state === PlanState.ACTIVE || row.state === PlanState.SUBMITTED || row.state === PlanState.CONFIRMED) {
+    return getPlan(id);
   }
+  if (row.state !== PlanState.REVIEW_COMPLETED) {
+    throw HttpError.conflict("Wait for the plan review to complete", { state: row.state });
+  }
+
+  await assertInvestmentReady(row.mfInvestmentAccountId, row.folioNumber ?? undefined, kind === "sip" ? true : undefined);
+  if (kind === "sip") {
+    if (!mandateId || !amount) throw HttpError.conflict("Create the SIP with an approved mandate before confirming");
+    await resolveMandate(mandateId, row.mfInvestmentAccountId, amount.toString());
+  } else if (row.folioNumber) {
+    // Holdings can have been redeemed or switched away since the plan was made.
+    await assertHoldsScheme(row.mfInvestmentAccountId, row.folioNumber, isin);
+  }
+
   const contact = await resolveConsentContact(row.mfInvestmentAccountId, row.folioNumber);
   const proof = await consumeVerificationToken(verificationToken, `plan:${id}`);
-  if (proof.phone.replace(/\D/g, "") !== `${contact.isdCode}${contact.mobile}`.replace(/\D/g, "")) throw HttpError.badRequest("Consent phone mismatch");
+  if (proof.purpose !== OtpPurpose.TRANSACTION_APPROVAL) {
+    throw HttpError.badRequest("This verification was not issued for approving a transaction");
+  }
+  if (proof.phone.replace(/\D/g, "") !== `${contact.isdCode}${contact.mobile}`.replace(/\D/g, "")) {
+    throw HttpError.badRequest("The verified number does not match the mobile registered against this folio");
+  }
   const confirm = (consent: { email: string; isd_code?: string; mobile?: string }) =>
     ({ id: row.fpId, state: "confirmed" as const, consent });
   try {
@@ -160,8 +200,9 @@ export async function cancelPlan(id: string, cancellationCode: string, cancellat
   const { row, kind } = await resolvePlan(id);
   if (kind === "sip") return cancelSip(id, cancellationCode, cancellationReason);
   if (row.state === "CANCELLED") return getPlan(id);
+  if (row.state === PlanState.COMPLETED) throw HttpError.conflict("A completed plan cannot be cancelled");
   assertCancellable(row.state);
-  const payload = { cancellation_code: cancellationCode, ...(cancellationReason && { cancellation_reason: cancellationReason }) };
+  const payload = planCancellationPayload(cancellationCode, cancellationReason);
   try {
     if (kind === "swp") await syncRedemptionPlan(await fpPlans.cancelRedemptionPlan(row.fpId, payload), row.mfInvestmentAccountId);
     else await syncSwitchPlan(await fpPlans.cancelSwitchPlan(row.fpId, payload), row.mfInvestmentAccountId);
@@ -412,6 +453,10 @@ export async function createSip(input: CreateSipInput): Promise<PlanDto> {
   });
 
   const mandate = await resolveMandate(input.mandateId, account.id, input.amount);
+  // A second SIP at the same AMC goes into the folio the first one opened, even
+  // when started from the fund page rather than the holding. See
+  // folio-resolution.service.ts.
+  const folioNumber = await resolvePurchaseFolio(account.id, input.isin, input.folioNumber);
 
   try {
     const created = await fpPlans.createPurchasePlan({
@@ -422,16 +467,17 @@ export async function createSip(input: CreateSipInput): Promise<PlanDto> {
       frequency: toFpFrequency(frequency),
       ...(input.installmentDay !== undefined && { installment_day: input.installmentDay }),
       number_of_installments: input.numberOfInstallments,
-      ...(input.folioNumber && { folio_number: input.folioNumber }),
+      ...(folioNumber && { folio_number: folioNumber }),
       ...(mandate && { payment_method: "mandate", payment_source: String(mandate.fpId) }),
       ...(input.purpose && { purpose: input.purpose }),
+      ...(input.firstInstallmentNow && { generate_first_installment_now: true }),
       source_ref_id: input.sourceRefId ?? crypto.randomUUID(),
       user_ip: input.userIp,
       ...(input.serverIp && { server_ip: input.serverIp }),
       ...(input.euin && { euin: input.euin }),
       initiated_by: "investor",
       ...(input.initiatedVia && { initiated_via: input.initiatedVia }),
-      gateway: GATEWAY,
+      gateway: fpConfig().orderGateway,
     });
     const row = await syncPurchasePlan(created, account.id);
     await settleNewSip(row.id, created.id, account.id, input.isin);
@@ -574,10 +620,7 @@ export async function cancelSip(
   try {
     const cancelled = await fpPlans.cancelPurchasePlan({
       id: plan.fpId,
-      cancellation_code: cancellationCode,
-      // FP accepts free text only alongside the custom_reason code.
-      ...(cancellationCode === "custom_reason" &&
-        cancellationReason && { cancellation_reason: cancellationReason }),
+      ...planCancellationPayload(cancellationCode, cancellationReason),
     });
     await syncPurchasePlan(cancelled, plan.mfInvestmentAccountId);
     return getSip(id);
@@ -592,9 +635,9 @@ export async function cancelSip(
 
 export async function createSwp(input: CreateSwpInput): Promise<PlanDto> {
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
-  if (input.frequency !== "MONTHLY") throw HttpError.badRequest("ONDC SWP supports monthly frequency only");
   const account = await requireAccount(input.mfInvestmentAccountId);
   const frequency = asFrequency(input.frequency);
+  assertExitPlanSchedule("SWP", frequency, input.installmentDay, input.numberOfInstallments);
   await validatePlan(SchemeThresholdType.SWP, {
     isin: input.isin,
     amount: input.amount,
@@ -603,6 +646,8 @@ export async function createSwp(input: CreateSwpInput): Promise<PlanDto> {
     installmentDay: input.installmentDay,
     numberOfInstallments: input.numberOfInstallments,
   });
+  await assertFolioAtSchemeAmc(account.id, input.folioNumber, input.isin);
+  await assertHoldsScheme(account.id, input.folioNumber, input.isin);
 
   try {
     const created = await fpPlans.createRedemptionPlan({
@@ -621,7 +666,7 @@ export async function createSwp(input: CreateSwpInput): Promise<PlanDto> {
       ...(input.euin && { euin: input.euin }),
       initiated_by: "investor",
       ...(input.initiatedVia && { initiated_via: input.initiatedVia }),
-      gateway: GATEWAY,
+      gateway: fpConfig().orderGateway,
     });
     const row = await syncRedemptionPlan(created, account.id);
     await settleNewPlan("swp", row.id, created.id, account.id);
@@ -639,17 +684,20 @@ export async function getSwp(id: string): Promise<PlanDto> {
 
 export async function createStp(input: CreateStpInput): Promise<PlanDto> {
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
-  if (input.frequency !== "MONTHLY") throw HttpError.badRequest("ONDC STP supports monthly frequency only");
   const account = await requireAccount(input.mfInvestmentAccountId);
   const frequency = asFrequency(input.frequency);
+  assertExitPlanSchedule("STP", frequency, input.installmentDay, input.numberOfInstallments);
   await validatePlan(SchemeThresholdType.STP, {
     isin: input.switchOutIsin,
+    switchInIsin: input.switchInIsin,
     amount: input.amount,
     units: input.units,
     frequency,
     installmentDay: input.installmentDay,
     numberOfInstallments: input.numberOfInstallments,
   });
+  await assertFolioAtSchemeAmc(account.id, input.folioNumber, input.switchOutIsin);
+  await assertHoldsScheme(account.id, input.folioNumber, input.switchOutIsin);
 
   try {
     const created = await fpPlans.createSwitchPlan({
@@ -669,7 +717,7 @@ export async function createStp(input: CreateStpInput): Promise<PlanDto> {
       ...(input.euin && { euin: input.euin }),
       initiated_by: "investor",
       ...(input.initiatedVia && { initiated_via: input.initiatedVia }),
-      gateway: GATEWAY,
+      gateway: fpConfig().orderGateway,
     });
     const row = await syncSwitchPlan(created, account.id);
     await settleNewPlan("stp", row.id, created.id, account.id);

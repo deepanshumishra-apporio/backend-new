@@ -10,6 +10,7 @@ import { kycRouter } from "./kyc.routes.ts";
 import { orderRouter } from "./order.routes.ts";
 import { otpRouter } from "./otp.routes.ts";
 import { paymentRouter } from "./payment.routes.ts";
+import { paymentReturnRouter } from "./payment-return.routes.ts";
 import { planRouter } from "./plan.routes.ts";
 import { portfolioRouter } from "./portfolio.routes.ts";
 import { schemeRouter } from "./scheme.routes.ts";
@@ -22,6 +23,9 @@ apiRouter.use("/schemes", schemeRouter);
 apiRouter.use("/otp", otpRouter);
 apiRouter.use("/sessions", sessionRouter);
 apiRouter.use("/webhooks/fp", fpWebhookRouter);
+// FP's `payment_postback_url`. Mounted before the session gate because the
+// investor's browser arrives here from the payment page, not from the app.
+apiRouter.use("/payments/return", paymentReturnRouter);
 
 apiRouter.use(requireSession, authorizeInputs, investorCommand);
 apiRouter.use(investorWorkspaceRouter);

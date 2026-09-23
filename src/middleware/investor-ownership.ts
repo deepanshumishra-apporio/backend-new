@@ -1,5 +1,6 @@
 import type { Request, RequestHandler, Router } from "express";
 import { db } from "../db/client.ts";
+import { isOndcRoute } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { investorId } from "./investor-auth.ts";
 import { validateCallback } from "./api-security.ts";
@@ -21,6 +22,8 @@ function uuid(id: unknown): asserts id is string {
 const ownershipSelect = { id: true } as const;
 /** Enough to decide "is this ONDC, and whose is it?". */
 const routedSelect = { gateway: true, mfInvestmentAccountId: true } as const;
+/** The two provider names FP stores against payments on the ONDC route. */
+const ONDC_PAYMENT_PROVIDERS: ReadonlySet<string> = new Set(["CYBRILLAPOA", "ONDC"]);
 
 export async function ownProfile(userId: string, id: string): Promise<void> {
   uuid(id);
@@ -79,7 +82,7 @@ export async function ownResource(userId: string, kind: string, id: string): Pro
           db.mfSwitchPlan.findUnique({ where: { id }, select: routedSelect }),
         ]);
     const row = rows.find(Boolean);
-    if (!row || (row.gateway !== "CYBRILLAPOA" &&
+    if (!row || (!isOndcRoute(row.gateway) &&
         !(row.gateway === "RTA" && fpConfig().simulationEnabled))) throw HttpError.notFound();
     return ownAccount(userId, row.mfInvestmentAccountId);
   }
@@ -89,8 +92,10 @@ export async function ownResource(userId: string, kind: string, id: string): Pro
       select: { provider: true, purchases: { select: { mfPurchaseId: true } } },
     });
     // A payment with no order behind it is not reachable by anyone: there is
-    // nothing to check ownership against.
-    if (!row || row.provider !== "CYBRILLAPOA" || !row.purchases.length) throw HttpError.notFound();
+    // nothing to check ownership against. The ONDC gateway records a mandate
+    // debit as CYBRILLAPOA but a UPI / netbanking payment as ONDC (see
+    // `resources/payments.ts`), and both are ours.
+    if (!row || !ONDC_PAYMENT_PROVIDERS.has(row.provider ?? "") || !row.purchases.length) throw HttpError.notFound();
     for (const purchase of row.purchases) await ownResource(userId, "orderId", purchase.mfPurchaseId);
     return;
   }
