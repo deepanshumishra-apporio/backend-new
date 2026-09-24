@@ -161,6 +161,21 @@ export async function requestOtp(input: RequestOtpInput): Promise<RequestOtpDto>
     });
     active = null;
   }
+  // A transaction code for a different order or plan: the investor backed out
+  // of one sell / switch / plan and started another. Refusing left them stuck
+  // for the rest of the old code's life (OTP_TTL_MINUTES) with nothing to do
+  // but wait. Superseding is safe because every transaction challenge is bound
+  // to its `context` — the retired code can no longer authorise anything — and
+  // the lockout and hourly / daily send budgets above still apply. Login and
+  // other purposes keep the one-challenge-at-a-time rule.
+  if (active && active.purpose === "TRANSACTION_APPROVAL" && input.purpose === "TRANSACTION_APPROVAL" &&
+      input.context && active.context !== input.context) {
+    await db.phoneVerification.updateMany({
+      where: { id: active.id, status: "PENDING" },
+      data: { status: "EXPIRED" },
+    });
+    active = null;
+  }
   if (active && (active.purpose !== input.purpose || active.context !== (input.context ?? null))) {
     throw HttpError.conflict("Complete or wait for the current OTP challenge before starting another action");
   }

@@ -30,8 +30,19 @@ test('replaces an unbound legacy transaction OTP with a new context-bound challe
   expect(created.context).toBe('plan:test-plan');
   expect(created.purpose).toBe('TRANSACTION_APPROVAL');
 });
-test('never rebinds a challenge belonging to another plan', async () => {
+test('never rebinds a challenge belonging to another plan — it is retired and a new one issued', async () => {
+  // The investor backed out of another plan and started this one: the old code
+  // is expired (it can no longer authorise anything) rather than reused here,
+  // and rather than leaving them locked out until it lapses.
   latest.context = 'plan:another-plan';
+  await requestOtp(input);
+  expect(retired).toBe(1);
+  expect(created.id).toBe('new-challenge');
+  expect(created.context).toBe('plan:test-plan');
+});
+test('a pending login challenge still blocks a transaction code', async () => {
+  latest.purpose = 'LOGIN';
+  latest.context = null;
   await expect(requestOtp(input)).rejects.toThrow('current OTP challenge');
   expect(retired).toBe(0);
   expect(created).toBeUndefined();

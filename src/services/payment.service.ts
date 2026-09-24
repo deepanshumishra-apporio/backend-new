@@ -14,6 +14,7 @@ import {
   MfOrderState,
   OrderGateway,
   PaymentStatus,
+  PlanState,
 } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
 import {
@@ -512,6 +513,23 @@ async function assertNotAlreadyPaid(mfPurchaseIds: string[]): Promise<void> {
 }
 
 /** Resolve our order ids to the integer ids the payment gateway understands. */
+/** A SIP in one of these states was confirmed with the investor's OTP. */
+const CONSENTED_PLAN_STATES: PlanState[] = [PlanState.CONFIRMED, PlanState.SUBMITTED, PlanState.ACTIVE];
+
+/**
+ * A SIP installment the investor may pay by netbanking / UPI.
+ *
+ * An installment carries no consent of its own: the investor consented, with
+ * an OTP, to the plan that generated it. And FP moves it straight to
+ * `submitted`, not `pending`, because it expects a mandate debit. The first
+ * installment of a SIP started "now" is paid on the payment page instead —
+ * a page payment is what ONDC allots (it carries the `pay_…` reference a
+ * mandate debit lacks in the sandbox), so the SIP's first units land at once.
+ */
+function isConsentedInstallment(order: { plan: { state: PlanState } | null }): boolean {
+  return order.plan !== null && CONSENTED_PLAN_STATES.includes(order.plan.state);
+}
+
 async function resolvePayableOrders(mfPurchaseIds: string[]) {
   if (mfPurchaseIds.length === 0) throw HttpError.badRequest("No orders given");
   if (mfPurchaseIds.length > 10) {
@@ -520,17 +538,21 @@ async function resolvePayableOrders(mfPurchaseIds: string[]) {
 
   const orders = await db.mfPurchase.findMany({
     where: { id: { in: mfPurchaseIds } },
-    select: { id: true, fpOldId: true, state: true, gateway: true, mfInvestmentAccountId: true, consentAt: true, folioNumber: true, amount: true },
+    select: { id: true, fpOldId: true, state: true, gateway: true, mfInvestmentAccountId: true, consentAt: true, folioNumber: true, amount: true, plan: { select: { state: true } } },
   });
   if (orders.length !== mfPurchaseIds.length) throw HttpError.notFound("Unknown order");
   const legacy = orders.find((order) => isOndcRoute(order.gateway) && !canMoveMoney(order.gateway));
   if (legacy) throw HttpError.conflict(LEGACY_GATEWAY_MESSAGE, { orderId: legacy.id, gateway: legacy.gateway, retryable: false });
-  if (orders.some(order => !canMoveMoney(order.gateway) || !order.consentAt)) throw HttpError.conflict("Only consented ONDC orders can be paid");
+  if (orders.some(order => !canMoveMoney(order.gateway) || (!order.consentAt && !isConsentedInstallment(order)))) throw HttpError.conflict("Only consented ONDC orders can be paid");
   // This API creates single orders. Batch checkout requires FP batch-order creation.
   if (orders.length !== 1) throw HttpError.badRequest("Use one order per payment; batch-order creation is not exposed");
   for (const order of orders) await assertInvestmentReady(order.mfInvestmentAccountId, order.folioNumber);
 
-  const notPending = orders.filter((order) => order.state !== MfOrderState.PENDING);
+  const notPending = orders.filter((order) =>
+    isConsentedInstallment(order)
+      ? !DEBITABLE_INSTALLMENT_STATES.includes(order.state)
+      : order.state !== MfOrderState.PENDING,
+  );
   if (notPending.length > 0) {
     // An ONDC order sits in `under_review` until FP's asynchronous review
     // passes, and is not payable until then. Saying so beats "not pending",

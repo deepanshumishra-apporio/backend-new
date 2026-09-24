@@ -79,6 +79,49 @@ export async function fetchFundScheme(isin: string, requestId?: string): Promise
   });
 }
 
+/** One limit block on a gateway scheme plan. */
+export interface FpSchemePlanThreshold {
+  type: string;
+  frequency?: string;
+  amount_min?: number | null;
+  amount_max?: number | null;
+  amount_multiples?: number | null;
+  installments_min?: number | null;
+  /** Installment days a monthly plan may run on; empty for other frequencies. */
+  dates?: number[] | null;
+}
+
+/** What the ONDC route itself offers for one scheme (v2, lower-case enums). */
+export interface FpSchemePlan {
+  object: "mf_scheme_plan";
+  gateway: string;
+  isin: string;
+  active: boolean;
+  /**
+   * The transaction types the route accepts, as limit blocks. A type with no
+   * block is not offered: an IDCW plan can carry no `lumpsum` and no `sip`
+   * here while `fund_schemes` still says `purchase_allowed: true`, and FP then
+   * refuses the order with "scheme: is not available for purchase".
+   */
+  thresholds: FpSchemePlanThreshold[];
+}
+
+/**
+ * The scheme as the ONDC order route sees it.
+ *
+ * The path segment is `cybrillapoa` even though orders go out as `ondc`: this
+ * lookup only answers under that name (`/ondc/` is a 400), and it describes
+ * the same ONDC catalogue. `expand` is mandatory — FP 400s without it.
+ */
+export async function fetchOndcSchemePlan(isin: string, requestId?: string): Promise<FpSchemePlan> {
+  return fpRequest<FpSchemePlan>({
+    method: "GET",
+    path: `/v2/mf_scheme_plans/cybrillapoa/${isin}`,
+    query: { expand: "mf_scheme,mf_fund" },
+    ...(requestId && { requestId }),
+  });
+}
+
 /** Paged, 20 per page by default and 100 at most. */
 export async function listFundSchemes(
   query: {

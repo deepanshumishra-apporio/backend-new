@@ -1,7 +1,8 @@
 import type { Request, Response } from "express";
 import * as portfolioService from "../services/portfolio.service.ts";
 import { lockStatementPdf } from "../services/statement-lock.service.ts";
-import { optionalDate } from "../utils/validate.ts";
+import { previewPurchaseFolio } from "../services/folio-resolution.service.ts";
+import { optionalDate, requiredIsin } from "../utils/validate.ts";
 import { HttpError } from "../utils/http-error.ts";
 
 type AccountParams = { accountId: string };
@@ -23,6 +24,11 @@ export async function getSummary(req: Request<AccountParams>, res: Response) {
 
 export async function listHoldings(req: Request<AccountParams>, res: Response) {
   res.json({ data: await portfolioService.listHoldings(req.params.accountId) });
+}
+
+export async function purchaseFolio(req: Request<AccountParams & { isin: string }>, res: Response) {
+  const isin = requiredIsin({ isin: req.params.isin });
+  res.json({ data: await previewPurchaseFolio(req.params.accountId, isin) });
 }
 
 export async function listFolios(req: Request<AccountParams>, res: Response) {

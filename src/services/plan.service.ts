@@ -16,12 +16,20 @@ import { Prisma } from "../../generated/prisma/client.ts";
 import { db } from "../db/client.ts";
 import { assertInvestmentReady } from "./investor-readiness.service.ts";
 import { assertFolioAtSchemeAmc, resolvePurchaseFolio } from "./folio-resolution.service.ts";
-import { fpConfig, fpErrorToHttpError, fpPlans } from "../integrations/fp/index.ts";
+import { fpConfig, fpErrorToHttpError, fpOrders, fpPlans } from "../integrations/fp/index.ts";
 import { isOndcRoute } from "../utils/gateway.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { asAmount, asDate, asUnits } from "../utils/money.ts";
 import { consumeVerificationToken } from "./otp.service.ts";
-import { resolveConsentContact, sendConsent } from "./order.service.ts";
+import {
+  applyPurchaseUpdate,
+  applyRedemptionUpdate,
+  applySwitchUpdate,
+  assertExitBasisSupported,
+  pullRedemptionPayout,
+  resolveConsentContact,
+  sendConsent,
+} from "./order.service.ts";
 import { syncPurchasePlan, syncRedemptionPlan, syncSwitchPlan } from "./fp-sync/index.ts";
 import { assertHoldsScheme, validatePlan } from "./scheme-rules.service.ts";
 import {
@@ -77,9 +85,29 @@ export async function getPlan(id: string): Promise<PlanDto> {
 export async function refreshPlan(id: string): Promise<PlanDto> {
   const { row, kind } = await resolvePlan(id);
   try {
-    if (kind === "sip") await syncPurchasePlan(await fpPlans.fetchPurchasePlan(row.fpId), row.mfInvestmentAccountId);
-    else if (kind === "swp") await syncRedemptionPlan(await fpPlans.fetchRedemptionPlan(row.fpId), row.mfInvestmentAccountId);
-    else await syncSwitchPlan(await fpPlans.fetchSwitchPlan(row.fpId), row.mfInvestmentAccountId);
+    if (kind === "sip") {
+      await syncPurchasePlan(await fpPlans.fetchPurchasePlan(row.fpId), row.mfInvestmentAccountId);
+      // FP announces installments only by webhook, and the background loop
+      // re-reads a plan every few minutes. A SIP started with its first
+      // installment now has that installment within seconds of confirmation,
+      // and the investor is waiting on it to pay — so mirror them here too.
+      for (const installment of await fpOrders.listPurchases({ plan: row.fpId })) {
+        await applyPurchaseUpdate(installment, row.mfInvestmentAccountId);
+      }
+    } else if (kind === "swp") {
+      await syncRedemptionPlan(await fpPlans.fetchRedemptionPlan(row.fpId), row.mfInvestmentAccountId);
+      // Same reason as a SIP: otherwise an investor asking "did this month's
+      // withdrawal go through" waits on the background sweep to find out.
+      for (const installment of await fpOrders.listRedemptions({ plan: row.fpId })) {
+        const local = await applyRedemptionUpdate(installment, row.mfInvestmentAccountId);
+        if (installment.state === "successful") await pullRedemptionPayout(local.id, installment.id);
+      }
+    } else {
+      await syncSwitchPlan(await fpPlans.fetchSwitchPlan(row.fpId), row.mfInvestmentAccountId);
+      for (const installment of await fpOrders.listSwitches({ plan: row.fpId })) {
+        await applySwitchUpdate(installment, row.mfInvestmentAccountId);
+      }
+    }
     return getPlan(id);
   } catch (error) { fpErrorToHttpError(error); }
 }
@@ -480,6 +508,12 @@ export async function createSip(input: CreateSipInput): Promise<PlanDto> {
       gateway: fpConfig().orderGateway,
     });
     const row = await syncPurchasePlan(created, account.id);
+    // FP does not echo `generate_first_installment_now`, so the mirror cannot
+    // learn it from the response. Record what we asked for: the collector's
+    // grace period for that first installment keys on it.
+    if (input.firstInstallmentNow) {
+      await db.mfPurchasePlan.update({ where: { id: row.id }, data: { generateFirstInstallmentNow: true } });
+    }
     await settleNewSip(row.id, created.id, account.id, input.isin);
     return getSip(row.id);
   } catch (error) {
@@ -638,6 +672,8 @@ export async function createSwp(input: CreateSwpInput): Promise<PlanDto> {
   const account = await requireAccount(input.mfInvestmentAccountId);
   const frequency = asFrequency(input.frequency);
   assertExitPlanSchedule("SWP", frequency, input.installmentDay, input.numberOfInstallments);
+  // Each installment is a redemption, and the ONDC route refuses those by units.
+  assertExitBasisSupported(fpConfig().orderGateway, input.units);
   await validatePlan(SchemeThresholdType.SWP, {
     isin: input.isin,
     amount: input.amount,
@@ -687,6 +723,8 @@ export async function createStp(input: CreateStpInput): Promise<PlanDto> {
   const account = await requireAccount(input.mfInvestmentAccountId);
   const frequency = asFrequency(input.frequency);
   assertExitPlanSchedule("STP", frequency, input.installmentDay, input.numberOfInstallments);
+  // Each installment is a switch, and the ONDC route does not settle those by units.
+  assertExitBasisSupported(fpConfig().orderGateway, input.units);
   await validatePlan(SchemeThresholdType.STP, {
     isin: input.switchOutIsin,
     switchInIsin: input.switchInIsin,

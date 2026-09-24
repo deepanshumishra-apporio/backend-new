@@ -17,12 +17,10 @@ import { fpOrders, fpPayments, fpPlans } from "../integrations/fp/index.ts";
 import {
   syncPayment,
   syncPurchasePlan,
-  syncRedemption,
   syncRedemptionPlan,
-  syncSwitch,
   syncSwitchPlan,
 } from "./fp-sync/index.ts";
-import { applyPurchaseUpdate, pullRedemptionPayout } from "./order.service.ts";
+import { applyPurchaseUpdate, applyRedemptionUpdate, applySwitchUpdate, pullRedemptionPayout } from "./order.service.ts";
 import { debitInstallment } from "./payment.service.ts";
 
 /** Paid and handed to the gateway, but not yet decided. */
@@ -140,7 +138,7 @@ export async function reconcileExits(limit = 25): Promise<ReconcileResult> {
     await attempt(row.fpId, async () => {
       const fresh = await fpOrders.fetchRedemption(row.fpId);
       // Also bumps `syncedAt`, which is what spaces out the payout re-checks.
-      const local = await syncRedemption(fresh, row.mfInvestmentAccountId);
+      const local = await applyRedemptionUpdate(fresh, row.mfInvestmentAccountId);
       if (fresh.state === "successful") await pullRedemptionPayout(local.id, row.fpId);
       return !["confirmed", "submitted"].includes(fresh.state);
     });
@@ -148,7 +146,7 @@ export async function reconcileExits(limit = 25): Promise<ReconcileResult> {
   for (const row of switches) {
     await attempt(row.fpId, async () => {
       const fresh = await fpOrders.fetchSwitch(row.fpId);
-      await syncSwitch(fresh, row.mfInvestmentAccountId);
+      await applySwitchUpdate(fresh, row.mfInvestmentAccountId);
       return !["confirmed", "submitted"].includes(fresh.state);
     });
   }
@@ -168,6 +166,15 @@ const LIVE_PLAN_STATES = [PlanState.CONFIRMED, PlanState.SUBMITTED, PlanState.AC
  * not to ticks.
  */
 const PLAN_RESYNC_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * How long the first installment of a SIP started "now" is left to the
+ * investor. They pay it on the payment page straight after confirming (the
+ * app opens it); a mandate debit created first would take the claim and leave
+ * the page with nothing to pay. ONDC expires an unpaid order in about this
+ * long anyway, so waiting costs no installment.
+ */
+const FIRST_INSTALLMENT_GRACE_MS = 30 * 60 * 1000;
 
 /** Installment states still waiting for money (see `debitInstallment`). */
 const UNPAID_INSTALLMENT_STATES = [MfOrderState.PENDING, MfOrderState.CONFIRMED, MfOrderState.SUBMITTED];
@@ -220,6 +227,12 @@ export async function collectSipInstallments(limit = 10): Promise<InstallmentCol
           state: { in: UNPAID_INSTALLMENT_STATES },
           paymentSubmission: null,
           payments: { none: {} },
+          NOT: {
+            plan: {
+              generateFirstInstallmentNow: true,
+              createdAt: { gt: new Date(Date.now() - FIRST_INSTALLMENT_GRACE_MS) },
+            },
+          },
         },
         select: { id: true },
       });
@@ -291,7 +304,7 @@ export async function collectExitPlanInstallments(limit = 10): Promise<ExitPlanC
       await syncRedemptionPlan(await fpPlans.fetchRedemptionPlan(plan.fpId), plan.mfInvestmentAccountId);
       for (const installment of await fpOrders.listRedemptions({ plan: plan.fpId })) {
         result.installmentsSeen++;
-        const local = await syncRedemption(installment, plan.mfInvestmentAccountId);
+        const local = await applyRedemptionUpdate(installment, plan.mfInvestmentAccountId);
         if (installment.state === "successful") await pullRedemptionPayout(local.id, installment.id);
       }
     });
@@ -301,7 +314,7 @@ export async function collectExitPlanInstallments(limit = 10): Promise<ExitPlanC
       await syncSwitchPlan(await fpPlans.fetchSwitchPlan(plan.fpId), plan.mfInvestmentAccountId);
       for (const installment of await fpOrders.listSwitches({ plan: plan.fpId })) {
         result.installmentsSeen++;
-        await syncSwitch(installment, plan.mfInvestmentAccountId);
+        await applySwitchUpdate(installment, plan.mfInvestmentAccountId);
       }
     });
   }

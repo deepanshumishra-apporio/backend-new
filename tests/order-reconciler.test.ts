@@ -80,6 +80,10 @@ mock.module("../src/services/fp-sync/index.ts", () => ({
 mock.module("../src/services/order.service.ts", () => ({
   applyPurchaseUpdate: async (order: { id: string }) => { applied.push(order.id); },
   pullRedemptionPayout: async (localId: string) => { payoutsPulled.push(localId); },
+  // The reconciler applies exits through these; they mirror the order (and
+  // pull holdings on success) — here they record the mirror like the sync stubs.
+  applyRedemptionUpdate: async (order: { id: string }) => { synced.push(order.id); return { id: `local-${order.id}` }; },
+  applySwitchUpdate: async (order: { id: string }) => { synced.push(order.id); return { id: `local-${order.id}` }; },
 }));
 mock.module("../src/services/payment.service.ts", () => ({
   debitInstallment: async (id: string) => { debited.push(id); return "debited"; },

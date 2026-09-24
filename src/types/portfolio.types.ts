@@ -67,3 +67,19 @@ export interface FolioDto {
   schemeCount: number;
   syncedAt: string;
 }
+
+/**
+ * The folio a new lumpsum or SIP into a scheme will go into.
+ *
+ * One investor has one folio per fund house. `existing` means that folio is
+ * already open and the order must carry it; `new` means this is the first
+ * investment at the fund house and the AMC opens the folio at allotment;
+ * `awaiting_allotment` means the first order there is paid for but not yet
+ * allotted — no folio number exists yet, and placing another order now would
+ * open a duplicate, so the app must wait (`pendingOrderId`).
+ */
+export interface PurchaseFolioDto {
+  status: "existing" | "new" | "awaiting_allotment";
+  folioNumber: string | null;
+  pendingOrderId: string | null;
+}

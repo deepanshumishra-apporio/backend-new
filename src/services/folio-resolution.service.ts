@@ -31,6 +31,7 @@ import { db } from "../db/client.ts";
 import { fpAccounts, fpErrorToHttpError } from "../integrations/fp/index.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { syncFolio } from "./fp-sync/index.ts";
+import type { PurchaseFolioDto } from "../types/portfolio.types.ts";
 
 /**
  * Fresh orders whose folio is about to exist. Only states where the money has
@@ -248,5 +249,35 @@ export async function mirrorFolio(mfInvestmentAccountId: string, folioNumber: st
     }
   } catch (error) {
     fpErrorToHttpError(error);
+  }
+}
+
+/**
+ * The folio a new lumpsum or SIP into `isin` will use, for the app to show and
+ * send before the investor confirms.
+ *
+ * The same decision `resolvePurchaseFolio` makes at order time — so what the
+ * investor is shown is what the order carries — with its refusals turned into
+ * a status instead of an error.
+ */
+export async function previewPurchaseFolio(
+  mfInvestmentAccountId: string,
+  isin: string,
+): Promise<PurchaseFolioDto> {
+  try {
+    const folioNumber = await resolvePurchaseFolio(mfInvestmentAccountId, isin);
+    return folioNumber
+      ? { status: "existing", folioNumber, pendingOrderId: null }
+      : { status: "new", folioNumber: null, pendingOrderId: null };
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 409) {
+      const pending = error.details?.["pendingOrderId"];
+      return {
+        status: "awaiting_allotment",
+        folioNumber: null,
+        pendingOrderId: typeof pending === "string" ? pending : null,
+      };
+    }
+    throw error;
   }
 }

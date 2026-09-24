@@ -6,6 +6,7 @@ export const orderRouter = Router();
 orderRouter.get("/", order.listOrders);
 orderRouter.get("/:orderId", order.getOrder);
 orderRouter.get("/:orderId/payments", order.listOrderPayments);
+orderRouter.get("/:orderId/holding", order.getOrderHolding);
 orderRouter.post("/:orderId/refresh", order.refreshOrder);
 
 // The ONDC purchase sequence is ordered and each step enforces it:

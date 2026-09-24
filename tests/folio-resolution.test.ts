@@ -101,3 +101,13 @@ test("a named folio the mirror knows nothing about passes through to FP", async 
   namedFolio = { amcCode: null, purchases: [] };
   expect(await resolvePurchaseFolio("acc", "INF109K01Z48", "BARE")).toBe("BARE");
 });
+
+test("the preview reports existing, new and awaiting-allotment folios without throwing", async () => {
+  const { previewPurchaseFolio } = await import("../src/services/folio-resolution.service.ts");
+  folios = [{ number: "12345/67", createdAt: new Date(), purchases: [] }];
+  expect(await previewPurchaseFolio("acc", "INF109K01Z48")).toEqual({ status: "existing", folioNumber: "12345/67", pendingOrderId: null });
+  folios = [];
+  expect(await previewPurchaseFolio("acc", "INF109K01Z48")).toEqual({ status: "new", folioNumber: null, pendingOrderId: null });
+  awaiting = { id: "order-1" };
+  expect(await previewPurchaseFolio("acc", "INF109K01Z48")).toEqual({ status: "awaiting_allotment", folioNumber: null, pendingOrderId: "order-1" });
+});

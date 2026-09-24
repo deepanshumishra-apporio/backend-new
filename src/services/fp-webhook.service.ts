@@ -27,9 +27,7 @@ import {
   syncPayment,
   syncPurchase,
   syncPurchasePlan,
-  syncRedemption,
   syncRedemptionPlan,
-  syncSwitch,
   syncSwitchPlan,
 } from "./fp-sync/index.ts";
 
@@ -188,7 +186,8 @@ async function applyEvent(type: string, objectFpId: string | null): Promise<bool
         const order = await fpOrders.fetchRedemption(objectFpId);
         const accountId = await accountIdByFpId(order.mf_investment_account);
         if (!accountId) return false;
-        const row = await syncRedemption(order, accountId);
+        const { applyRedemptionUpdate } = await import("./order.service.ts");
+        const row = await applyRedemptionUpdate(order, accountId);
         // Nothing announces a payout — there is no `mf_payout_detail` event —
         // so the redemption's own success event is the trigger for looking.
         if (order.state === "successful") {
@@ -201,7 +200,8 @@ async function applyEvent(type: string, objectFpId: string | null): Promise<bool
         const order = await fpOrders.fetchSwitch(objectFpId);
         const accountId = await accountIdByFpId(order.mf_investment_account);
         if (!accountId) return false;
-        await syncSwitch(order, accountId);
+        const { applySwitchUpdate } = await import("./order.service.ts");
+        await applySwitchUpdate(order, accountId);
         return true;
       }
       case "mf_purchase_plan": {

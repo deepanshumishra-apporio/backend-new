@@ -6,6 +6,8 @@ export const portfolioRouter = Router();
 portfolioRouter.get("/:accountId/summary", portfolio.getSummary);
 portfolioRouter.get("/:accountId/holdings", portfolio.listHoldings);
 portfolioRouter.get("/:accountId/folios", portfolio.listFolios);
+// The folio a new lumpsum or SIP into this scheme will use — one per fund house.
+portfolioRouter.get("/:accountId/folio-for/:isin", portfolio.purchaseFolio);
 portfolioRouter.get("/:accountId/returns", portfolio.schemeReturns);
 // Account-level returns — the Portfolio Performance summary.
 portfolioRouter.get("/:accountId/performance", portfolio.performance);

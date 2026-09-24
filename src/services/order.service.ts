@@ -49,7 +49,7 @@ import {
 } from "./scheme-rules.service.ts";
 import { refreshPortfolio } from "./portfolio.service.ts";
 import type { Prisma } from "../../generated/prisma/client.ts";
-import type { FpPurchase } from "../integrations/fp/index.ts";
+import type { FpPurchase, FpRedemption, FpSwitch } from "../integrations/fp/index.ts";
 import type {
   CreatePurchaseInput,
   CreateRedemptionInput,
@@ -618,9 +618,29 @@ export async function cancelPurchase(id: string): Promise<OrderDto> {
 // Redemptions and switches
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuse a units-based exit on the ONDC route, before the investor consents.
+ *
+ * FP documents redemption by units as RTA-only, and the sandbox bears it out:
+ * a units redemption was accepted, consented to, then failed at the gateway
+ * (`order_failure_at_gateway`), and a units switch sat in `submitted` while
+ * the same switch by amount settled in seconds. By amount, or the whole
+ * holding (neither amount nor units), both settle. Failing here costs the
+ * investor nothing; failing after the OTP costs them a code and a dead order.
+ */
+export function assertExitBasisSupported(gateway: string, units: string | undefined): void {
+  if (units !== undefined && gateway === "ondc") {
+    throw HttpError.badRequest(
+      "Selling or switching a number of units is not supported on this route. Enter an amount, or choose to sell everything.",
+      { basis: "units" },
+    );
+  }
+}
+
 export async function createRedemption(input: CreateRedemptionInput): Promise<OrderDto> {
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
   const account = await requireAccount(input.mfInvestmentAccountId);
+  assertExitBasisSupported(input.gateway ?? fpConfig().orderGateway, input.units);
   await validateRedemption(input.isin, input.amount, input.units);
   await assertFolioAtSchemeAmc(account.id, input.folioNumber, input.isin);
   // FP's step 3: the folio must actually be able to give up what is asked.
@@ -719,7 +739,7 @@ export async function confirmRedemption(
     const updated = await sendConsent(contact, (consent) =>
       fpOrders.updateRedemption({ id: order.fpId, state: "confirmed", consent }),
     );
-    await syncRedemption(updated, order.mfInvestmentAccountId);
+    await applyRedemptionUpdate(updated, order.mfInvestmentAccountId);
     await db.mfRedemption.update({ where: { id }, data: consentAudit(contact) });
     return loadRedemption(order.fpId);
   } catch (error) {
@@ -730,6 +750,7 @@ export async function confirmRedemption(
 export async function createSwitch(input: CreateSwitchInput): Promise<OrderDto> {
   await assertInvestmentReady(input.mfInvestmentAccountId, input.folioNumber);
   const account = await requireAccount(input.mfInvestmentAccountId);
+  assertExitBasisSupported(input.gateway ?? fpConfig().orderGateway, input.units);
   await validateSwitch(input.switchOutIsin, input.switchInIsin, input.amount, input.units);
   // One folio, one fund house: `validateSwitch` has already proved both schemes
   // share an AMC, so the folio only has to be at the source's.
@@ -786,7 +807,7 @@ export async function confirmSwitch(id: string, input: OrderConsentInput): Promi
     const updated = await sendConsent(contact, (consent) =>
       fpOrders.updateSwitch({ id: order.fpId, state: "confirmed", consent }),
     );
-    await syncSwitch(updated, order.mfInvestmentAccountId);
+    await applySwitchUpdate(updated, order.mfInvestmentAccountId);
     await db.mfSwitch.update({ where: { id }, data: consentAudit(contact) });
     return loadSwitch(order.fpId);
   } catch (error) {
@@ -873,6 +894,47 @@ export async function applyPurchaseUpdate(fresh: FpPurchase, mfInvestmentAccount
   }
 }
 
+/**
+ * Mirror a redemption FP has reported, and pull the holdings the first time it
+ * succeeds.
+ *
+ * A redemption takes units out of a folio, but the holdings rows only move on
+ * a portfolio pull — and nothing pulled after a sale, so Holdings, the
+ * dashboard and every "redeem all" kept offering units that were already sold.
+ * Same rule as `applyPurchaseUpdate`: the one place a fetched redemption is
+ * applied. The payout pull stays with the callers that already do it.
+ */
+export async function applyRedemptionUpdate(fresh: FpRedemption, mfInvestmentAccountId: string) {
+  const before = await db.mfRedemption.findUnique({ where: { fpId: fresh.id }, select: { state: true } });
+  const row = await syncRedemption(fresh, mfInvestmentAccountId);
+  if (fresh.state === "successful" && before?.state !== MfOrderState.SUCCESSFUL) {
+    await pullHoldingsAfterExit(mfInvestmentAccountId, `redemption ${fresh.id}`);
+  }
+  return row;
+}
+
+/** The switch counterpart: units leave one scheme and arrive in another. */
+export async function applySwitchUpdate(fresh: FpSwitch, mfInvestmentAccountId: string) {
+  const before = await db.mfSwitch.findUnique({ where: { fpId: fresh.id }, select: { state: true } });
+  const row = await syncSwitch(fresh, mfInvestmentAccountId);
+  if (fresh.state === "successful" && before?.state !== MfOrderState.SUCCESSFUL) {
+    await pullHoldingsAfterExit(mfInvestmentAccountId, `switch ${fresh.id}`);
+  }
+  return row;
+}
+
+/** Best-effort, like the purchase pull: the order row is already right. */
+async function pullHoldingsAfterExit(mfInvestmentAccountId: string, what: string): Promise<void> {
+  try {
+    await refreshPortfolio(mfInvestmentAccountId);
+  } catch (error) {
+    console.warn(
+      `[orders] ${what} succeeded, but the holdings pull failed; the next refresh retries it`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
 async function loadPurchase(fpId: string): Promise<OrderDto> {
   const row = await db.mfPurchase.findUnique({ where: { fpId }, select: purchaseSelect });
   if (!row) throw HttpError.notFound("No such order");
@@ -929,7 +991,7 @@ export async function refreshOrder(id: string): Promise<OrderDto> {
   if (redemption) {
     try {
       const fresh = await fpOrders.fetchRedemption(redemption.fpId);
-      const row = await syncRedemption(fresh, redemption.mfInvestmentAccountId);
+      const row = await applyRedemptionUpdate(fresh, redemption.mfInvestmentAccountId);
       // Only once the units are gone: before that FP has nothing to report and
       // the call is a wasted round trip on every poll of a pending order.
       if (fresh.state === "successful") await pullRedemptionPayout(row.id, redemption.fpId);
@@ -946,7 +1008,7 @@ export async function refreshOrder(id: string): Promise<OrderDto> {
   if (switchOrder) {
     try {
       const fresh = await fpOrders.fetchSwitch(switchOrder.fpId);
-      await syncSwitch(fresh, switchOrder.mfInvestmentAccountId);
+      await applySwitchUpdate(fresh, switchOrder.mfInvestmentAccountId);
       return loadSwitch(switchOrder.fpId);
     } catch (error) {
       fpErrorToHttpError(error);

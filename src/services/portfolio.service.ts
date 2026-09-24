@@ -6,6 +6,7 @@
 // ₹5,000 at a NAV of 9.7524 does not allot 512.6943 units because we computed
 // it — it allots what the AMC says it allots.
 import { Prisma } from "../../generated/prisma/client.ts";
+import { MfOrderState } from "../../generated/prisma/enums.ts";
 import { db } from "../db/client.ts";
 import { fpAccounts, fpErrorToHttpError } from "../integrations/fp/index.ts";
 import { HttpError } from "../utils/http-error.ts";
@@ -110,6 +111,48 @@ function toHoldingDto(row: HoldingRow): HoldingDto {
     asOn: asDate(row.unitsAsOn),
     syncedAt: row.syncedAt.toISOString(),
   };
+}
+
+/**
+ * The holding a successful purchase landed in: its folio, its scheme.
+ *
+ * The last step of a lumpsum. An order's own `allottedUnits` is what this one
+ * purchase bought; the holding is what the folio now holds in the scheme, from
+ * FP's holdings report — the only authoritative figure. Null until the order is
+ * `successful`, because nothing before that carries a folio.
+ *
+ * `applyPurchaseUpdate` pulls holdings on the transition to successful, so the
+ * row is normally already here. When that best-effort pull failed, one more is
+ * tried now; if FP still has nothing — the report can lag the allotment — the
+ * answer is null and the caller asks again later.
+ */
+export async function getPurchaseHolding(mfPurchaseId: string): Promise<HoldingDto | null> {
+  const purchase = await db.mfPurchase.findUnique({
+    where: { id: mfPurchaseId },
+    select: { state: true, folioNumber: true, schemeIsin: true, mfInvestmentAccountId: true },
+  });
+  if (!purchase) throw HttpError.notFound("No such purchase");
+  const { folioNumber, schemeIsin, mfInvestmentAccountId } = purchase;
+  if (purchase.state !== MfOrderState.SUCCESSFUL || !folioNumber) return null;
+
+  const find = () =>
+    db.mfHolding.findFirst({
+      where: { mfInvestmentAccountId, folioNumber, schemeIsin },
+      select: holdingSelect,
+    });
+  let row = await find();
+  if (!row) {
+    try {
+      await refreshPortfolio(mfInvestmentAccountId);
+      row = await find();
+    } catch (error) {
+      console.warn(
+        `[portfolio] holdings pull for purchase ${mfPurchaseId} failed; the next read retries it`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+  return row ? toHoldingDto(row) : null;
 }
 
 export async function listHoldings(mfInvestmentAccountId: string): Promise<HoldingDto[]> {
