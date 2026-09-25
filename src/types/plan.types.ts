@@ -64,6 +64,51 @@ export interface PlanMandateDto {
   accountNumberLast4: string;
 }
 
+/** A pause on a SIP, as FP holds it. Dates are ISO `YYYY-MM-DD`. */
+export interface PlanPauseDto {
+  id: string;
+  /** Upper-case FP state: PENDING, ACTIVE, CANCELLATION_REQUESTED, … */
+  state: string;
+  /** First and last installment dates skipped, both inclusive. */
+  from: string;
+  to: string | null;
+  /** The first installment collected again once the pause runs out. */
+  resumesOn: string | null;
+  remainingInstallments: number;
+  skippedInstallments: number;
+}
+
+/** One length of pause the investor may choose, dated exactly as FP will be told. */
+export interface PlanPauseOptionDto {
+  installments: number;
+  from: string;
+  to: string;
+  resumesOn: string;
+}
+
+/**
+ * What the pause controls need: the pause in force, if any, and the lengths
+ * SEBI's consecutive-failure limit still allows. `options` is empty when the
+ * SIP cannot be paused at all, and `unavailableReason` says why.
+ */
+export interface PlanPauseStatusDto {
+  pause: PlanPauseDto | null;
+  options: PlanPauseOptionDto[];
+  unavailableReason: string | null;
+}
+
+/** A requested change to a SIP's installment amount. */
+export interface PlanAmountChangeDto {
+  id: string;
+  /** `created`, then `completed` or `failed`. */
+  state: string;
+  from: string | null;
+  to: string | null;
+  failureReason: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
 export interface PlanDto {
   id: string;
   fpId: string;

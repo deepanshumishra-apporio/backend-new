@@ -8,7 +8,14 @@
 //
 // Like orders, plan creation is not idempotent — pass a `source_ref_id`.
 import { fpList, fpRequest } from "../fp.http.ts";
-import type { FpConsent, FpPurchasePlan, FpRedemptionPlan, FpSwitchPlan } from "../fp.types.ts";
+import type {
+  FpConsent,
+  FpPlanModificationInstruction,
+  FpPlanSkipInstruction,
+  FpPurchasePlan,
+  FpRedemptionPlan,
+  FpSwitchPlan,
+} from "../fp.types.ts";
 
 interface PlanContext {
   source_ref_id: string;
@@ -119,6 +126,82 @@ export async function cancelPurchasePlan(
     path: "/v2/mf_purchase_plans/cancel",
     body: payload,
     retry: false,
+    ...(requestId && { requestId }),
+  });
+}
+
+/**
+ * Pause a purchase plan: installments dated `from`..`to` are skipped.
+ *
+ * FP refuses a range that would leave the plan at SEBI's consecutive-failure
+ * limit for its frequency, so the caller sizes the range first.
+ */
+export async function createPurchasePlanSkip(
+  planId: string,
+  range: { from: string; to: string },
+  requestId?: string,
+): Promise<FpPlanSkipInstruction> {
+  return fpRequest<FpPlanSkipInstruction>({
+    method: "POST",
+    path: `/v2/mf_purchase_plans/${planId}/skip_instructions`,
+    body: range,
+    retry: false,
+    ...(requestId && { requestId }),
+  });
+}
+
+export async function listPurchasePlanSkips(
+  planId: string,
+  requestId?: string,
+): Promise<FpPlanSkipInstruction[]> {
+  const page = await fpRequest<{ data: FpPlanSkipInstruction[] }>({
+    method: "GET",
+    path: `/v2/mf_purchase_plans/${planId}/skip_instructions`,
+    ...(requestId && { requestId }),
+  });
+  return page.data;
+}
+
+/** End a pause early. Asynchronous: the instruction goes to CANCELLATION_REQUESTED first. */
+export async function cancelPurchasePlanSkip(
+  skipId: string,
+  requestId?: string,
+): Promise<FpPlanSkipInstruction> {
+  return fpRequest<FpPlanSkipInstruction>({
+    method: "POST",
+    path: `/v2/mf_purchase_plans/skip_instructions/${skipId}/cancel`,
+    body: {},
+    retry: false,
+    ...(requestId && { requestId }),
+  });
+}
+
+/**
+ * Change an active plan's installment amount, with the investor's consent.
+ *
+ * On ONDC `PATCH /v2/mf_purchase_plans` refuses an amount ("state cannot be
+ * null for ondc gateway"); this instruction is the route that gateway takes.
+ */
+export async function createPlanAmountChange(
+  payload: { plan: string; amount: number; consent: FpConsent },
+  requestId?: string,
+): Promise<FpPlanModificationInstruction> {
+  return fpRequest<FpPlanModificationInstruction>({
+    method: "POST",
+    path: "/v2/mf_plan_modification_instructions",
+    body: payload,
+    retry: false,
+    ...(requestId && { requestId }),
+  });
+}
+
+export async function fetchPlanModification(
+  id: string,
+  requestId?: string,
+): Promise<FpPlanModificationInstruction> {
+  return fpRequest<FpPlanModificationInstruction>({
+    method: "GET",
+    path: `/v2/mf_plan_modification_instructions/${id}`,
     ...(requestId && { requestId }),
   });
 }

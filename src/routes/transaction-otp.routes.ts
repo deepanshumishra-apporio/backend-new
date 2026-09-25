@@ -10,9 +10,12 @@ import { HttpError } from "../utils/http-error.ts";
 export const transactionOtpRouter = Router();
 for (const operation of ["request", "verify"] as const) transactionOtpRouter.post(`/${operation}`, async (req, res) => {
   const body = asBody(req.body);
-  const kind = oneOf(body, "kind", ["order", "plan"] as const)!;
+  // `planChange` approves a change to a plan that is already running — its
+  // amount — rather than the plan's confirmation. It has its own context, so a
+  // code issued for one can never be spent on the other.
+  const kind = oneOf(body, "kind", ["order", "plan", "planChange"] as const)!;
   const id = requiredString(body, "id");
-  await ownResource(investorId(req), `${kind}Id`, id);
+  await ownResource(investorId(req), kind === "order" ? "orderId" : "planId", id);
   // Only the three fields this handler reads — see investor-ownership.ts.
   const select = { state: true, mfInvestmentAccountId: true, folioNumber: true } as const;
   const rows = kind === "order"
@@ -27,7 +30,11 @@ for (const operation of ["request", "verify"] as const) transactionOtpRouter.pos
         db.mfSwitchPlan.findUnique({ where: { id }, select }),
       ]);
   const row = rows.find(Boolean);
-  if (!row || !["PENDING", "REVIEW_COMPLETED"].includes(row.state)) throw HttpError.conflict("Wait for provider review before collecting transaction consent");
+  if (kind === "planChange") {
+    if (!row || row.state !== "ACTIVE") throw HttpError.conflict("Only an active plan can be changed");
+  } else if (!row || !["PENDING", "REVIEW_COMPLETED"].includes(row.state)) {
+    throw HttpError.conflict("Wait for provider review before collecting transaction consent");
+  }
   const contact = await resolveConsentContact(row.mfInvestmentAccountId, row.folioNumber);
   const input = { phone: `+${contact.isdCode}${contact.mobile}`, purpose: "TRANSACTION_APPROVAL" as const,
     context: `${kind}:${id}`, ipAddress: req.ip, userAgent: req.get("user-agent") };

@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import * as planService from "../services/plan.service.ts";
+import * as planChangeService from "../services/plan-change.service.ts";
 import { listPlanInstallments } from "../services/order.service.ts";
 import {
   asBody,
@@ -176,4 +177,32 @@ export async function listInstallments(req: Request<PlanParams>, res: Response) 
   // that reads as "this SIP has never paid in".
   await planService.getPlan(req.params.planId);
   res.json({ data: await listPlanInstallments(req.params.planId) });
+}
+
+export async function getPlanPause(req: Request<PlanParams>, res: Response) {
+  res.json({ data: await planChangeService.getSipPause(req.params.planId) });
+}
+
+export async function pausePlan(req: Request<PlanParams>, res: Response) {
+  // The service holds it to SEBI's limit for the plan's frequency; this only
+  // keeps a nonsense count off the wire.
+  const installments = requiredInt(asBody(req.body), "installments", { min: 1, max: 12 });
+  res.json({ data: await planChangeService.pauseSip(req.params.planId, installments) });
+}
+
+export async function resumePlan(req: Request<PlanParams>, res: Response) {
+  res.json({ data: await planChangeService.resumeSip(req.params.planId) });
+}
+
+export async function changePlanAmount(req: Request<PlanParams>, res: Response) {
+  const body = asBody(req.body);
+  const amount = requiredDecimal(body, "amount", { maxDecimalPlaces: 2 });
+  const verificationToken = requiredString(body, "verificationToken");
+  res.status(201).json({ data: await planChangeService.changeSipAmount(req.params.planId, amount, verificationToken) });
+}
+
+export async function getPlanAmountChange(req: Request<PlanParams & { changeId: string }>, res: Response) {
+  const changeId = req.params.changeId;
+  if (!/^mpmi_[a-zA-Z0-9]+$/.test(changeId)) throw HttpError.badRequest("Invalid change id");
+  res.json({ data: await planChangeService.getSipAmountChange(req.params.planId, changeId) });
 }

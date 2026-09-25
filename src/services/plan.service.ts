@@ -260,7 +260,7 @@ function toFpFrequency(frequency: string): string {
  * "toString") would otherwise come back truthy and be sent to FP as a
  * frequency.
  */
-function asFrequency(raw: string): Frequency {
+export function asFrequency(raw: string): Frequency {
   const name = raw.toUpperCase();
   const frequencies = SchemeThresholdFrequency as Record<string, string>;
   const match = Object.hasOwn(frequencies, name) ? frequencies[name] : undefined;
@@ -445,7 +445,7 @@ async function requireAccount(mfInvestmentAccountId: string) {
  * FP answers "Mandate passed is incorrect, pass correct mandate for order
  * gateway …" otherwise, which is impossible to act on from the client.
  */
-async function resolveMandate(mandateId: string | undefined, mfInvestmentAccountId: string, amount: string) {
+export async function resolveMandate(mandateId: string | undefined, mfInvestmentAccountId: string, amount: string) {
   if (!mandateId) throw HttpError.badRequest("Choose an approved mandate before creating a SIP");
   const mandate = await db.mandate.findFirst({
     where: {

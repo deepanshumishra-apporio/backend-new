@@ -38,6 +38,47 @@ export interface FpConsent {
   otp?: string | null;
 }
 
+/**
+ * A pause on a plan: installments dated between `from_date` and `to_date`
+ * (inclusive) are generated and marked cancelled.
+ *
+ * States are upper-case on the wire (`PENDING`, `ACTIVE`, `COMPLETED`,
+ * `CANCELLED`, `CANCELLATION_REQUESTED`, `FAILED`) although the reference
+ * documents them lower-case; compare case-insensitively. The counts arrive as
+ * numeric strings.
+ */
+export interface FpPlanSkipInstruction {
+  object: "plan_skip_instruction";
+  id: string;
+  plan: string;
+  state: string;
+  remaining_installments: string | number;
+  skipped_installments: string | number;
+  created_at: string;
+  cancelled_at: string | null;
+  completed_at: string | null;
+  from_date: string;
+  to_date: string | null;
+}
+
+/**
+ * A change to an active plan — its amount or its mandate, never both. ONDC
+ * only; it applies to installments not yet scheduled.
+ */
+export interface FpPlanModificationInstruction {
+  object: "mf_plan_modification_instruction";
+  id: string;
+  plan: string;
+  /** `created`, then `completed` or `failed`. */
+  state: string;
+  amount: { from: string; to: string } | null;
+  payment_method: string | null;
+  created_at: string;
+  completed_at: string | null;
+  failed_at: string | null;
+  failure_reason: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // KYC
 // ---------------------------------------------------------------------------
