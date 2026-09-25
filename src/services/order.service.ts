@@ -349,6 +349,18 @@ async function requireConsentProof(
   orderId: string,
 ): Promise<void> {
   const consumed = await consumeVerificationToken(input.verificationToken, `order:${orderId}`);
+  assertProofFor(consumed, contact);
+}
+
+/**
+ * A spent verification must be a transaction approval, sent to the mobile the
+ * folio has registered. Exported for the cart, which spends one token and then
+ * holds it against every order and plan in the checkout.
+ */
+export function assertProofFor(
+  consumed: { phone: string; purpose: string },
+  contact: { isdCode: string; mobile: string },
+): void {
   if (consumed.purpose !== OtpPurpose.TRANSACTION_APPROVAL) {
     throw HttpError.badRequest("This verification was not issued for approving a transaction");
   }
@@ -418,7 +430,20 @@ export async function recordPurchaseConsent(
 
   const contact = await resolveConsentContact(order.mfInvestmentAccountId, order.folioNumber);
   await requireConsentProof(input, contact, id);
+  return applyPurchaseConsent(id, order, contact);
+}
 
+/**
+ * Send an already-proven consent to FP and keep our audit of it.
+ *
+ * The caller has spent the OTP and matched it to `contact`; this is only the
+ * write. Split out so a cart checkout can prove once and consent many.
+ */
+export async function applyPurchaseConsent(
+  id: string,
+  order: { fpId: string; mfInvestmentAccountId: string },
+  contact: ConsentContact,
+): Promise<OrderDto> {
   try {
     const updated = await sendConsent(contact, (consent) =>
       fpOrders.updatePurchase({ id: order.fpId, consent }),
@@ -439,6 +464,100 @@ export async function recordPurchaseConsent(
   } catch (error) {
     fpErrorToHttpError(error);
   }
+}
+
+/**
+ * Create several purchases as one FP batch, so a single payment can pay for
+ * them all.
+ *
+ * On ONDC this is the only way: FP pays several orders together only when they
+ * were created by `POST /v2/mf_purchases/batch`. Every line is validated the
+ * way `createPurchase` validates one — folio reuse, the scheme's limits — so a
+ * refusal names the fund before anything is created. The batch is all or
+ * nothing at FP, and each line carries its own `source_ref_id`, so a retried
+ * request is refused rather than doubled.
+ */
+export async function createPurchaseBatch(inputs: CreatePurchaseInput[]): Promise<OrderDto[]> {
+  if (inputs.length === 0) return [];
+  if (inputs.length > 10) throw HttpError.badRequest("At most ten one-time orders can be placed together");
+  const accountId = inputs[0]!.mfInvestmentAccountId;
+  if (inputs.some((input) => input.mfInvestmentAccountId !== accountId)) {
+    throw HttpError.badRequest("Every order in one checkout must be on the same investment account");
+  }
+  await assertInvestmentReady(accountId, inputs[0]!.folioNumber);
+  const account = await requireAccount(accountId);
+
+  const lines = [];
+  for (const input of inputs) {
+    const folioNumber = await resolvePurchaseFolio(account.id, input.isin, input.folioNumber);
+    await validatePurchase(input.isin, input.amount, Boolean(folioNumber));
+    lines.push({
+      mf_investment_account: account.fpId,
+      scheme: input.isin,
+      amount: Number(input.amount),
+      ...(folioNumber && { folio_number: folioNumber }),
+      source_ref_id: input.sourceRefId ?? crypto.randomUUID(),
+      user_ip: input.userIp,
+      ...(input.serverIp && { server_ip: input.serverIp }),
+      ...(input.euin && { euin: input.euin }),
+      ...(input.initiatedVia && { initiated_via: input.initiatedVia }),
+      initiated_by: "investor",
+      gateway: input.gateway ?? fpConfig().orderGateway,
+    });
+  }
+
+  try {
+    const created = await fpOrders.createPurchaseBatch(lines);
+    for (const purchase of created) await syncPurchase(purchase, account.id);
+    // FP answers in its own order; hand back ours, line for line.
+    const byRef = new Map(created.map((purchase) => [purchase.source_ref_id, purchase.id]));
+    return Promise.all(lines.map((line) => loadPurchase(byRef.get(line.source_ref_id) ?? "")));
+  } catch (error) {
+    fpErrorToHttpError(error);
+  }
+}
+
+/**
+ * Confirm a batch of consented, paid-for purchases together.
+ *
+ * The batch counterpart of `confirmPurchase`, with the same refusals made
+ * first — consent recorded, a live payment behind each — because FP's batch
+ * answer does not say which order it objected to.
+ */
+export async function confirmPurchaseBatch(ids: string[]): Promise<OrderDto[]> {
+  const orders = await db.mfPurchase.findMany({
+    where: { id: { in: ids } },
+    select: {
+      id: true,
+      fpId: true,
+      mfInvestmentAccountId: true,
+      state: true,
+      gateway: true,
+      consentAt: true,
+      payments: { select: { payment: { select: { status: true } } } },
+    },
+  });
+  if (orders.length !== ids.length) throw HttpError.notFound("Unknown order");
+  const pending = orders.filter((order) => order.state === MfOrderState.PENDING);
+  for (const order of pending) {
+    if (!canMoveMoney(order.gateway)) {
+      throw HttpError.conflict(LEGACY_GATEWAY_MESSAGE, { orderId: order.id, retryable: false });
+    }
+    if (!order.consentAt) throw HttpError.conflict("Record the investor's consent before confirming", { orderId: order.id });
+    const live = order.payments.some(
+      (link) => link.payment.status !== PaymentStatus.FAILED && link.payment.status !== PaymentStatus.REJECTED,
+    );
+    if (!live) throw HttpError.conflict("Create a payment for these orders before confirming", { orderId: order.id });
+  }
+  if (pending.length > 0) {
+    try {
+      const updated = await fpOrders.confirmPurchaseBatch(pending.map((order) => order.fpId));
+      for (const purchase of updated) await applyPurchaseUpdate(purchase, pending[0]!.mfInvestmentAccountId);
+    } catch (error) {
+      fpErrorToHttpError(error);
+    }
+  }
+  return Promise.all(orders.map((order) => loadPurchase(order.fpId)));
 }
 
 /** Final step: confirm, which is what submits the order to the gateway. */

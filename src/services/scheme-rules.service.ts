@@ -347,6 +347,26 @@ export async function assertSwitchPair(switchOutIsin: string, switchInIsin: stri
   }
 }
 
+/** An STP's target must publish the plan's frequency for STP too. */
+async function assertStpTargetFrequency(
+  switchInIsin: string,
+  frequency: ThresholdFrequency,
+): Promise<void> {
+  const [target, supported] = await Promise.all([
+    requireTradableScheme(switchInIsin),
+    db.mfSchemeThreshold.findMany({
+      where: { scheme: { isin: switchInIsin }, type: SchemeThresholdType.STP },
+      select: { frequency: true },
+    }),
+  ]);
+  if (!supported.some((row) => row.frequency === frequency)) {
+    throw HttpError.badRequest(
+      `${target.name} does not accept ${frequency.toLowerCase()} transfer plans. Choose another fund to transfer into.`,
+      { switchInIsin, supported: supported.map((row) => row.frequency) },
+    );
+  }
+}
+
 /**
  * The target scheme's entry minimum, checked against a switch amount.
  *
@@ -444,6 +464,12 @@ export async function validatePlan(
     throw HttpError.badRequest(`${scheme.name} does not support ${input.frequency} for ${type}`, {
       supported: supported.map((row) => row.frequency),
     });
+  }
+  // FP checks the frequency against the target scheme as well, and answers a
+  // target that publishes none with a bare "frequency: not supported". Both
+  // sandbox index funds are such targets.
+  if (type === SchemeThresholdType.STP && input.switchInIsin) {
+    await assertStpTargetFrequency(input.switchInIsin, input.frequency);
   }
 
   const threshold = await loadThreshold(input.isin, type, input.frequency);

@@ -85,6 +85,40 @@ export async function updatePurchase(
   });
 }
 
+/**
+ * Create up to ten ONDC purchases in one call (early access on FP).
+ *
+ * The only way to collect a single payment for several orders on ONDC: FP pays
+ * a group of orders together only when they were created as a batch. Never
+ * retried, for the same reason as a single create — each line's
+ * `source_ref_id` is what refuses a replay.
+ */
+export async function createPurchaseBatch(
+  purchases: CreatePurchasePayload[],
+  requestId?: string,
+): Promise<FpPurchase[]> {
+  const created = await fpRequest<{ data: FpPurchase[] }>({
+    method: "POST",
+    path: "/v2/mf_purchases/batch",
+    body: { mf_purchases: purchases },
+    retry: false,
+    ...(requestId && { requestId }),
+  });
+  return created.data;
+}
+
+/** Move a batch created by `createPurchaseBatch` to `confirmed`, together. */
+export async function confirmPurchaseBatch(ids: string[], requestId?: string): Promise<FpPurchase[]> {
+  const updated = await fpRequest<{ data: FpPurchase[] }>({
+    method: "PATCH",
+    path: "/v2/mf_purchases/batch",
+    body: { mf_purchases: ids.map((id) => ({ id, state: "confirmed" })) },
+    retry: false,
+    ...(requestId && { requestId }),
+  });
+  return updated.data;
+}
+
 export async function fetchPurchase(id: string, requestId?: string): Promise<FpPurchase> {
   return fpRequest<FpPurchase>({
     method: "GET",

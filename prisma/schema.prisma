@@ -860,6 +860,8 @@ model User {
   preVerifications   PreVerification[]
   bankAccountLookups BankAccountLookup[]
   watchlist          WatchlistItem[]
+  cartItems          CartItem[]
+  cartCheckouts      CartCheckout[]
   auditLogs          AuditLog[]
 
   @@index([status])
@@ -1376,13 +1378,13 @@ model InvestorProfile {
   type      InvestorProfileType @default(INDIVIDUAL)
   taxStatus TaxStatus?
 
-  name          String?        @db.VarChar(70)
-  dateOfBirth   DateTime?      @db.Date
+  name          String?               @db.VarChar(70)
+  dateOfBirth   DateTime?             @db.Date
   gender        Gender?
   maritalStatus ProfileMaritalStatus?
   occupation    Occupation?
   /// Full PAN — required by FP and the folio join key. See KycCheck.pan.
-  pan           String?        @db.VarChar(10)
+  pan           String?               @db.VarChar(10)
 
   // --- KRA demographics --------------------------------------------------
   // Undocumented on FP's investor_profile but real: it returns AND accepts all
@@ -1918,6 +1920,7 @@ model MfScheme {
   navHistory    NavHistory[]
   thresholds    MfSchemeThreshold[]
   watchlistedBy WatchlistItem[]
+  inCarts       CartItem[]
 
   purchases       MfPurchase[]
   redemptions     MfRedemption[]
@@ -2057,6 +2060,7 @@ model MfInvestmentAccount {
   switches        MfSwitch[]
   purchasePlans   MfPurchasePlan[]
   redemptionPlans MfRedemptionPlan[]
+  cartCheckouts   CartCheckout[]
   switchPlans     MfSwitchPlan[]
 
   @@index([primaryInvestorProfileId])
@@ -3255,4 +3259,95 @@ model AuditLog {
   @@index([entityType, entityId])
   @@index([action, createdAt])
   @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Cart — our own tables, not a mirror of FP
+// ---------------------------------------------------------------------------
+
+/// How a fund sits in the cart: a one-time purchase or a monthly SIP.
+enum CartItemType {
+  LUMPSUM
+  SIP
+}
+
+/// A fund the investor means to buy, kept on the server so the cart follows
+/// them across devices. One row per fund and type: adding it again changes
+/// the amount rather than stacking a second line.
+model CartItem {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  schemeId String   @db.Uuid
+  scheme   MfScheme @relation(fields: [schemeId], references: [id], onDelete: Cascade)
+
+  type   CartItemType
+  /// The one-time amount, or the monthly SIP instalment.
+  amount Decimal      @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([userId, schemeId, type])
+  @@index([userId])
+  @@map("cart_items")
+}
+
+/// One checkout of the cart: a snapshot of its items and the FP orders and
+/// plans placed for them, confirmed together with a single transaction OTP.
+model CartCheckout {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  mfInvestmentAccountId String              @db.Uuid
+  mfInvestmentAccount   MfInvestmentAccount @relation(fields: [mfInvestmentAccountId], references: [id], onDelete: Restrict)
+
+  /// The approved mandate every SIP in this checkout is debited by.
+  mandateId      String? @db.Uuid
+  /// Day of the month the SIPs debit on.
+  installmentDay Int?
+
+  /// When the one OTP was spent and every order and plan carried its consent.
+  consentedAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  items CartCheckoutItem[]
+
+  @@index([userId, createdAt])
+  @@map("cart_checkouts")
+}
+
+/// A line of a checkout, and what FP made of it.
+model CartCheckoutItem {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  checkoutId String       @db.Uuid
+  checkout   CartCheckout @relation(fields: [checkoutId], references: [id], onDelete: Cascade)
+
+  isin   String       @db.VarChar(12)
+  type   CartItemType
+  amount Decimal      @db.Decimal(14, 2)
+
+  /// FP's idempotency anchor for this line's order or plan. FP refuses a
+  /// second create carrying it, which is what makes a retried checkout safe.
+  sourceRefId String @unique @db.VarChar(64)
+
+  /// Our `MfPurchase.id` for a lumpsum, once FP has created it.
+  mfPurchaseId     String? @unique @db.Uuid
+  /// Our `MfPurchasePlan.id` for a SIP, once FP has created it.
+  mfPurchasePlanId String? @unique @db.Uuid
+
+  /// Why FP refused to create this line, in its own words.
+  error String? @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([checkoutId])
+  @@map("cart_checkout_items")
 }

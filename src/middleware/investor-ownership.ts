@@ -99,6 +99,17 @@ export async function ownResource(userId: string, kind: string, id: string): Pro
     for (const purchase of row.purchases) await ownResource(userId, "orderId", purchase.mfPurchaseId);
     return;
   }
+  // Cart rows belong to the user directly, not through a profile.
+  if (kind === "cartItemId") {
+    const row = await db.cartItem.findFirst({ where: { id, userId }, select: ownershipSelect });
+    if (!row) throw HttpError.notFound();
+    return;
+  }
+  if (kind === "checkoutId") {
+    const row = await db.cartCheckout.findFirst({ where: { id, userId }, select: ownershipSelect });
+    if (!row) throw HttpError.notFound();
+    return;
+  }
   if (kind === "formId") {
     const row = await db.kycForm.findFirst({ where: { id, userId }, select: ownershipSelect });
     if (!row) throw HttpError.notFound();
@@ -126,7 +137,7 @@ export const authorizeInputs: RequestHandler = async (req, _res, next) => {
   next();
 };
 export function protectParameters(router: Router): void {
-  for (const kind of ["profileId", "accountId", "bankAccountId", "mandateId", "orderId", "planId", "paymentId", "formId", "preVerificationId"]) {
+  for (const kind of ["profileId", "accountId", "bankAccountId", "mandateId", "orderId", "planId", "paymentId", "formId", "preVerificationId", "cartItemId", "checkoutId"]) {
     router.param(kind, (req: Request, _res, next, id: string) => {
       void ownResource(investorId(req), kind, id).then(() => next(), next);
     });

@@ -530,7 +530,13 @@ function isConsentedInstallment(order: { plan: { state: PlanState } | null }): b
   return order.plan !== null && CONSENTED_PLAN_STATES.includes(order.plan.state);
 }
 
-async function resolvePayableOrders(mfPurchaseIds: string[]) {
+/**
+ * `batch`: the orders were created together by `POST /v2/mf_purchases/batch`
+ * (a cart checkout), which is the one case FP lets a single ONDC payment cover
+ * more than one order. Only the cart service passes it — the public payment
+ * API stays one order per payment.
+ */
+async function resolvePayableOrders(mfPurchaseIds: string[], batch = false) {
   if (mfPurchaseIds.length === 0) throw HttpError.badRequest("No orders given");
   if (mfPurchaseIds.length > 10) {
     throw HttpError.badRequest("At most ten orders can share one payment");
@@ -545,7 +551,10 @@ async function resolvePayableOrders(mfPurchaseIds: string[]) {
   if (legacy) throw HttpError.conflict(LEGACY_GATEWAY_MESSAGE, { orderId: legacy.id, gateway: legacy.gateway, retryable: false });
   if (orders.some(order => !canMoveMoney(order.gateway) || (!order.consentAt && !isConsentedInstallment(order)))) throw HttpError.conflict("Only consented ONDC orders can be paid");
   // This API creates single orders. Batch checkout requires FP batch-order creation.
-  if (orders.length !== 1) throw HttpError.badRequest("Use one order per payment; batch-order creation is not exposed");
+  if (orders.length !== 1 && !batch) throw HttpError.badRequest("Use one order per payment; batch-order creation is not exposed");
+  if (batch && orders.some((order) => order.plan !== null)) {
+    throw HttpError.badRequest("A plan installment cannot share a batch payment");
+  }
   for (const order of orders) await assertInvestmentReady(order.mfInvestmentAccountId, order.folioNumber);
 
   const notPending = orders.filter((order) =>
@@ -607,9 +616,12 @@ async function defaultPayingAccount(mfInvestmentAccountId: string): Promise<stri
  * Collect payment by netbanking or UPI. The investor completes it at
  * `paymentUrl`, and FP confirms the order itself once the money arrives.
  */
-export async function payByNetbanking(input: PayOrdersInput): Promise<PaymentDto> {
+export async function payByNetbanking(
+  input: PayOrdersInput,
+  options: { batch?: boolean } = {},
+): Promise<PaymentDto> {
   requireOndcProvider(input.providerName);
-  const orders = await resolvePayableOrders(input.orderIds);
+  const orders = await resolvePayableOrders(input.orderIds, options.batch ?? false);
   await assertNotAlreadyPaid(input.orderIds);
 
   // The ONDC half of /api/pg requires the debiting account and answers a bare

@@ -72,7 +72,11 @@ const plan = (extra: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   schemes = { [OUT]: open(OUT), [IN]: open(IN) };
-  thresholds = { [`${OUT}:SWP`]: threshold(null), [`${OUT}:STP`]: threshold(null) };
+  thresholds = {
+    [`${OUT}:SWP`]: threshold(null),
+    [`${OUT}:STP`]: threshold(null),
+    [`${IN}:STP`]: threshold(null),
+  };
   payment = null;
   closedAtFp.clear();
 });
@@ -112,6 +116,10 @@ describe("STP target scheme", () => {
   test("an installment below the target's entry minimum is refused", async () => {
     thresholds[`${IN}:SWITCH_IN`] = { amountMin: new Prisma.Decimal("5000") };
     await expect(validatePlan("STP", plan({ switchInIsin: IN }))).rejects.toThrow("at least 5000.00");
+  });
+  test("a target that publishes no STP frequency is refused — FP says only \"frequency: not supported\"", async () => {
+    delete thresholds[`${IN}:STP`];
+    await expect(validatePlan("STP", plan({ switchInIsin: IN }))).rejects.toThrow("transfer plans");
   });
   test("amount and units together are refused", async () => {
     await expect(validatePlan("STP", plan({ switchInIsin: IN, units: "2" }))).rejects.toThrow("not both");

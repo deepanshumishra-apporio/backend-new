@@ -27,8 +27,10 @@ import {
   applySwitchUpdate,
   assertExitBasisSupported,
   pullRedemptionPayout,
+  assertProofFor,
   resolveConsentContact,
   sendConsent,
+  type ConsentContact,
 } from "./order.service.ts";
 import { syncPurchasePlan, syncRedemptionPlan, syncSwitchPlan } from "./fp-sync/index.ts";
 import { assertHoldsScheme, validatePlan } from "./scheme-rules.service.ts";
@@ -121,10 +123,33 @@ export async function refreshPlan(id: string): Promise<PlanDto> {
  * investor has consented.
  */
 export async function confirmPlan(id: string, verificationToken: string): Promise<PlanDto> {
+  const prepared = await preparePlanConfirm(id);
+  if (!prepared) return getPlan(id);
+  const proof = await consumeVerificationToken(verificationToken, `plan:${id}`);
+  assertProofFor(proof, prepared.contact);
+  return sendPlanConfirm(prepared);
+}
+
+/** A reviewed plan, checked and ready for its consent. */
+export interface PlanConfirmation {
+  id: string;
+  fpId: string;
+  kind: "sip" | "swp" | "stp";
+  mfInvestmentAccountId: string;
+  contact: ConsentContact;
+}
+
+/**
+ * Every check that can refuse a plan's confirmation, run before any OTP is
+ * spent. Null when the plan is already past confirmation, so there is nothing
+ * to send. Exported for the cart, which prepares every plan in a checkout
+ * before spending its one code.
+ */
+export async function preparePlanConfirm(id: string): Promise<PlanConfirmation | null> {
   await refreshPlan(id);
   const { row, kind, isin, mandateId, amount } = await resolvePlan(id);
   if (row.state === PlanState.ACTIVE || row.state === PlanState.SUBMITTED || row.state === PlanState.CONFIRMED) {
-    return getPlan(id);
+    return null;
   }
   if (row.state !== PlanState.REVIEW_COMPLETED) {
     throw HttpError.conflict("Wait for the plan review to complete", { state: row.state });
@@ -140,22 +165,21 @@ export async function confirmPlan(id: string, verificationToken: string): Promis
   }
 
   const contact = await resolveConsentContact(row.mfInvestmentAccountId, row.folioNumber);
-  const proof = await consumeVerificationToken(verificationToken, `plan:${id}`);
-  if (proof.purpose !== OtpPurpose.TRANSACTION_APPROVAL) {
-    throw HttpError.badRequest("This verification was not issued for approving a transaction");
-  }
-  if (proof.phone.replace(/\D/g, "") !== `${contact.isdCode}${contact.mobile}`.replace(/\D/g, "")) {
-    throw HttpError.badRequest("The verified number does not match the mobile registered against this folio");
-  }
+  return { id, fpId: row.fpId, kind, mfInvestmentAccountId: row.mfInvestmentAccountId, contact };
+}
+
+/** Send a prepared plan's consent and confirmation; the OTP is already spent. */
+export async function sendPlanConfirm(prepared: PlanConfirmation): Promise<PlanDto> {
+  const { id, fpId, kind, mfInvestmentAccountId, contact } = prepared;
   const confirm = (consent: { email: string; isd_code?: string; mobile?: string }) =>
-    ({ id: row.fpId, state: "confirmed" as const, consent });
+    ({ id: fpId, state: "confirmed" as const, consent });
   try {
     // Same mobile fallback as an order confirm — FP rejects the registered
     // number on some accounts, and a plan stuck unconfirmed is as dead as an
     // order stuck pending.
-    if (kind === "sip") await syncPurchasePlan(await sendConsent(contact, (c) => fpPlans.updatePurchasePlan(confirm(c))), row.mfInvestmentAccountId);
-    else if (kind === "swp") await syncRedemptionPlan(await sendConsent(contact, (c) => fpPlans.updateRedemptionPlan(confirm(c))), row.mfInvestmentAccountId);
-    else await syncSwitchPlan(await sendConsent(contact, (c) => fpPlans.updateSwitchPlan(confirm(c))), row.mfInvestmentAccountId);
+    if (kind === "sip") await syncPurchasePlan(await sendConsent(contact, (c) => fpPlans.updatePurchasePlan(confirm(c))), mfInvestmentAccountId);
+    else if (kind === "swp") await syncRedemptionPlan(await sendConsent(contact, (c) => fpPlans.updateRedemptionPlan(confirm(c))), mfInvestmentAccountId);
+    else await syncSwitchPlan(await sendConsent(contact, (c) => fpPlans.updateSwitchPlan(confirm(c))), mfInvestmentAccountId);
     return getPlan(id);
   } catch (error) { fpErrorToHttpError(error); }
 }

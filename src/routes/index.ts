@@ -4,6 +4,7 @@ import { requireSession, sessionRouter } from "../middleware/investor-auth.ts";
 import { authorizeInputs, protectParameters } from "../middleware/investor-ownership.ts";
 import { investorCommand } from "../middleware/investor-command.ts";
 import { transactionOtpRouter } from "./transaction-otp.routes.ts";
+import { cartRouter } from "./cart.routes.ts";
 import { fpWebhookRouter } from "./fp-webhook.routes.ts";
 import { investorRouter } from "./investor.routes.ts";
 import { kycRouter } from "./kyc.routes.ts";
@@ -37,7 +38,8 @@ for (const router of [investorRouter,
     orderRouter, 
     planRouter, 
     paymentRouter, 
-    portfolioRouter
+    portfolioRouter,
+    cartRouter,
 ]) protectParameters(router);
 
 // The investor journey.
@@ -47,5 +49,6 @@ apiRouter.use("/orders", orderRouter);
 apiRouter.use("/plans", planRouter);
 apiRouter.use("/payments", paymentRouter);
 apiRouter.use("/portfolio", portfolioRouter);
+apiRouter.use("/cart", cartRouter);
 
 // Inbound from FP.
