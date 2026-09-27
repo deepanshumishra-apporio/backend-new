@@ -2654,6 +2654,16 @@ model MfPurchasePlan {
   /// Purchase plans only. No payment is auto-created for that installment.
   generateFirstInstallmentNow Boolean @default(false)
 
+  /// Mirror of the newest live FP skip instruction (the pause), so a list can
+  /// say "paused" without one FP call per SIP — FP rate-limits that burst.
+  /// Written on pause/resume and re-read by the background sync; null = none.
+  pauseFpId     String?   @db.VarChar(64)
+  /// FP's upper-case state: PENDING, ACTIVE, CANCELLATION_REQUESTED.
+  pauseState    String?   @db.VarChar(40)
+  pauseFrom     DateTime? @db.Date
+  pauseTo       DateTime? @db.Date
+  pauseSyncedAt DateTime? @db.Timestamptz(3)
+
   /// Mandate that funds the installments. `paymentSourceRef` is FP's own
   /// reference to the instrument (the mandate's numeric id as a string), kept
   /// verbatim alongside our foreign key.

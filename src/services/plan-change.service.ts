@@ -3,10 +3,10 @@
 //
 // All three are FP instructions against the plan, not edits of it — a skip
 // instruction and a modification instruction — and FP carries them out on its
-// own time. Nothing here is mirrored in our tables: the plan row changes only
-// when FP says so (a completed amount change is picked up by `refreshPlan`),
-// and the pause in force is read from FP each time, so there is no copy of it
-// to go stale.
+// own time. The plan row changes only when FP says so (a completed amount
+// change is picked up by `refreshPlan`). The pause is read from FP wherever it
+// decides anything; the plan row keeps a copy (`pause*` columns) only so a
+// list can show "paused" without one FP call per SIP — see `recordPause`.
 //
 // Everything checks the plan against a state just re-read from FP, as
 // `cancelPlan` does, so a refusal is in our words rather than the gateway's.
@@ -23,6 +23,8 @@ import { resolveConsentContact, sendConsent } from "./order.service.ts";
 import { asFrequency, refreshPlan, resolveMandate } from "./plan.service.ts";
 import { validatePlan } from "./scheme-rules.service.ts";
 import type {
+  PlanDto,
+  PlanPauseSummaryDto,
   PlanAmountChangeDto,
   PlanPauseDto,
   PlanPauseOptionDto,
@@ -134,6 +136,64 @@ async function livePause(fpId: string): Promise<FpPlanSkipInstruction | null> {
 }
 
 /**
+ * Keep the plan row's copy of its live pause in step with FP.
+ *
+ * The pause is FP's; this copy exists only so a list of SIPs can say "paused"
+ * without one FP call per SIP, which FP rate-limits. Every path that learns
+ * the pause — pausing, resuming, the pause sheet, the background sync —
+ * writes what it learned here.
+ */
+async function recordPause(fpId: string, skip: FpPlanSkipInstruction | null): Promise<void> {
+  await db.mfPurchasePlan.updateMany({
+    where: { fpId },
+    data: {
+      pauseFpId: skip?.id ?? null,
+      pauseState: skip ? skip.state.toUpperCase() : null,
+      pauseFrom: skip?.from_date ? new Date(`${skip.from_date}T00:00:00Z`) : null,
+      pauseTo: skip?.to_date ? new Date(`${skip.to_date}T00:00:00Z`) : null,
+      pauseSyncedAt: new Date(),
+    },
+  });
+}
+
+/** Re-read one SIP's pause from FP and store it. Used by the background sync. */
+export async function refreshPause(fpId: string): Promise<void> {
+  await recordPause(fpId, await livePause(fpId));
+}
+
+/**
+ * Mark each active SIP in a list with the pause in force on it, from the
+ * stored copy — no FP call. A pause whose last skipped date has passed is
+ * over, whatever the copy last said.
+ */
+export async function withPauses(plans: PlanDto[]): Promise<PlanDto[]> {
+  const ids = plans.filter((plan) => plan.type === "SIP" && plan.state === PlanState.ACTIVE).map((plan) => plan.id);
+  if (ids.length === 0) return plans;
+  const rows = await db.mfPurchasePlan.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, frequency: true, pauseState: true, pauseFrom: true, pauseTo: true },
+  });
+  const today = isoDate(new Date());
+  const pauses = new Map<string, PlanPauseSummaryDto | null>();
+  for (const row of rows) {
+    const to = row.pauseTo ? isoDate(row.pauseTo) : null;
+    const live = row.pauseState && row.pauseFrom && LIVE_PAUSE.includes(row.pauseState) && (!to || to >= today);
+    const step = STEP[row.frequency];
+    pauses.set(
+      row.id,
+      live
+        ? {
+            state: row.pauseState!,
+            from: isoDate(row.pauseFrom!),
+            to,
+            resumesOn: to && step ? isoDate(addSteps(new Date(`${to}T00:00:00Z`), step, 1)) : null,
+          }
+        : null,
+    );
+  }
+  return plans.map((plan) => (pauses.has(plan.id) ? { ...plan, pause: pauses.get(plan.id)! } : plan));
+}
+/**
  * The pause in force and the lengths still open to the investor.
  *
  * Each option starts at the next installment and is dated here, once, so the
@@ -144,6 +204,7 @@ export async function getSipPause(id: string): Promise<PlanPauseStatusDto> {
   const row = await requireSip(id);
   try {
     const current = await livePause(row.fpId);
+    await recordPause(row.fpId, current);
     const pause = current ? toPauseDto(current, row.frequency) : null;
     const closed = (reason: string): PlanPauseStatusDto => ({ pause, options: [], unavailableReason: reason });
 
@@ -185,6 +246,7 @@ export async function pauseSip(id: string, installments: number): Promise<PlanPa
   const row = await requireSip(id);
   try {
     const skip = await fpPlans.createPurchasePlanSkip(row.fpId, { from: option.from, to: option.to });
+    await recordPause(row.fpId, skip);
     await notifyPlanChange(id, {
       key: `pause:${skip.id}`,
       title: "SIP paused",
@@ -212,6 +274,7 @@ export async function resumeSip(id: string): Promise<PlanPauseDto> {
     if (!current) throw HttpError.conflict("This SIP is not paused");
     if (current.state.toUpperCase() === "CANCELLATION_REQUESTED") return toPauseDto(current, row.frequency);
     const cancelled = await fpPlans.cancelPurchasePlanSkip(current.id);
+    await recordPause(row.fpId, cancelled);
     await notifyPlanChange(id, {
       key: `resume:${current.id}`,
       title: "SIP resume requested",

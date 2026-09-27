@@ -22,6 +22,7 @@ import {
 } from "./fp-sync/index.ts";
 import { applyPurchaseUpdate, applyRedemptionUpdate, applySwitchUpdate, pullRedemptionPayout } from "./order.service.ts";
 import { debitInstallment } from "./payment.service.ts";
+import { refreshPause } from "./plan-change.service.ts";
 
 /** Paid and handed to the gateway, but not yet decided. */
 const IN_FLIGHT = [MfOrderState.CONFIRMED, MfOrderState.SUBMITTED];
@@ -216,6 +217,9 @@ export async function collectSipInstallments(limit = 10): Promise<InstallmentCol
     result.plans++;
     try {
       await syncPurchasePlan(await fpPlans.fetchPurchasePlan(plan.fpId), plan.mfInvestmentAccountId);
+      // Keep the list's copy of the pause current; a failure here is only a
+      // stale "paused" label, never a reason to skip collecting.
+      await refreshPause(plan.fpId).catch(() => undefined);
       for (const installment of await fpOrders.listPurchases({ plan: plan.fpId })) {
         result.installmentsSeen++;
         await applyPurchaseUpdate(installment, plan.mfInvestmentAccountId);

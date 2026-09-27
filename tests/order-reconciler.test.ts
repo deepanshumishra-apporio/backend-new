@@ -88,6 +88,10 @@ mock.module("../src/services/order.service.ts", () => ({
 mock.module("../src/services/payment.service.ts", () => ({
   debitInstallment: async (id: string) => { debited.push(id); return "debited"; },
 }));
+// The collector refreshes each SIP's stored pause; that is not under test here.
+mock.module("../src/services/plan-change.service.ts", () => ({
+  refreshPause: async () => undefined,
+}));
 
 const { collectExitPlanInstallments, collectSipInstallments, reconcileExits, reconcileInFlightPurchases, reconcileOpenPayments } = await import("../src/services/order-reconciler.service.ts");
 

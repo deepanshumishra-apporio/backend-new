@@ -139,4 +139,31 @@ export interface PlanDto {
   createdAt: string;
   activatedAt: string | null;
   cancelledAt: string | null;
+  /** A SIP's most recent installment, so a list can say it failed. Absent on SWP/STP. */
+  lastInstallment?: PlanLastInstallmentDto | null;
+  /** The pause in force on an active SIP (null: none). Absent on anything else. */
+  pause?: PlanPauseSummaryDto | null;
+}
+
+/** A pause as a list shows it: the dates, not the counters. */
+export interface PlanPauseSummaryDto {
+  state: string;
+  from: string;
+  to: string | null;
+  resumesOn: string | null;
+}
+
+/** How a SIP's latest installment went, and — when it failed — why. */
+export interface PlanLastInstallmentDto {
+  id: string;
+  state: string;
+  /** The installment's date: when it was scheduled, else when FP raised it. */
+  date: string;
+  amount: string;
+  failureCode: string | null;
+  failureReason: string | null;
+  /** True when the money never moved: the debit or payment itself failed. */
+  paymentFailed: boolean;
+  /** The payment provider's own words for that failure. */
+  paymentFailureReason: string | null;
 }

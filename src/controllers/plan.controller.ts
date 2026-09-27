@@ -152,7 +152,7 @@ export async function listPlans(req: Request, res: Response) {
   if (typeof accountId !== "string") {
     throw HttpError.badRequest("mfInvestmentAccountId is required");
   }
-  res.json({ data: await planService.listPlans(accountId) });
+  res.json({ data: await planChangeService.withPauses(await planService.listPlans(accountId)) });
 }
 
 export async function cancelPlan(req: Request<PlanParams>, res: Response) {

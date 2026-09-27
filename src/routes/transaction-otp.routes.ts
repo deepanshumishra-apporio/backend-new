@@ -7,6 +7,7 @@ import { resolveConsentContact } from "../services/order.service.ts";
 import { requestOtp, verifyOtp, otpLength } from "../services/otp.service.ts";
 import { asBody, oneOf, requiredString } from "../utils/validate.ts";
 import { HttpError } from "../utils/http-error.ts";
+import { isOndcRoute } from "../utils/gateway.ts";
 
 /** Who the code goes to, and what it may be spent on. */
 async function consentScope(
@@ -37,6 +38,13 @@ async function consentScope(
   const row = rows.find(Boolean);
   if (kind === "planChange") {
     if (!row || row.state !== "ACTIVE") throw HttpError.conflict("Only an active plan can be changed");
+    // The change itself only runs on an ONDC SIP (plan-change.service
+    // `requireSip`). Refuse anything else here, before a code is sent that
+    // could never be spent.
+    const sip = rows[0] ? await db.mfPurchasePlan.findUnique({ where: { id }, select: { gateway: true } }) : null;
+    if (!sip || !isOndcRoute(sip.gateway)) {
+      throw HttpError.conflict("This plan's amount can't be changed in the app. Start a new SIP at the amount you want instead.");
+    }
   } else if (!row || !["PENDING", "REVIEW_COMPLETED"].includes(row.state)) {
     throw HttpError.conflict("Wait for provider review before collecting transaction consent");
   }

@@ -42,6 +42,7 @@ import {
 } from "./sip-validation.ts";
 import type {
   PlanDto,
+  PlanLastInstallmentDto,
   PlanMandateDto,
   CreateSipInput,
   CreateStpInput,
@@ -813,9 +814,58 @@ export async function listPlans(mfInvestmentAccountId: string): Promise<PlanDto[
     db.mfSwitchPlan.findMany({ where, select: stpSelect, orderBy, take }),
   ]);
 
+  const latest = await latestInstallments(sips.map((sip) => sip.id));
   return [
-    ...sips.map(toSipDto),
+    ...sips.map((sip) => ({ ...toSipDto(sip), lastInstallment: latest.get(sip.id) ?? null })),
     ...swps.map(toSwpDto),
     ...stps.map(toStpDto),
   ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+/**
+ * Each SIP's newest installment, with the payment behind it — one query.
+ *
+ * An installment that failed on the money ("the AutoPay debit was refused")
+ * reads very differently to the investor from one the AMC rejected, so the
+ * newest payment's verdict travels with it.
+ */
+async function latestInstallments(planIds: string[]): Promise<Map<string, PlanLastInstallmentDto>> {
+  const latest = new Map<string, PlanLastInstallmentDto>();
+  if (planIds.length === 0) return latest;
+  const rows = await db.mfPurchase.findMany({
+    where: { planId: { in: planIds } },
+    orderBy: [{ fpCreatedAt: "desc" }, { createdAt: "desc" }],
+    select: {
+      id: true,
+      planId: true,
+      state: true,
+      amount: true,
+      scheduledOn: true,
+      fpCreatedAt: true,
+      createdAt: true,
+      failureCode: true,
+      failureReason: true,
+      payments: {
+        orderBy: { createdAt: "desc" },
+        take: 1,
+        select: { payment: { select: { status: true, failedReason: true } } },
+      },
+    },
+  });
+  for (const row of rows) {
+    if (!row.planId || latest.has(row.planId)) continue;
+    const payment = row.payments[0]?.payment ?? null;
+    const paymentFailed = payment !== null && ["FAILED", "REJECTED"].includes(payment.status);
+    latest.set(row.planId, {
+      id: row.id,
+      state: row.state,
+      date: (row.scheduledOn ?? row.fpCreatedAt ?? row.createdAt).toISOString().slice(0, 10),
+      amount: asAmount(row.amount) ?? "0",
+      failureCode: row.failureCode,
+      failureReason: row.failureReason,
+      paymentFailed,
+      paymentFailureReason: paymentFailed ? payment.failedReason : null,
+    });
+  }
+  return latest;
 }
