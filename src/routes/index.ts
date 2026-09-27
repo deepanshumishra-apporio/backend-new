@@ -5,6 +5,8 @@ import { authorizeInputs, protectParameters } from "../middleware/investor-owner
 import { investorCommand } from "../middleware/investor-command.ts";
 import { transactionOtpRouter } from "./transaction-otp.routes.ts";
 import { cartRouter } from "./cart.routes.ts";
+import { notificationRouter } from "./notification.routes.ts";
+import { marketRouter } from "./market.routes.ts";
 import { fpWebhookRouter } from "./fp-webhook.routes.ts";
 import { investorRouter } from "./investor.routes.ts";
 import { kycRouter } from "./kyc.routes.ts";
@@ -21,6 +23,7 @@ export const apiRouter = Router();
 
 // Catalogue and OTP need no investor context.
 apiRouter.use("/schemes", schemeRouter);
+apiRouter.use("/market", marketRouter);
 apiRouter.use("/otp", otpRouter);
 apiRouter.use("/sessions", sessionRouter);
 apiRouter.use("/webhooks/fp", fpWebhookRouter);
@@ -40,6 +43,7 @@ for (const router of [investorRouter,
     paymentRouter, 
     portfolioRouter,
     cartRouter,
+    notificationRouter,
 ]) protectParameters(router);
 
 // The investor journey.
@@ -50,5 +54,6 @@ apiRouter.use("/plans", planRouter);
 apiRouter.use("/payments", paymentRouter);
 apiRouter.use("/portfolio", portfolioRouter);
 apiRouter.use("/cart", cartRouter);
+apiRouter.use("/notifications", notificationRouter);
 
 // Inbound from FP.

@@ -105,6 +105,11 @@ export async function ownResource(userId: string, kind: string, id: string): Pro
     if (!row) throw HttpError.notFound();
     return;
   }
+  if (kind === "notificationId") {
+    const row = await db.notification.findFirst({ where: { id, userId }, select: ownershipSelect });
+    if (!row) throw HttpError.notFound();
+    return;
+  }
   if (kind === "checkoutId") {
     const row = await db.cartCheckout.findFirst({ where: { id, userId }, select: ownershipSelect });
     if (!row) throw HttpError.notFound();
@@ -137,7 +142,7 @@ export const authorizeInputs: RequestHandler = async (req, _res, next) => {
   next();
 };
 export function protectParameters(router: Router): void {
-  for (const kind of ["profileId", "accountId", "bankAccountId", "mandateId", "orderId", "planId", "paymentId", "formId", "preVerificationId", "cartItemId", "checkoutId"]) {
+  for (const kind of ["profileId", "accountId", "bankAccountId", "mandateId", "orderId", "planId", "paymentId", "formId", "preVerificationId", "cartItemId", "checkoutId", "notificationId"]) {
     router.param(kind, (req: Request, _res, next, id: string) => {
       void ownResource(investorId(req), kind, id).then(() => next(), next);
     });

@@ -12,7 +12,9 @@
 //   - re-read payments FP has not settled, so a funded order never shows its
 //     payment as pending after it has been allotted;
 //   - keep the catalogue's capability flags current, so a fund the AMC has
-//     closed drops out of the fund list instead of failing at order time.
+//     closed drops out of the fund list instead of failing at order time;
+//   - twice a day, top up the last ten days of NAVs from AMFI;
+//   - keep the market holiday calendar, and announce a holiday the day before.
 //
 // One tick at a time: a tick that outlives the interval makes the next one
 // wait instead of overlapping it, so a slow FP never piles up concurrent sweeps.
@@ -25,6 +27,8 @@ import {
 } from "./order-reconciler.service.ts";
 import { processPending } from "./fp-webhook.service.ts";
 import { refreshCatalogueFlags } from "./scheme-availability.service.ts";
+import { refreshRecentNavs } from "./nav-import.service.ts";
+import { runMarketCalendarJobs } from "./market.service.ts";
 
 const DEFAULT_INTERVAL_MS = 30_000;
 
@@ -54,6 +58,17 @@ async function tick(): Promise<void> {
     const exits = await reconcileExits();
     const payments = await reconcileOpenPayments();
     const catalogue = await refreshCatalogueFlags();
+    // AMFI being slow or down must never hold up the money sweeps above.
+    const navs = await refreshRecentNavs().catch((error: unknown) => {
+      console.warn("[jobs] NAV refresh failed:", error instanceof Error ? error.message : error);
+      return null;
+    });
+    if (navs) console.log(`[jobs] NAVs refreshed: ${navs.matched}/${navs.schemes} schemes, ${navs.points} points`);
+    const market = await runMarketCalendarJobs().catch((error: unknown) => {
+      console.warn("[jobs] market calendar failed:", error instanceof Error ? error.message : error);
+      return null;
+    });
+    if (market?.notified) console.log(`[jobs] market holiday announced to ${market.notified} investors`);
     if (orders.checked > 0 || exits.checked > 0 || sips.plans > 0 || exitPlans.plans > 0 || payments.checked > 0 || catalogue.checked > 0 || webhooks.processed > 0 || webhooks.failed > 0) {
       console.log(
         `[jobs] webhooks processed=${webhooks.processed} failed=${webhooks.failed}; ` +

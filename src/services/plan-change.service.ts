@@ -10,6 +10,7 @@
 //
 // Everything checks the plan against a state just re-read from FP, as
 // `cancelPlan` does, so a refusal is in our words rather than the gateway's.
+import { notifyPlanChange } from "./notification.service.ts";
 import { OtpPurpose, PlanState, SchemeThresholdType } from "../../generated/prisma/enums.ts";
 import { Prisma } from "../../generated/prisma/client.ts";
 import { db } from "../db/client.ts";
@@ -184,6 +185,11 @@ export async function pauseSip(id: string, installments: number): Promise<PlanPa
   const row = await requireSip(id);
   try {
     const skip = await fpPlans.createPurchasePlanSkip(row.fpId, { from: option.from, to: option.to });
+    await notifyPlanChange(id, {
+      key: `pause:${skip.id}`,
+      title: "SIP paused",
+      body: `${installments} instalment${installments === 1 ? "" : "s"} will be skipped (${shortDate(option.from)} – ${shortDate(option.to)}). It resumes on ${shortDate(option.resumesOn)}.`,
+    });
     return toPauseDto(skip, row.frequency);
   } catch (error) {
     fpErrorToHttpError(error);
@@ -205,7 +211,13 @@ export async function resumeSip(id: string): Promise<PlanPauseDto> {
     const current = await livePause(row.fpId);
     if (!current) throw HttpError.conflict("This SIP is not paused");
     if (current.state.toUpperCase() === "CANCELLATION_REQUESTED") return toPauseDto(current, row.frequency);
-    return toPauseDto(await fpPlans.cancelPurchasePlanSkip(current.id), row.frequency);
+    const cancelled = await fpPlans.cancelPurchasePlanSkip(current.id);
+    await notifyPlanChange(id, {
+      key: `resume:${current.id}`,
+      title: "SIP resume requested",
+      body: "We asked the fund house to end your pause early. Your instalments restart once it confirms.",
+    });
+    return toPauseDto(cancelled, row.frequency);
   } catch (error) {
     if (error instanceof HttpError) throw error;
     fpErrorToHttpError(error);
@@ -265,6 +277,11 @@ export async function changeSipAmount(
     const change = await sendConsent(contact, (consent) =>
       fpPlans.createPlanAmountChange({ plan: row.fpId, amount: next.toNumber(), consent }),
     );
+    await notifyPlanChange(id, {
+      key: `amount:${change.id}:requested`,
+      title: "SIP change requested",
+      body: `Your SIP amount is changing from ${rupees(row.amount)} to ${rupees(next)}. We'll tell you once it applies.`,
+    });
     return toAmountChangeDto(change);
   } catch (error) {
     fpErrorToHttpError(error);
@@ -283,10 +300,31 @@ export async function getSipAmountChange(id: string, changeId: string): Promise<
   try {
     const change = await fpPlans.fetchPlanModification(changeId);
     if (change.plan !== row.fpId) throw HttpError.notFound("No such change on this SIP");
-    if (change.state === "completed") await refreshPlan(id);
+    if (change.state === "completed") {
+      await refreshPlan(id);
+      await notifyPlanChange(id, {
+        key: `amount:${change.id}:completed`,
+        title: "SIP amount changed",
+        body: `Your SIP is now ${rupees(change.amount?.to ?? null)} per instalment, from the next one.`,
+      });
+    } else if (change.state === "failed") {
+      await notifyPlanChange(id, {
+        key: `amount:${change.id}:failed`,
+        category: "ACTION",
+        title: "SIP change not applied",
+        body: `Your SIP amount could not be changed; it stays ${rupees(change.amount?.from ?? null)}. ${change.failure_reason ?? ""}`.trim(),
+      });
+    }
     return toAmountChangeDto(change);
   } catch (error) {
     if (error instanceof HttpError) throw error;
     fpErrorToHttpError(error);
   }
 }
+
+const rupees = (value: Prisma.Decimal | string | number | null) =>
+  value == null ? "the old amount" : `₹${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+
+/** "5 Nov" — a plan date as a notification writes it. */
+const shortDate = (iso: string) =>
+  new Date(`${iso.slice(0, 10)}T00:00:00Z`).toLocaleDateString("en-IN", { day: "numeric", month: "short", timeZone: "UTC" });

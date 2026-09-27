@@ -7,6 +7,13 @@
 //
 // These take an already-resolved local investment account id rather than
 // looking it up, so the caller controls the transaction boundary.
+import {
+  afterSync,
+  notifyPlan,
+  notifyPurchase,
+  notifyRedemption,
+  notifySwitch,
+} from "../notification.service.ts";
 import { db } from "../../db/client.ts";
 import {
   MfOrderState,
@@ -139,7 +146,7 @@ async function resolvePlanId(
   return plan?.id ?? null;
 }
 
-export async function syncPurchase(
+async function mirrorPurchase(
   order: FpPurchase,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
@@ -177,7 +184,7 @@ export async function syncPurchase(
   });
 }
 
-export async function syncRedemption(
+async function mirrorRedemption(
   order: FpRedemption,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
@@ -222,7 +229,7 @@ export async function syncRedemption(
   });
 }
 
-export async function syncSwitch(
+async function mirrorSwitch(
   order: FpSwitch,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
@@ -309,7 +316,7 @@ function planCommon(plan: FpPurchasePlan | FpRedemptionPlan | FpSwitchPlan) {
   };
 }
 
-export async function syncPurchasePlan(
+async function mirrorPurchasePlan(
   plan: FpPurchasePlan,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
@@ -344,7 +351,7 @@ export async function syncPurchasePlan(
   });
 }
 
-export async function syncRedemptionPlan(
+async function mirrorRedemptionPlan(
   plan: FpRedemptionPlan,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
@@ -368,7 +375,7 @@ export async function syncRedemptionPlan(
   });
 }
 
-export async function syncSwitchPlan(
+async function mirrorSwitchPlan(
   plan: FpSwitchPlan,
   mfInvestmentAccountId: string,
 ): Promise<{ id: string }> {
@@ -391,6 +398,67 @@ export async function syncSwitchPlan(
     create: { fpId: plan.id, ...data },
     select: { id: true },
   });
+}
+
+
+/** Mirror the order, then raise whatever the investor should hear about its new state. */
+export async function syncPurchase(
+  order: FpPurchase,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const row = await mirrorPurchase(order, mfInvestmentAccountId);
+  await afterSync(() => notifyPurchase(row.id));
+  return row;
+}
+
+/** Mirror the order, then raise whatever the investor should hear about its new state. */
+export async function syncRedemption(
+  order: FpRedemption,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const row = await mirrorRedemption(order, mfInvestmentAccountId);
+  await afterSync(() => notifyRedemption(row.id));
+  return row;
+}
+
+/** Mirror the order, then raise whatever the investor should hear about its new state. */
+export async function syncSwitch(
+  order: FpSwitch,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const row = await mirrorSwitch(order, mfInvestmentAccountId);
+  await afterSync(() => notifySwitch(row.id));
+  return row;
+}
+
+/** Mirror the plan, then raise whatever the investor should hear about its new state. */
+export async function syncPurchasePlan(
+  plan: FpPurchasePlan,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const row = await mirrorPurchasePlan(plan, mfInvestmentAccountId);
+  await afterSync(() => notifyPlan("sip", row.id));
+  return row;
+}
+
+/** Mirror the plan, then raise whatever the investor should hear about its new state. */
+export async function syncRedemptionPlan(
+  plan: FpRedemptionPlan,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const row = await mirrorRedemptionPlan(plan, mfInvestmentAccountId);
+  await afterSync(() => notifyPlan("swp", row.id));
+  return row;
+}
+
+/** Mirror the plan, then raise whatever the investor should hear about its new state. */
+export async function syncSwitchPlan(
+  plan: FpSwitchPlan,
+  mfInvestmentAccountId: string,
+): Promise<{ id: string }> {
+  const row = await mirrorSwitchPlan(plan, mfInvestmentAccountId);
+  await afterSync(() => notifyPlan("stp", row.id));
+  return row;
 }
 
 // ---------------------------------------------------------------------------

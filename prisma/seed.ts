@@ -103,6 +103,18 @@ async function main() {
   const snapshot = await loadSnapshot();
   console.log(`[seed] catalogue snapshot from ${snapshot.source}, captured ${snapshot.capturedAt}`);
 
+  // --- Market holidays -------------------------------------------------------
+  // NSE's MF-segment list, committed so the seed runs offline. The server's
+  // background loop refreshes it from NSE weekly.
+  const calendar = JSON.parse(
+    await Bun.file(new URL("./seed-data/market-holidays.json", import.meta.url)).text(),
+  ) as { holidays: { date: string; name: string }[] };
+  for (const holiday of calendar.holidays) {
+    const date = new Date(`${holiday.date}T00:00:00Z`);
+    await db.marketHoliday.upsert({ where: { date }, create: { date, name: holiday.name }, update: { name: holiday.name } });
+  }
+  console.log(`[seed] market holidays ready: ${calendar.holidays.length}`);
+
   // --- AMCs ----------------------------------------------------------------
   const amcIdByFpId = new Map<number, string>();
   for (const amc of snapshot.amcs) {
@@ -128,8 +140,15 @@ async function main() {
     const amcId = scheme.fpAmcId === null ? undefined : amcIdByFpId.get(scheme.fpAmcId);
     if (!amcId) throw new Error(`${scheme.isin}: no seeded AMC for fpAmcId ${scheme.fpAmcId}`);
 
+    // Real NAVs arrive from AMFI (`bun run nav:import`). Once a scheme has any
+    // history, the synthetic series must not come back: it would overwrite the
+    // latest NAV with a made-up anchor and wedge fake points between real ones.
+    const existing = await db.mfScheme.findUnique({
+      where: { isin: scheme.isin },
+      select: { _count: { select: { navHistory: true } } },
+    });
     const anchor = NAV_ANCHORS[scheme.isin];
-    const series = anchor === undefined ? [] : navSeries(anchor, NAV_DAYS);
+    const series = anchor === undefined || (existing?._count.navHistory ?? 0) > 0 ? [] : navSeries(anchor, NAV_DAYS);
     const latest = series.at(-1);
 
     const columns = {

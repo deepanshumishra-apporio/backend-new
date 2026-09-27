@@ -2,6 +2,7 @@
 //
 // These come from FP's /api/pg gateway, which identifies everything by integer
 // and shouts its enum values. `fpId` here is therefore an Int, not a String.
+import { afterSync, notifyPayment } from "../notification.service.ts";
 import { db } from "../../db/client.ts";
 import {
   MandateStatus,
@@ -150,5 +151,6 @@ export async function syncPayment(payment: FpPayment): Promise<{ id: string }> {
     }),
   ]);
 
+  await afterSync(() => notifyPayment(row.id));
   return row;
 }

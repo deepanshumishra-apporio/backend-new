@@ -104,7 +104,9 @@ sessionRouter.post('/sandbox', async (req, res) => {
     const existing = byPhone;
     if (existing && (existing.deletedAt || existing.role !== 'INVESTOR' ||
         !['ACTIVE', 'PENDING_VERIFICATION'].includes(existing.status)))
-      throw new HttpError(403, 'ACCOUNT_UNAVAILABLE', 'This account cannot sign in. Contact support.');
+      throw existing.status === 'SUSPENDED'
+        ? new HttpError(403, 'ACCOUNT_FROZEN', 'This account is frozen. Contact support to unfreeze it.')
+        : new HttpError(403, 'ACCOUNT_UNAVAILABLE', 'This account cannot sign in. Contact support.');
     const account = await tx.user.upsert({
       where: { phone },
       create: { phone, email, status: 'ACTIVE' },
@@ -137,6 +139,9 @@ sessionRouter.post("/", async (req, res) => {
       create: { phone: proof.phone, status: "ACTIVE", phoneVerifiedAt: now },
       update: { lastLoginAt: now, phoneVerifiedAt: now },
     });
+    // A frozen account says so: the investor froze it themselves, and a bare
+    // 401 would read as a wrong code rather than "contact support to unfreeze".
+    if (user.status === "SUSPENDED") throw new HttpError(403, "ACCOUNT_FROZEN", "This account is frozen. Contact support to unfreeze it.");
     if (user.deletedAt || !["ACTIVE", "PENDING_VERIFICATION"].includes(user.status) || user.role !== "INVESTOR") throw unauthorized();
     await tx.user.update({ where: { id: user.id }, data: { status: "ACTIVE", lastLoginAt: now } });
     await tx.investorSession.create({ data: { userId: user.id, tokenHash: tokenHash(accessToken), expiresAt } });
@@ -147,5 +152,27 @@ sessionRouter.post("/", async (req, res) => {
 });
 sessionRouter.delete("/current", requireSession, async (_req, res) => {
   await db.investorSession.update({ where: { id: res.locals["sessionId"] }, data: { revokedAt: new Date() } });
+  res.status(204).end();
+});
+// "Log out of all devices": every live session of this investor, this one too.
+sessionRouter.delete("/all", requireSession, async (_req, res) => {
+  await db.investorSession.updateMany({
+    where: { userId: res.locals["investorUserId"], revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+  res.status(204).end();
+});
+// "Freeze account": the investor suspects someone else is in. Suspending the
+// user stops every sign-in (see POST /sessions) and revoking the sessions ends
+// the ones already open, so nothing more can be placed from any device.
+// Unfreezing is support's call, after they have verified the investor.
+sessionRouter.post("/freeze", requireSession, async (_req, res) => {
+  const userId = res.locals["investorUserId"] as string;
+  const now = new Date();
+  await db.$transaction([
+    db.user.update({ where: { id: userId }, data: { status: "SUSPENDED" } }),
+    db.investorSession.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: now } }),
+    db.auditLog.create({ data: { actorId: userId, actorRole: "INVESTOR", action: "ACCOUNT_FROZEN", entityType: "user", entityId: userId } }),
+  ]);
   res.status(204).end();
 });

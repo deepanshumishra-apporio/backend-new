@@ -862,6 +862,7 @@ model User {
   watchlist          WatchlistItem[]
   cartItems          CartItem[]
   cartCheckouts      CartCheckout[]
+  notifications      Notification[]
   auditLogs          AuditLog[]
 
   @@index([status])
@@ -3350,4 +3351,70 @@ model CartCheckoutItem {
 
   @@index([checkoutId])
   @@map("cart_checkout_items")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications — our own table
+// ---------------------------------------------------------------------------
+
+/// The pill a notification carries in the list.
+enum NotificationCategory {
+  /// A one-time order, redemption or switch.
+  ORDER
+  /// A SIP, SWP or STP — and each instalment it generates.
+  PLAN
+  PAYMENT
+  /// Something went wrong, or is waiting on the investor.
+  ACTION
+  ACCOUNT
+  /// A market holiday, or anything else about when orders are processed.
+  MARKET
+}
+
+/// Something the investor should see about their money, raised when an order,
+/// plan or payment reaches a state that matters to them.
+model Notification {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  category NotificationCategory
+  title    String               @db.VarChar(160)
+  body     String               @db.VarChar(500)
+
+  /// Where tapping it goes: `order` or `plan`, and our id for it.
+  targetType String? @db.VarChar(20)
+  targetId   String? @db.Uuid
+
+  /// One notification per event: `order:<id>:successful`. A re-sync of the
+  /// same state, from a webhook, a refresh or the reconciler, raises nothing.
+  dedupeKey String @db.VarChar(160)
+
+  readAt    DateTime? @db.Timestamptz(3)
+  /// When the event happened, not when we noticed it.
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Market calendar — our own table
+// ---------------------------------------------------------------------------
+
+/// A day the exchanges are shut for mutual fund business (NSE's "MF" segment
+/// holiday list). Weekends are not stored; the code knows them. An order placed
+/// on one of these days is processed at the next business day's NAV.
+model MarketHoliday {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  date DateTime @unique @db.Date
+  name String   @db.VarChar(120)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("market_holidays")
 }
