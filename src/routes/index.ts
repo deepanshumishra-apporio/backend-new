@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { adminRouter } from "./admin.routes.ts";
 import { investorWorkspaceRouter } from "./investor-workspace.routes.ts";
 import { requireSession, sessionRouter } from "../middleware/investor-auth.ts";
 import { authorizeInputs, protectParameters } from "../middleware/investor-ownership.ts";
@@ -6,6 +7,8 @@ import { investorCommand } from "../middleware/investor-command.ts";
 import { transactionOtpRouter } from "./transaction-otp.routes.ts";
 import { cartRouter } from "./cart.routes.ts";
 import { notificationRouter } from "./notification.routes.ts";
+import { supportRouter } from "./support.routes.ts";
+import { announcementRouter } from "./announcement.routes.ts";
 import { marketRouter } from "./market.routes.ts";
 import { fpWebhookRouter } from "./fp-webhook.routes.ts";
 import { investorRouter } from "./investor.routes.ts";
@@ -30,6 +33,9 @@ apiRouter.use("/webhooks/fp", fpWebhookRouter);
 // FP's `payment_postback_url`. Mounted before the session gate because the
 // investor's browser arrives here from the payment page, not from the app.
 apiRouter.use("/payments/return", paymentReturnRouter);
+// The admin portal has its own staff sessions; the investor gate below must
+// never see these requests.
+apiRouter.use("/admin", adminRouter);
 
 apiRouter.use(requireSession, authorizeInputs, investorCommand);
 apiRouter.use(investorWorkspaceRouter);
@@ -44,6 +50,8 @@ for (const router of [investorRouter,
     portfolioRouter,
     cartRouter,
     notificationRouter,
+    supportRouter,
+    announcementRouter,
 ]) protectParameters(router);
 
 // The investor journey.
@@ -55,5 +63,7 @@ apiRouter.use("/payments", paymentRouter);
 apiRouter.use("/portfolio", portfolioRouter);
 apiRouter.use("/cart", cartRouter);
 apiRouter.use("/notifications", notificationRouter);
+apiRouter.use("/support", supportRouter);
+apiRouter.use("/announcements", announcementRouter);
 
 // Inbound from FP.

@@ -54,14 +54,14 @@ interface IdentityCheck extends Timestamps {
   dateOfBirthStatus: string | null;
 }
 
-function identityCheckPassed(check: IdentityCheck | null): boolean {
+function identityCheckPassed(check: IdentityCheck | null, requireFresh = true): boolean {
   return Boolean(
     check &&
       check.readinessStatus === VERIFIED &&
       check.panStatus === VERIFIED &&
       check.nameStatus === VERIFIED &&
       check.dateOfBirthStatus === VERIFIED &&
-      isFresh(check),
+      (!requireFresh || isFresh(check)),
   );
 }
 
@@ -117,8 +117,17 @@ export async function bankIsVerified(bankAccountId: string): Promise<boolean> {
  * to the user and not yet to a profile, and ignoring them would make the
  * recommended sequence the one sequence that cannot transact.
  */
-export async function identityIsVerified(investorProfileId: string, pan: string | null): Promise<boolean> {
-  if (!pan) return false;
+export async function identityIsVerified(
+  investorProfileId: string,
+  pan: string | null,
+  requireFresh = true,
+): Promise<boolean> {
+  return identityCheckPassed(await latestIdentityCheck(investorProfileId, pan), requireFresh);
+}
+
+/** The newest identity verdict for this profile's PAN, or null when there is none. */
+async function latestIdentityCheck(investorProfileId: string, pan: string | null) {
+  if (!pan) return null;
   const owner = await db.userInvestorProfile.findFirst({
     where: { investorProfileId, relationship: "SELF" },
     select: { userId: true },
@@ -142,7 +151,7 @@ export async function identityIsVerified(investorProfileId: string, pan: string 
     },
     orderBy: { fpCreatedAt: "desc" },
   });
-  return identityCheckPassed(check);
+  return check;
 }
 
 export interface InvestmentReadiness {
@@ -168,9 +177,13 @@ export async function investmentReadiness(accountId: string): Promise<Investment
     return { identityVerified: false, payoutAccountVerified: false, payoutAccountRequired: payoutVerificationRequired(), canTransact: false };
   }
 
+  // A pass counts here however old it is: the guard below renews an expired
+  // one by itself when an order needs it, so telling the app "not ready" would
+  // grey out every button for a check the investor never has to redo.
   const identityVerified = await identityIsVerified(
     account.primaryInvestorProfileId,
     account.primaryInvestorProfile.pan,
+    false,
   );
   const payoutBankAccountId = account.folioDefaults?.payoutBankAccountId;
   const payoutAccountVerified = payoutBankAccountId ? await bankIsVerified(payoutBankAccountId) : false;
@@ -205,9 +218,7 @@ export async function assertInvestmentReady(
     throw HttpError.notFound("No such individual investment account");
   }
 
-  if (!(await identityIsVerified(account.primaryInvestorProfileId, account.primaryInvestorProfile.pan))) {
-    throw HttpError.conflict("Complete a fresh investor pre-verification before transacting");
-  }
+  await assertFreshIdentity(account.primaryInvestorProfile);
 
   const payoutBankAccountId = account.folioDefaults?.payoutBankAccountId;
   if (!payoutBankAccountId) {
@@ -222,5 +233,80 @@ export async function assertInvestmentReady(
       where: { mfInvestmentAccountId_number: { mfInvestmentAccountId: accountId, number: folioNumber } },
     });
     if (!folio) throw HttpError.badRequest("The folio does not belong to this investment account");
+  }
+}
+
+/** How long an order waits for a renewed check's verdict before giving up. */
+const RENEW_WAIT_MS = 9_000;
+const RENEW_POLL_MS = 1_500;
+/** One renewal per profile at a time, however many orders arrive together. */
+const renewing = new Map<string, Promise<void>>();
+
+/**
+ * The identity gate for an order: a fresh pass, or one renewed on the spot.
+ *
+ * A pass expires after MAX_CHECK_AGE_MS, which is our policy. Before this, an
+ * expired pass refused every order with "complete a fresh pre-verification" —
+ * and nothing in the app could start one, so a fully verified investor was
+ * locked out a day after onboarding. Now an expired *pass* is re-run with the
+ * PAN, name and date of birth already on the profile, and the order waits a
+ * few seconds for FP's verdict (it lands in about one on this route).
+ *
+ * Only a pass is renewed. A check that failed, or none at all, still refuses:
+ * re-submitting the same details would only fail again, and a real problem
+ * with the PAN must reach the investor rather than be retried away.
+ */
+async function assertFreshIdentity(profile: {
+  id: string;
+  pan: string | null;
+  name: string | null;
+  dateOfBirth: Date | null;
+}): Promise<void> {
+  const latest = await latestIdentityCheck(profile.id, profile.pan);
+  if (identityCheckPassed(latest)) return;
+  if (!identityCheckPassed(latest, false) || !profile.pan || !profile.name || !profile.dateOfBirth) {
+    throw HttpError.conflict("Complete a fresh investor pre-verification before transacting");
+  }
+
+  const running = renewing.get(profile.id) ?? renewIdentity(profile as RenewableProfile).finally(() => renewing.delete(profile.id));
+  renewing.set(profile.id, running);
+  await running;
+
+  if (identityCheckPassed(await latestIdentityCheck(profile.id, profile.pan))) return;
+  throw HttpError.conflict(
+    "We're re-confirming your PAN details with the registry. Please try again in a minute.",
+    { reason: "IDENTITY_RECHECK_PENDING" },
+  );
+}
+
+type RenewableProfile = { id: string; pan: string; name: string; dateOfBirth: Date };
+
+/** Run a new pre-verification on the profile's own details and wait for its verdict. */
+async function renewIdentity(profile: RenewableProfile): Promise<void> {
+  const owner = await db.userInvestorProfile.findFirst({
+    where: { investorProfileId: profile.id, relationship: "SELF" },
+    select: { userId: true },
+  });
+  if (!owner) return;
+  // Imported here, not at the top: kyc.service sits above the sync layer, and
+  // this module is imported by every order path.
+  const kyc = await import("./kyc.service.ts");
+  try {
+    const started = await kyc.checkReadiness({
+      userId: owner.userId,
+      investorProfileId: profile.id,
+      pan: profile.pan,
+      name: profile.name,
+      dateOfBirth: profile.dateOfBirth.toISOString().slice(0, 10),
+    });
+    // The create usually answers with the verdict still running; read it back.
+    // `readinessStatus` is null until FP decides; `ready` is only its yes/no.
+    for (let waited = 0, status = started.readinessStatus; status == null && waited < RENEW_WAIT_MS; waited += RENEW_POLL_MS) {
+      await new Promise((resolve) => setTimeout(resolve, RENEW_POLL_MS));
+      status = (await kyc.getReadiness(started.id)).readinessStatus;
+    }
+  } catch (error) {
+    // FP unreachable: the caller refuses with "try again", which is the truth.
+    console.warn("[readiness] identity re-check failed:", error instanceof Error ? error.message : error);
   }
 }

@@ -25,7 +25,7 @@ export interface NotifyInput {
   title: string;
   body: string;
   dedupeKey: string;
-  targetType?: "order" | "plan";
+  targetType?: "order" | "plan" | "ticket";
   targetId?: string;
   /** When the event happened; defaults to now. */
   at?: Date | null;
@@ -330,7 +330,7 @@ const toDto = (row: Row): NotificationDto => ({
   category: row.category,
   title: row.title,
   body: row.body,
-  target: row.targetType && row.targetId ? { type: row.targetType as "order" | "plan", id: row.targetId } : null,
+  target: row.targetType && row.targetId ? { type: row.targetType as "order" | "plan" | "ticket", id: row.targetId } : null,
   read: row.readAt !== null,
   createdAt: row.createdAt.toISOString(),
 });

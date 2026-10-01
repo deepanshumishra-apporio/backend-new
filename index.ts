@@ -5,6 +5,9 @@ import { createApp } from "./src/app.ts";
 import { disconnectDatabase } from "./src/db/client.ts";
 import { closeEmailTransport } from "./src/integrations/email.client.ts";
 import { startBackgroundJobs, stopBackgroundJobs } from "./src/services/background-jobs.service.ts";
+import { startAdminProjection, stopAdminProjection } from "./src/services/admin-projection.service.ts";
+import { startComplianceScan, stopComplianceScan } from "./src/services/compliance-alert.service.ts";
+import { startAnnouncementDispatch, stopAnnouncementDispatch } from "./src/services/announcement.service.ts";
 
 const port = Number(process.env["PORT"] ?? 3000);
 if (!Number.isInteger(port) || port <= 0) {
@@ -16,6 +19,11 @@ const server = createApp().listen(port, () => {
   // Reconcile paid orders (so their folio is saved even when nobody is looking)
   // and apply pending FP webhooks.
   if (startBackgroundJobs()) console.log("[jobs] order reconciliation and webhook processing started");
+  // The admin portal's read model, on its own loop so it can never delay the money sweeps.
+  if (startAdminProjection()) console.log("[admin-projection] started");
+  // Compliance alerts: reads the mirror only, so it never competes with FP calls.
+  if (startComplianceScan()) console.log("[compliance] scan started");
+  if (startAnnouncementDispatch()) console.log("[announcements] delivery started");
 });
 
 /**
@@ -41,6 +49,9 @@ async function shutdown(signal: string): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   // Before the pool closes: a tick in progress still needs the database.
   await stopBackgroundJobs();
+  await stopAdminProjection();
+  await stopComplianceScan();
+  await stopAnnouncementDispatch();
   await closeEmailTransport();
   await disconnectDatabase();
   clearTimeout(forceExit);

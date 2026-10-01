@@ -6,7 +6,7 @@
   "scripts": {
     "//test": "test:unit is offline and fast; test:schema needs pglite; test:e2e talks to the live FP sandbox. `test` runs the two that need no network.",
     "test": "bun run test:unit && bun run test:schema",
-    "test:unit": "bun test tests/unit.test.ts tests/sandbox-auth.test.ts tests/kyc-prefill.test.ts tests/payment-rules.test.ts && bun test tests/kyc-flow.test.ts && bun test tests/email-login.test.ts && bun test tests/otp-context.test.ts && bun test tests/redemption-settle.test.ts && bun test tests/folio-resolution.test.ts && bun test tests/order-allotment.test.ts && bun test tests/order-reconciler.test.ts && bun test tests/payment-return.test.ts && bun test tests/exit-orders.test.ts && bun test tests/scheme-availability.test.ts && bun test tests/exit-holdings.test.ts && bun test tests/cart.test.ts && bun test tests/notifications.test.ts && bun test tests/amfi.test.ts && bun test tests/market.test.ts",
+    "test:unit": "bun test tests/unit.test.ts tests/sandbox-auth.test.ts tests/kyc-prefill.test.ts tests/payment-rules.test.ts && bun test tests/kyc-flow.test.ts && bun test tests/email-login.test.ts && bun test tests/otp-context.test.ts && bun test tests/redemption-settle.test.ts && bun test tests/folio-resolution.test.ts && bun test tests/order-allotment.test.ts && bun test tests/order-reconciler.test.ts && bun test tests/payment-return.test.ts && bun test tests/exit-orders.test.ts && bun test tests/scheme-availability.test.ts && bun test tests/exit-holdings.test.ts && bun test tests/cart.test.ts && bun test tests/notifications.test.ts && bun test tests/amfi.test.ts && bun test tests/market.test.ts && bun test tests/admin.test.ts tests/staff-auth.test.ts",
     "test:schema": "node --test --test-isolation=none tests/investor-schema.test.mjs",
     "//e2e": "Live end-to-end run against the FP ONDC sandbox and the configured database. Creates real objects; never point it at production.",
     "test:e2e": "bun run tests/e2e-ondc.ts",
@@ -22,6 +22,8 @@
     "db:migrate:status": "bunx --bun prisma migrate status",
     "db:seed": "bunx --bun prisma db seed",
     "//seed-refresh": "Re-captures the FP sandbox scheme catalogue that the seed loads. Needs FP_* credentials and network access; the seed itself needs neither.",
+    "//staff": "Creates or resets an admin-portal staff account. Password via STAFF_PASSWORD; see the script header.",
+    "staff:create": "bun run scripts/create-staff.ts",
     "holidays:import": "bun run scripts/import-holidays.ts",
     "nav:import": "bun run scripts/import-navs.ts",
     "db:seed:refresh": "bun run prisma/seed-data/refresh.ts",

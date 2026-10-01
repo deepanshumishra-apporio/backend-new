@@ -45,8 +45,10 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
   let claim = await db.investorCommand.createMany({ data: [{ id, userId, key, requestHash, route }], skipDuplicates: true });
   if (!claim.count) {
     const previous = await db.investorCommand.findUniqueOrThrow({ where: { userId_key: { userId, key } } });
-    if (previous.requestHash !== requestHash) throw HttpError.conflict("Idempotency-Key was already used for a different request");
-    if (previous.statusCode === null) throw HttpError.conflict("Request is in progress or requires reconciliation; do not submit a new key", { commandId: previous.id });
+    if (previous.requestHash !== requestHash) throw new HttpError(409, "IDEMPOTENCY_KEY_REUSED", "Idempotency-Key was already used for a different request");
+    // Its own code, so a client can tell "your request may still be running"
+    // from a business refusal, which is also a 409 but created nothing.
+    if (previous.statusCode === null) throw new HttpError(409, "REQUEST_IN_PROGRESS", "Request is in progress or requires reconciliation; do not submit a new key", { commandId: previous.id });
     if (previous.statusCode >= 400) {
       // A stored failure is not an outcome worth protecting — see the note on
       // 4xx below. Rows written before that rule existed are still out there,
@@ -57,7 +59,7 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
       await db.investorCommand.delete({ where: { id: previous.id } }).catch(() => undefined);
       claim = await db.investorCommand.createMany({ data: [{ id, userId, key, requestHash, route }], skipDuplicates: true });
       // Someone else re-claimed it in between; theirs is in flight, not ours.
-      if (!claim.count) throw HttpError.conflict("Request is in progress; retry in a moment");
+      if (!claim.count) throw new HttpError(409, "REQUEST_IN_PROGRESS", "Request is in progress; retry in a moment");
     } else {
       res.setHeader("Idempotency-Replayed", "true");
       res.status(previous.statusCode).json(previous.response);

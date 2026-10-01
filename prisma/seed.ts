@@ -52,7 +52,7 @@ function navSeries(base: number, days: number): { navDate: Date; nav: string }[]
   return series;
 }
 
-/** Dev accounts. Phone is the credential; email is optional on User. */
+/** Dev investors. Phone is the credential; email is optional on User. */
 const USERS = [
   {
     phone: "+919876543210",
@@ -60,12 +60,15 @@ const USERS = [
     fullName: "Asha Investor",
     role: "INVESTOR",
   },
-  {
-    phone: "+919876500001",
-    email: "admin@mutualfund.local",
-    fullName: "Platform Admin",
-    role: "ADMIN",
-  },
+] as const;
+
+/**
+ * Dev staff for the admin portal — a separate identity from User. MFA stays
+ * required: the first sign-in enrols an authenticator, as it would in
+ * production.
+ */
+const STAFF = [
+  { email: "admin@mutualfund.local", fullName: "Platform Admin", roleKey: "SUPER_ADMIN" },
 ] as const;
 
 async function loadSnapshot(): Promise<CatalogueSnapshot> {
@@ -216,6 +219,27 @@ async function main() {
       select: { id: true },
     });
     console.log(`[seed] user ${user.role.padEnd(8)} ${row.id}  ${user.phone}`);
+  }
+
+  // --- Staff -----------------------------------------------------------------
+  // Roles and permissions are seeded by migration; only the accounts live here.
+  for (const member of STAFF) {
+    const row = await db.staffUser.upsert({
+      where: { email: member.email },
+      update: { status: "ACTIVE" },
+      create: { email: member.email, fullName: member.fullName, status: "ACTIVE" },
+      select: { id: true },
+    });
+    await db.staffCredential.upsert({
+      where: { staffUserId: row.id },
+      update: {},
+      create: { staffUserId: row.id, passwordHash },
+    });
+    await db.staffUserRole.createMany({
+      data: [{ staffUserId: row.id, roleKey: member.roleKey }],
+      skipDuplicates: true,
+    });
+    console.log(`[seed] staff ${member.roleKey.padEnd(11)} ${row.id}  ${member.email}`);
   }
 
   console.log("[seed] complete");

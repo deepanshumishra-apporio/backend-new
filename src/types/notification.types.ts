@@ -1,4 +1,4 @@
-export type NotificationCategory = "ORDER" | "PLAN" | "PAYMENT" | "ACTION" | "ACCOUNT" | "MARKET";
+export type NotificationCategory = "ORDER" | "PLAN" | "PAYMENT" | "ACTION" | "ACCOUNT" | "MARKET" | "ANNOUNCEMENT";
 
 export interface NotificationDto {
   id: string;
@@ -6,7 +6,7 @@ export interface NotificationDto {
   title: string;
   body: string;
   /** Where tapping it goes, when anywhere. */
-  target: { type: "order" | "plan"; id: string } | null;
+  target: { type: "order" | "plan" | "ticket"; id: string } | null;
   read: boolean;
   /** When the event happened. */
   createdAt: string;

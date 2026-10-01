@@ -59,7 +59,8 @@
 //            JOINT_HOLDER.
 //   agent  — Partner, MfPurchase.partner/euin, MfInvestmentAccount
 //            .servicingPartner, UserRole.DISTRIBUTOR.
-//   admin  — UserRole.ADMIN / SUPPORT, AuditLog, FpWebhookEvent.
+//   admin  — the Staff* models (a separate identity from User), roles and
+//            permissions, AuditLog.actorStaff, FpWebhookEvent.
 //
 // ---------------------------------------------------------------------------
 // Numeric conventions (NEVER Float for money — binary floats cannot represent
@@ -94,8 +95,8 @@ enum UserRole {
   /// Sub-broker / ARN holder acting for investors. The agent subdomain builds
   /// on this plus Partner; nothing else in the schema needs to change.
   DISTRIBUTOR
-  ADMIN
-  SUPPORT
+  // Staff are not Users. They live in StaffUser, with their own sessions,
+  // credentials and roles, so no customer-facing check can ever admit them.
 }
 
 enum UserStatus {
@@ -852,6 +853,10 @@ model User {
   /// so an investor with history can never be hard-deleted.
   deletedAt DateTime?
 
+  /// When the investor turned off offers and promotions; null means they receive them.
+  /// Informational announcements and transactional notifications ignore it.
+  promoOptOutAt DateTime? @db.Timestamptz(3)
+
   profileLinks       UserInvestorProfile[]
   uploadedFiles      FpFile[]
   kycChecks          KycCheck[]
@@ -864,10 +869,15 @@ model User {
   cartCheckouts      CartCheckout[]
   notifications      Notification[]
   auditLogs          AuditLog[]
+  supportTickets     SupportTicket[]
+  chatConversations  ChatConversation[]
+  complianceAlerts   ComplianceAlert[]
+  announcementViews  AnnouncementView[]
 
   @@index([status])
   @@index([deletedAt])
   @@index([createdAt])
+  @@index([updatedAt])
   @@map("users")
 }
 
@@ -894,6 +904,7 @@ model UserInvestorProfile {
 
   @@unique([userId, investorProfileId])
   @@index([investorProfileId])
+  @@index([updatedAt])
   @@map("user_investor_profiles")
 }
 
@@ -931,6 +942,7 @@ model InvestorOnboarding {
   updatedAt   DateTime  @updatedAt
 
   @@index([stage])
+  @@index([updatedAt])
   @@map("investor_onboardings")
 }
 
@@ -1073,6 +1085,7 @@ model PreVerification {
   @@index([userId, createdAt(sort: Desc)])
   @@index([investorProfileId, createdAt(sort: Desc)])
   @@index([status, syncedAt])
+  @@index([updatedAt])
   @@map("pre_verifications")
 }
 
@@ -1293,6 +1306,7 @@ model KycForm {
   @@index([pan, createdAt(sort: Desc)])
   @@index([status])
   @@index([userId])
+  @@index([updatedAt])
   @@map("kyc_forms")
 }
 
@@ -1455,6 +1469,7 @@ model InvestorProfile {
   @@index([pan])
   @@index([type])
   @@index([createdAt])
+  @@index([updatedAt])
   @@map("investor_profiles")
 }
 
@@ -1623,6 +1638,7 @@ model BankAccount {
 
   @@unique([investorProfileId, accountNumberFingerprint])
   @@index([investorProfileId])
+  @@index([updatedAt])
   @@map("bank_accounts")
 }
 
@@ -2067,6 +2083,7 @@ model MfInvestmentAccount {
   @@index([primaryInvestorProfileId])
   @@index([primaryInvestorPan])
   @@index([holdingPattern])
+  @@index([updatedAt])
   @@map("mf_investment_accounts")
 }
 
@@ -2113,6 +2130,7 @@ model MfFolioDefaults {
   updatedAt DateTime @updatedAt
   syncedAt  DateTime @default(now())
 
+  @@index([updatedAt])
   @@map("mf_folio_defaults")
 }
 
@@ -2334,6 +2352,7 @@ model MfHolding {
   @@unique([mfInvestmentAccountId, folioNumber, schemeIsin])
   @@index([mfInvestmentAccountId])
   @@index([schemeIsin])
+  @@index([updatedAt])
   @@map("mf_holdings")
 }
 
@@ -2443,6 +2462,7 @@ model MfPurchase {
   @@index([schemeIsin])
   @@index([planId])
   @@index([folioNumber])
+  @@index([updatedAt])
   @@map("mf_purchases")
 }
 
@@ -2723,6 +2743,7 @@ model MfPurchasePlan {
   @@index([state, nextInstallmentDate])
   @@index([schemeIsin])
   @@index([mandateId])
+  @@index([updatedAt])
   @@map("mf_purchase_plans")
 }
 
@@ -3250,11 +3271,15 @@ model AuditLog {
   id String @id @default(uuid(7)) @db.Uuid
 
   /// Kept as SetNull so purging an actor never destroys the audit trail.
-  actorId   String?   @db.Uuid
-  actor     User?     @relation(fields: [actorId], references: [id], onDelete: SetNull)
-  /// The actor's role at the time of the action — roles change, history must
-  /// not. The admin subdomain reads this, not the current User.role.
-  actorRole UserRole?
+  actorId      String?    @db.Uuid
+  actor        User?      @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  /// Set instead of actorId when a staff member acted. A CHECK constraint keeps
+  /// the two exclusive; neither set means the system (a job, a webhook) did.
+  actorStaffId String?    @db.Uuid
+  actorStaff   StaffUser? @relation(fields: [actorStaffId], references: [id], onDelete: SetNull)
+  /// The investor actor's role at the time of the action — roles change,
+  /// history must not.
+  actorRole    UserRole?
 
   action     String  @db.VarChar(100)
   entityType String  @db.VarChar(60)
@@ -3267,6 +3292,7 @@ model AuditLog {
   createdAt DateTime @default(now())
 
   @@index([actorId, createdAt])
+  @@index([actorStaffId, createdAt])
   @@index([entityType, entityId])
   @@index([action, createdAt])
   @@map("audit_logs")
@@ -3379,6 +3405,8 @@ enum NotificationCategory {
   ACCOUNT
   /// A market holiday, or anything else about when orders are processed.
   MARKET
+  /// An announcement from the business: an offer, a product update, a notice.
+  ANNOUNCEMENT
 }
 
 /// Something the investor should see about their money, raised when an order,
@@ -3393,7 +3421,7 @@ model Notification {
   title    String               @db.VarChar(160)
   body     String               @db.VarChar(500)
 
-  /// Where tapping it goes: `order` or `plan`, and our id for it.
+  /// Where tapping it goes: `order`, `plan` or `ticket`, and our id for it.
   targetType String? @db.VarChar(20)
   targetId   String? @db.Uuid
 
@@ -3427,4 +3455,713 @@ model MarketHoliday {
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   @@map("market_holidays")
+}
+
+// ===========================================================================
+// Staff — the admin portal's identity. Deliberately NOT User.
+//
+// Customers and staff differ in every way that matters: how they sign in
+// (OTP vs password + MFA), how long a session lives, what they may see and
+// who may create them. Keeping them in separate tables means no investor
+// check can admit a staff member and no staff check an investor — by schema,
+// not by a role comparison someone can get wrong.
+//
+// Access is permission-based: code asks for `investors.read`, never for a
+// role. Roles are data (seeded system roles plus any ops define later), so a
+// new "Compliance officer" needs no deploy.
+// ===========================================================================
+
+enum StaffStatus {
+  ACTIVE
+  SUSPENDED
+  /// Left the organisation. Kept, never deleted: the audit trail points here.
+  DEACTIVATED
+}
+
+enum StaffMfaType {
+  TOTP
+}
+
+enum StaffLoginOutcome {
+  SUCCESS
+  BAD_PASSWORD
+  UNKNOWN_EMAIL
+  INACTIVE
+  LOCKED
+  MFA_SUCCESS
+  MFA_FAILED
+}
+
+model StaffUser {
+  id          String      @id @default(uuid(7)) @db.Uuid
+  /// Stored lower-case; a CHECK constraint enforces it, so uniqueness is
+  /// case-insensitive without citext.
+  email       String      @unique @db.VarChar(255)
+  fullName    String      @db.VarChar(150)
+  /// Contact only. Never a credential.
+  phone       String?     @db.VarChar(20)
+  status      StaffStatus @default(ACTIVE)
+  /// Off only for break-glass service accounts; every person keeps it on.
+  mfaRequired Boolean     @default(true)
+
+  lastLoginAt   DateTime?   @db.Timestamptz(3)
+  createdById   String?     @db.Uuid
+  createdBy     StaffUser?  @relation("StaffCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  created       StaffUser[] @relation("StaffCreatedBy")
+  createdAt     DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime    @updatedAt @db.Timestamptz(3)
+  deactivatedAt DateTime?   @db.Timestamptz(3)
+
+  credential   StaffCredential?
+  mfaFactors   StaffMfaFactor[]
+  sessions     StaffSession[]
+  roles        StaffUserRole[]   @relation("StaffRoles")
+  rolesGranted StaffUserRole[]   @relation("StaffRoleGrantor")
+  loginEvents  StaffLoginEvent[]
+  auditLogs    AuditLog[]
+
+  ticketsAssigned SupportTicket[]        @relation("TicketAssignee")
+  ticketsOpened   SupportTicket[]        @relation("TicketOpenedBy")
+  ticketMessages  SupportTicketMessage[]
+  ticketEvents    SupportTicketEvent[]
+  chatsAssigned   ChatConversation[]
+  chatMessages    ChatMessage[]
+
+  announcementsCreated  Announcement[] @relation("AnnouncementCreator")
+  announcementsApproved Announcement[] @relation("AnnouncementApprover")
+
+  complianceAssigned ComplianceAlert[]      @relation("ComplianceAssignee")
+  complianceResolved ComplianceAlert[]      @relation("ComplianceResolver")
+  complianceEvents   ComplianceAlertEvent[]
+
+  @@index([status])
+  @@map("staff_users")
+}
+
+/// The password, apart from the profile so reading a staff member never loads
+/// the hash. An SSO-only account would simply have no row.
+model StaffCredential {
+  staffUserId       String    @id @db.Uuid
+  staffUser         StaffUser @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  /// Argon2id.
+  passwordHash      String    @db.VarChar(255)
+  passwordChangedAt DateTime  @default(now()) @db.Timestamptz(3)
+  /// Set when an operator issues a password; cleared once the owner changes it.
+  mustChange        Boolean   @default(false)
+  failedAttempts    Int       @default(0)
+  lockedUntil       DateTime? @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@map("staff_credentials")
+}
+
+model StaffMfaFactor {
+  id              String       @id @default(uuid(7)) @db.Uuid
+  staffUserId     String       @db.Uuid
+  staffUser       StaffUser    @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  type            StaffMfaType
+  /// AES-256-GCM under STAFF_MFA_ENCRYPTION_KEY, so a database dump alone
+  /// cannot mint codes.
+  secretEncrypted Bytes
+  /// Null until the first code proves the authenticator was set up.
+  confirmedAt     DateTime?    @db.Timestamptz(3)
+  /// The last TOTP time-step accepted; a code is never accepted twice.
+  lastUsedStep    Int?
+  lastUsedAt      DateTime?    @db.Timestamptz(3)
+  createdAt       DateTime     @default(now()) @db.Timestamptz(3)
+
+  @@index([staffUserId])
+  @@map("staff_mfa_factors")
+}
+
+/// An opaque bearer token (only its SHA-256 is stored). A session starts
+/// MFA-pending and short-lived; passing MFA promotes it to a full session.
+model StaffSession {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  staffUserId       String    @db.Uuid
+  staffUser         StaffUser @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  tokenHash         String    @unique @db.VarChar(64)
+  mfaVerifiedAt     DateTime? @db.Timestamptz(3)
+  mfaFailedAttempts Int       @default(0)
+  /// Idle timeout is measured from here.
+  lastSeenAt        DateTime  @default(now()) @db.Timestamptz(3)
+  /// Absolute lifetime; never extended by activity.
+  expiresAt         DateTime  @db.Timestamptz(3)
+  revokedAt         DateTime? @db.Timestamptz(3)
+  /// LOGOUT | MFA_FAILED | PASSWORD_CHANGED
+  revokedReason     String?   @db.VarChar(40)
+  ipAddress         String?   @db.VarChar(45)
+  userAgent         String?   @db.VarChar(300)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([staffUserId, expiresAt])
+  @@map("staff_sessions")
+}
+
+/// Every sign-in attempt, good or bad: lockout, investigation and alerting
+/// all read this. Kept even for unknown emails, which is what a credential-
+/// stuffing run looks like.
+model StaffLoginEvent {
+  id          String            @id @default(uuid(7)) @db.Uuid
+  staffUserId String?           @db.Uuid
+  staffUser   StaffUser?        @relation(fields: [staffUserId], references: [id], onDelete: SetNull)
+  email       String            @db.VarChar(255)
+  outcome     StaffLoginOutcome
+  ipAddress   String?           @db.VarChar(45)
+  userAgent   String?           @db.VarChar(300)
+  createdAt   DateTime          @default(now()) @db.Timestamptz(3)
+
+  @@index([staffUserId, createdAt])
+  @@index([email, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("staff_login_events")
+}
+
+/// A capability code checks, e.g. `investors.read`. The set is fixed by code
+/// (`src/types/staff.types.ts`) and seeded by migration; roles group them.
+model Permission {
+  key         String           @id @db.VarChar(60)
+  description String           @db.VarChar(200)
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model Role {
+  /// SUPER_ADMIN, OPERATIONS, SUPPORT, READ_ONLY, or one ops defines later.
+  key         String           @id @db.VarChar(40)
+  name        String           @db.VarChar(80)
+  description String?          @db.VarChar(200)
+  /// Seeded roles; the portal must not edit or delete them.
+  isSystem    Boolean          @default(false)
+  createdAt   DateTime         @default(now()) @db.Timestamptz(3)
+  permissions RolePermission[]
+  staff       StaffUserRole[]
+
+  @@map("roles")
+}
+
+model RolePermission {
+  roleKey       String     @db.VarChar(40)
+  role          Role       @relation(fields: [roleKey], references: [key], onDelete: Cascade)
+  permissionKey String     @db.VarChar(60)
+  permission    Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([roleKey, permissionKey])
+  @@map("role_permissions")
+}
+
+model StaffUserRole {
+  staffUserId String     @db.Uuid
+  staffUser   StaffUser  @relation("StaffRoles", fields: [staffUserId], references: [id], onDelete: Cascade)
+  roleKey     String     @db.VarChar(40)
+  role        Role       @relation(fields: [roleKey], references: [key], onDelete: Restrict)
+  grantedById String?    @db.Uuid
+  grantedBy   StaffUser? @relation("StaffRoleGrantor", fields: [grantedById], references: [id], onDelete: SetNull)
+  grantedAt   DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@id([staffUserId, roleKey])
+  @@index([roleKey])
+  @@map("staff_user_roles")
+}
+
+// ===========================================================================
+// Admin read model — derived, never written by the investor journey.
+//
+// `investorFacts` (admin-investor.service.ts) works out each investor's KYC
+// status and journey stage from a dozen tables. That is fine for one record
+// and too slow to run across every investor on every dashboard load, so
+// `admin-projection.service.ts` materialises it here: incrementally for the
+// users whose rows changed, and in full once a day to correct any drift.
+//
+// Safe to truncate at any time; the next full refresh rebuilds it. No foreign
+// key to users on purpose: a read model must never block a write model.
+// ===========================================================================
+
+model InvestorJourneySnapshot {
+  userId               String    @id @db.Uuid
+  name                 String?   @db.VarChar(150)
+  email                String?   @db.VarChar(255)
+  phone                String    @db.VarChar(20)
+  pan                  String?   @db.VarChar(10)
+  userStatus           String    @db.VarChar(30)
+  stage                String    @db.VarChar(30)
+  kycStatus            String    @db.VarChar(30)
+  kycVia               String?   @db.VarChar(20)
+  /// The latest KYC form's state, for the next-step breakdown.
+  kycFormStatus        String?   @db.VarChar(30)
+  kycProofStatus       String?   @db.VarChar(30)
+  kycSignatureProvided Boolean?
+  kycFieldsNeeded      String[]  @db.VarChar(60)
+  /// When the open form last moved. "Stalled" is judged at read time against
+  /// now(), because time passing changes no row.
+  kycMovedAt           DateTime? @db.Timestamptz(3)
+  kycCompletedAt       DateTime? @db.Timestamptz(3)
+  hasProfile           Boolean
+  hasAccount           Boolean
+  purchases            Int
+  investedAmount       Decimal   @db.Decimal(18, 2)
+  /// From the last holdings sync.
+  currentValue         Decimal   @default(0) @db.Decimal(18, 2)
+  activeSips           Int       @default(0)
+  /// Active SIPs normalised to a monthly amount.
+  sipMonthlyAmount     Decimal   @default(0) @db.Decimal(18, 2)
+  nextSipDate          DateTime? @db.Date
+  signedUpAt           DateTime  @db.Timestamptz(3)
+  lastLoginAt          DateTime? @db.Timestamptz(3)
+  lastActivityAt       DateTime  @db.Timestamptz(3)
+  refreshedAt          DateTime  @db.Timestamptz(3)
+
+  @@index([signedUpAt(sort: Desc), userId(sort: Desc)])
+  @@index([stage, signedUpAt(sort: Desc)])
+  @@index([kycStatus, signedUpAt(sort: Desc)])
+  @@index([kycCompletedAt])
+  @@index([nextSipDate])
+  @@map("investor_journey_snapshots")
+}
+
+/// Progress and a lease for a background projection. The lease is a row, not
+/// a Postgres advisory lock, because session locks do not survive the
+/// transaction-mode pooler the app connects through.
+model ProjectionCheckpoint {
+  name        String    @id @db.VarChar(60)
+  /// Rows changed after this have not been applied yet.
+  watermark   DateTime? @db.Timestamptz(3)
+  lastFullAt  DateTime? @db.Timestamptz(3)
+  leaseUntil  DateTime? @db.Timestamptz(3)
+  leaseHolder String?   @db.VarChar(80)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@map("projection_checkpoints")
+}
+
+// ===========================================================================
+// Support — our own tables, not a mirror of FP.
+//
+// A ticket is a tracked request with a status, an owner and an SLA. A chat is
+// the live conversation in the app: Ri (the bot) answers until a person takes
+// over — because the investor asked for one, or because staff stepped in —
+// and a chat that needs follow-up becomes a ticket.
+// ===========================================================================
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  /// Our reply is out; the next move is the investor's.
+  WAITING_ON_INVESTOR
+  RESOLVED
+  /// Closed by staff, or resolved and left alone.
+  CLOSED
+}
+
+enum SupportTicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum SupportTicketCategory {
+  KYC
+  SIP_MANDATE
+  ORDER
+  REDEMPTION
+  PAYMENT
+  STATEMENT
+  ACCOUNT
+  OTHER
+}
+
+/// Where the ticket came from.
+enum SupportChannel {
+  APP
+  CHAT
+  PHONE
+  EMAIL
+}
+
+enum SupportAuthor {
+  INVESTOR
+  STAFF
+  /// Status changes and handovers, written by the platform.
+  SYSTEM
+}
+
+model SupportTicket {
+  id     String @id @default(uuid(7)) @db.Uuid
+  /// The human reference, shown as RS-000123. A sequence, so it never repeats.
+  number Int    @unique @default(autoincrement())
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  subject  String                @db.VarChar(160)
+  category SupportTicketCategory
+  priority SupportTicketPriority @default(NORMAL)
+  status   SupportTicketStatus   @default(OPEN)
+  channel  SupportChannel
+
+  assignedStaffId String?    @db.Uuid
+  assignedStaff   StaffUser? @relation("TicketAssignee", fields: [assignedStaffId], references: [id], onDelete: SetNull)
+  /// Set when staff raised it for the investor (a phone call, an email).
+  openedByStaffId String?    @db.Uuid
+  openedByStaff   StaffUser? @relation("TicketOpenedBy", fields: [openedByStaffId], references: [id], onDelete: SetNull)
+
+  /// The chat it was escalated from, if any.
+  chatConversationId String?           @unique @db.Uuid
+  chatConversation   ChatConversation? @relation(fields: [chatConversationId], references: [id], onDelete: SetNull)
+
+  /// The order, plan or payment it is about: our id, typed.
+  relatedType String? @db.VarChar(20)
+  relatedId   String? @db.Uuid
+
+  /// When the ticket must be resolved by, from its priority.
+  slaDueAt         DateTime  @db.Timestamptz(3)
+  firstResponseAt  DateTime? @db.Timestamptz(3)
+  resolvedAt       DateTime? @db.Timestamptz(3)
+  closedAt         DateTime? @db.Timestamptz(3)
+  lastMessageAt    DateTime  @default(now()) @db.Timestamptz(3)
+  /// The investor wrote since staff last replied.
+  awaitingStaff    Boolean   @default(true)
+  /// Staff replied since the investor last opened it.
+  unreadByInvestor Boolean   @default(false)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  messages SupportTicketMessage[]
+  events   SupportTicketEvent[]
+
+  @@index([status, slaDueAt])
+  @@index([assignedStaffId, status])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([lastMessageAt(sort: Desc)])
+  @@map("support_tickets")
+}
+
+model SupportTicketMessage {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  ticketId String        @db.Uuid
+  ticket   SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  author   SupportAuthor
+  staffId  String?       @db.Uuid
+  staff    StaffUser?    @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  body     String        @db.VarChar(4000)
+  /// A note between staff. Never shown to the investor.
+  internal Boolean       @default(false)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([ticketId, createdAt])
+  @@map("support_ticket_messages")
+}
+
+/// A ticket's history: every status, owner, priority and category change.
+model SupportTicketEvent {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  ticketId String        @db.Uuid
+  ticket   SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  actor        SupportAuthor
+  actorStaffId String?       @db.Uuid
+  actorStaff   StaffUser?    @relation(fields: [actorStaffId], references: [id], onDelete: SetNull)
+  type         String        @db.VarChar(30)
+  fromValue    String?       @db.VarChar(80)
+  toValue      String?       @db.VarChar(80)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([ticketId, createdAt])
+  @@map("support_ticket_events")
+}
+
+/// Who answers the investor right now.
+enum ChatHandler {
+  BOT
+  HUMAN
+}
+
+enum ChatStatus {
+  /// Being answered, by the bot or by the assigned person.
+  OPEN
+  /// Handed to a person; nobody has picked it up yet.
+  WAITING_FOR_AGENT
+  CLOSED
+}
+
+enum ChatSender {
+  INVESTOR
+  BOT
+  STAFF
+  SYSTEM
+}
+
+model ChatConversation {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  handler         ChatHandler @default(BOT)
+  status          ChatStatus  @default(OPEN)
+  assignedStaffId String?     @db.Uuid
+  assignedStaff   StaffUser?  @relation(fields: [assignedStaffId], references: [id], onDelete: SetNull)
+
+  /// The bot's last matched intent, for the queue and for triage.
+  lastIntent          String?   @db.VarChar(60)
+  handoverRequestedAt DateTime? @db.Timestamptz(3)
+  lastMessageAt       DateTime  @default(now()) @db.Timestamptz(3)
+  /// The investor wrote since staff last looked.
+  unreadByStaff       Boolean   @default(false)
+  closedAt            DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  messages ChatMessage[]
+  ticket   SupportTicket?
+
+  // At most one open conversation per investor: a partial unique index in the
+  // migration, which Prisma cannot express.
+  @@index([status, lastMessageAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("chat_conversations")
+}
+
+model ChatMessage {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  conversationId String           @db.Uuid
+  conversation   ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  sender  ChatSender
+  staffId String?    @db.Uuid
+  staff   StaffUser? @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  body    String     @db.VarChar(2000)
+  /// What the bot matched, on its turns.
+  intent  String?    @db.VarChar(60)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([conversationId, createdAt])
+  @@map("chat_messages")
+}
+
+// ===========================================================================
+// Compliance alerts — our own tables, raised by a scan of the mirror.
+//
+// `compliance-alert.service.ts` looks for conditions a distributor must act
+// on (stalled or failed KYC, repeated SIP failures, a rejected mandate behind
+// a live SIP, money collected without units, a holding with no nomination)
+// and keeps one alert per condition, keyed by `dedupeKey`. An alert whose
+// condition has gone is resolved by the scan itself; staff acknowledge,
+// assign, resolve or dismiss the rest, and every step is in the history.
+// ===========================================================================
+
+enum ComplianceAlertKind {
+  KYC_STALLED
+  KYC_FAILED
+  SIP_FAILURES
+  MANDATE_REJECTED
+  MANDATE_PENDING
+  PAID_NOT_ALLOTTED
+  ORDER_STUCK
+  NOMINEE_MISSING
+}
+
+/// Declared most urgent first: sorting by this column puts HIGH on top.
+enum ComplianceSeverity {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum ComplianceAlertStatus {
+  OPEN
+  /// Someone has seen it and owns it; the condition is still there.
+  ACKNOWLEDGED
+  RESOLVED
+  /// Not a real problem (a false positive, or accepted); the scan will not reopen it.
+  DISMISSED
+}
+
+model ComplianceAlert {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  kind     ComplianceAlertKind
+  severity ComplianceSeverity
+  status   ComplianceAlertStatus @default(OPEN)
+
+  /// One alert per condition, e.g. `sip_failures:<planId>:<first failed installment>`.
+  dedupeKey String @unique @db.VarChar(160)
+
+  /// The investor it concerns.
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The record behind it — `order`, `plan`, `mandate` or `account` — and our id for it.
+  entityType String? @db.VarChar(20)
+  entityId   String? @db.Uuid
+
+  title  String @db.VarChar(160)
+  detail String @db.VarChar(500)
+
+  firstDetectedAt DateTime @db.Timestamptz(3)
+  lastDetectedAt  DateTime @db.Timestamptz(3)
+
+  assignedStaffId   String?    @db.Uuid
+  assignedStaff     StaffUser? @relation("ComplianceAssignee", fields: [assignedStaffId], references: [id], onDelete: SetNull)
+  resolvedAt        DateTime?  @db.Timestamptz(3)
+  resolvedByStaffId String?    @db.Uuid
+  resolvedByStaff   StaffUser? @relation("ComplianceResolver", fields: [resolvedByStaffId], references: [id], onDelete: SetNull)
+  /// Why it was resolved or dismissed, in staff's words.
+  resolution        String?    @db.VarChar(500)
+  /// Resolved by the scan because the condition cleared, not by a person.
+  autoResolved      Boolean    @default(false)
+  lastRemindedAt    DateTime?  @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  events ComplianceAlertEvent[]
+
+  @@index([status, severity, firstDetectedAt])
+  @@index([kind, status])
+  @@index([userId])
+  @@index([assignedStaffId, status])
+  @@map("compliance_alerts")
+}
+
+model ComplianceAlertEvent {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  alertId String          @db.Uuid
+  alert   ComplianceAlert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+
+  /// DETECTED, ACKNOWLEDGED, ASSIGNED, RESOLVED, DISMISSED, REOPENED, AUTO_RESOLVED, REMINDED, NOTE.
+  type         String     @db.VarChar(30)
+  /// Null when the scan did it.
+  actorStaffId String?    @db.Uuid
+  actorStaff   StaffUser? @relation(fields: [actorStaffId], references: [id], onDelete: SetNull)
+  note         String?    @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([alertId, createdAt])
+  @@map("compliance_alert_events")
+}
+
+// ===========================================================================
+// Announcements — messages the business sends to investors (offers, product
+// updates, notices). Our own tables.
+//
+// Maker-checker: whoever composes an announcement cannot approve it. Once
+// approved, `announcement.service.ts` delivers it at `startsAt` — an in-app
+// notification to every investor in the audience, and/or the home banner and
+// its one-time modal until `endsAt`. Promotional ones skip investors who
+// opted out, wait out quiet hours and respect a weekly cap.
+// ===========================================================================
+
+enum AnnouncementCategory {
+  /// An offer or campaign. Honours the investor's opt-out, quiet hours and the weekly cap.
+  PROMOTIONAL
+  /// A product update or notice every investor in the audience should see.
+  INFORMATIONAL
+}
+
+/// Who it goes to, as a rule evaluated at send time against the admin read model.
+enum AnnouncementAudience {
+  ALL_INVESTORS
+  KYC_PENDING
+  READY_NOT_INVESTED
+  INVESTED
+  ACTIVE_SIP
+  NO_SIP
+}
+
+enum AnnouncementStatus {
+  DRAFT
+  PENDING_APPROVAL
+  REJECTED
+  /// Approved, waiting for `startsAt` (or for quiet hours to end).
+  SCHEDULED
+  /// Delivered, with its banner still showing.
+  LIVE
+  /// Delivered and finished: notification only, or the banner has ended.
+  COMPLETED
+  CANCELLED
+}
+
+model Announcement {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// Internal only; investors never see it.
+  name     String               @db.VarChar(120)
+  category AnnouncementCategory
+  audience AnnouncementAudience
+  status   AnnouncementStatus   @default(DRAFT)
+
+  /// The notification. `{{firstName}}` in the body is filled per investor.
+  title String @db.VarChar(80)
+  body  String @db.VarChar(240)
+
+  sendNotification Boolean @default(true)
+  showBanner       Boolean @default(false)
+  /// The banner and its modal; required when `showBanner`.
+  tag              String? @db.VarChar(30)
+  bannerTitle      String? @db.VarChar(60)
+  bannerBody       String? @db.VarChar(120)
+  highlight        String? @db.VarChar(80)
+  ctaLabel         String? @db.VarChar(30)
+  /// Where the call to action goes in the app: `start_sip`, `invest`, `sips` or `none`.
+  ctaAction        String? @db.VarChar(20)
+
+  startsAt DateTime  @db.Timestamptz(3)
+  /// When the banner stops showing. Null for a notification-only announcement.
+  endsAt   DateTime? @db.Timestamptz(3)
+
+  createdByStaffId  String?    @db.Uuid
+  createdByStaff    StaffUser? @relation("AnnouncementCreator", fields: [createdByStaffId], references: [id], onDelete: SetNull)
+  submittedAt       DateTime?  @db.Timestamptz(3)
+  approvedByStaffId String?    @db.Uuid
+  approvedByStaff   StaffUser? @relation("AnnouncementApprover", fields: [approvedByStaffId], references: [id], onDelete: SetNull)
+  approvedAt        DateTime?  @db.Timestamptz(3)
+  rejectionReason   String?    @db.VarChar(300)
+  cancelledAt       DateTime?  @db.Timestamptz(3)
+
+  /// Delivery, written once when it is sent.
+  sentAt         DateTime? @db.Timestamptz(3)
+  targetedCount  Int       @default(0)
+  deliveredCount Int       @default(0)
+  optedOutCount  Int       @default(0)
+  cappedCount    Int       @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  views AnnouncementView[]
+
+  @@index([status, startsAt])
+  @@index([createdAt(sort: Desc)])
+  @@map("announcements")
+}
+
+/// One investor seeing an announcement's modal, and tapping its call to action.
+model AnnouncementView {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  announcementId String       @db.Uuid
+  announcement   Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  userId         String       @db.Uuid
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  seenAt    DateTime  @default(now()) @db.Timestamptz(3)
+  clickedAt DateTime? @db.Timestamptz(3)
+
+  @@unique([announcementId, userId])
+  @@index([userId])
+  @@map("announcement_views")
 }

@@ -478,6 +478,65 @@ POST   /api/v1/webhooks/fp                      FP posts here
 POST   /api/v1/webhooks/fp/process              operator, x-admin-secret
 ```
 
+### Admin portal (staff)
+
+Staff are **not** `User`s. They live in `staff_users` with their own
+credentials, TOTP factors, sessions, login-event log and permission-based roles
+(`permissions`, `roles`, `role_permissions`, `staff_user_roles`). Investor and
+staff tokens sit in different tables behind different gates, so neither can
+reach the other's routes. Audit rows name a staff actor in `actorStaffId`; a
+CHECK keeps it exclusive with the investor `actorId`.
+
+```
+POST   /api/v1/admin/sessions                   email + password → full session; MFA-pending (10 min) only with STAFF_MFA_ENABLED=true
+GET    /api/v1/admin/sessions/current           MFA state of this session
+POST   /api/v1/admin/sessions/mfa/setup         enrol a TOTP authenticator
+POST   /api/v1/admin/sessions/mfa/verify        code → full session (12 h, 30 min idle)
+DELETE /api/v1/admin/sessions/current           sign out
+GET    /api/v1/admin/me                         who am I, roles, permissions
+POST   /api/v1/admin/me/password                change own password; signs out other sessions
+GET    /api/v1/admin/dashboard/summary          dashboard.read
+GET    /api/v1/admin/dashboard/signups          dashboard.read
+GET    /api/v1/admin/investors                  investors.read — filters, cursor pages
+GET    /api/v1/admin/investors/:userId          investors.read — audited as STAFF_VIEWED_INVESTOR
+GET    /api/v1/admin/roles                      staff.manage — roles and what they grant
+GET    /api/v1/admin/staff                      staff.manage — also POST to add (returns a one-time password)
+GET    /api/v1/admin/staff/:staffId             also PATCH (name, phone, roles)
+POST   /api/v1/admin/staff/:staffId/status      ACTIVE | SUSPENDED | DEACTIVATED (final)
+POST   /api/v1/admin/staff/:staffId/reset-password   one-time password; ends their sessions
+POST   /api/v1/admin/staff/:staffId/reset-mfa   lost phone; they re-enrol at next sign-in
+POST   /api/v1/admin/staff/:staffId/revoke-sessions
+```
+
+Staff management refuses, whatever the caller's roles: acting on your own
+account; granting, removing or resetting a role whose permissions you don't
+all hold yourself (so `staff.manage` can't mint a super admin); anything that
+would leave no active super admin; and any change to a deactivated account.
+
+**The dashboard reads a projection, not the journey tables.**
+`admin-projection.service.ts` materialises `investorFacts` into
+`investor_journey_snapshots` on its own loop (`ADMIN_PROJECTION_INTERVAL_MS`,
+default 60 s; separate from the money sweeps so it can never delay them):
+each tick re-derives only the users whose rows changed since the watermark
+(indexed `updatedAt` on every table the stage depends on), and once a day it
+rebuilds everyone in batches. A lease row in `projection_checkpoints` makes one
+instance do the work; upserts are idempotent, so overlap is harmless. The
+summary reports `dataAsOf`; opening an investor refreshes that one row. The
+table is disposable — truncate it and the next pass rebuilds it.
+
+- Code checks **permissions**, never roles (`requirePermission("investors.read")`).
+  A new permission key goes in `src/types/staff.types.ts` *and* a migration that
+  seeds it; roles are data.
+- Create or reset an account (the owner must change the password at first
+  sign-in; `--reset-mfa` for a lost phone):
+  `STAFF_PASSWORD='…' bun run staff:create --email a@b.c --name "Name" --role SUPER_ADMIN`
+- `STAFF_MFA_ENCRYPTION_KEY` (32 bytes, base64) seals TOTP secrets. Without it
+  sign-in answers 503; the investor API is unaffected. Losing it forces every
+  staff member to re-enrol.
+- The admin frontend calls this API from its server, so set `TRUST_PROXY` to
+  that server's address in production — otherwise every staff member shares one
+  IP for rate limits, lockouts and the login log.
+
 ### The FP integration itself
 
 ```
@@ -503,4 +562,6 @@ until a specific endpoint is called:
 | `CALLBACK_ALLOWED_ORIGINS` | every endpoint taking a callback URL — KYC forms, mandate postbacks — answers 503 |
 | `MSG91_OTP_TEMPLATE_ID` | `/otp/*` and `/transaction-otp/*` answer 503, so no session and no 2FA consent |
 | `FP_WEBHOOK_ADMIN_SECRET` | the webhook operator endpoints answer 503 |
+| `STAFF_MFA_ENCRYPTION_KEY` | admin portal sign-in answers 503 |
+| `ADMIN_PROJECTION_INTERVAL_MS` | defaults to 60 s; `0` stops the admin read model updating |
 

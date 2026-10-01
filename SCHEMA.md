@@ -4,7 +4,7 @@
 
 For the diagrams and the reasoning behind this shape, see [`ARCHITECTURE.md`](ARCHITECTURE.md). The schema file itself carries the commentary explaining *why* each decision was made.
 
-53 models, 59 enums.
+69 models, 65 enums.
 
 ## Model inventory
 
@@ -65,6 +65,22 @@ For the diagrams and the reasoning behind this shape, see [`ARCHITECTURE.md`](AR
 | `InvestorCommand` | `investor_commands` | — | Durable API command journal. |
 | `PaymentSubmission` | `payment_submissions` | — | Cross-process lock acquired before contacting the payment provider. |
 | `AuditLog` | `audit_logs` | — |  |
+| `CartItem` | `cart_items` | — | A fund the investor means to buy, kept on the server so the cart follows them across devices. |
+| `CartCheckout` | `cart_checkouts` | — | One checkout of the cart: a snapshot of its items and the FP orders and plans placed for them, confirmed together with a single transaction OTP. |
+| `CartCheckoutItem` | `cart_checkout_items` | — | A line of a checkout, and what FP made of it. |
+| `Notification` | `notifications` | — | Something the investor should see about their money, raised when an order, plan or payment reaches a state that matters to them. |
+| `MarketHoliday` | `market_holidays` | — | A day the exchanges are shut for mutual fund business (NSE's "MF" segment holiday list). |
+| `StaffUser` | `staff_users` | — |  |
+| `StaffCredential` | `staff_credentials` | — | The password, apart from the profile so reading a staff member never loads the hash. |
+| `StaffMfaFactor` | `staff_mfa_factors` | — |  |
+| `StaffSession` | `staff_sessions` | — | An opaque bearer token (only its SHA-256 is stored). |
+| `StaffLoginEvent` | `staff_login_events` | — | Every sign-in attempt, good or bad: lockout, investigation and alerting all read this. |
+| `Permission` | `permissions` | — | A capability code checks, e.g. |
+| `Role` | `roles` | — |  |
+| `RolePermission` | `role_permissions` | — |  |
+| `StaffUserRole` | `staff_user_roles` | — |  |
+| `InvestorJourneySnapshot` | `investor_journey_snapshots` | — |  |
+| `ProjectionCheckpoint` | `projection_checkpoints` | — | Progress and a lease for a background projection. |
 
 ## Models
 
@@ -90,13 +106,14 @@ A login account on our platform. Not an FP object.  Mobile first: `phone` is the
 | `updatedAt` | DateTime |  |  |
 | `deletedAt` | DateTime? |  | Soft delete: financial records reference users with onDelete: Restrict, so an investor with history can never be hard-deleted. |
 
-Relations: `sessions` → InvestorSession, `commands` → InvestorCommand, `profileLinks` → UserInvestorProfile, `uploadedFiles` → FpFile, `kycChecks` → KycCheck, `kycRequests` → KycRequest, `kycForms` → KycForm, `preVerifications` → PreVerification, `bankAccountLookups` → BankAccountLookup, `watchlist` → WatchlistItem, `auditLogs` → AuditLog.
+Relations: `sessions` → InvestorSession, `commands` → InvestorCommand, `profileLinks` → UserInvestorProfile, `uploadedFiles` → FpFile, `kycChecks` → KycCheck, `kycRequests` → KycRequest, `kycForms` → KycForm, `preVerifications` → PreVerification, `bankAccountLookups` → BankAccountLookup, `watchlist` → WatchlistItem, `cartItems` → CartItem, `cartCheckouts` → CartCheckout, `notifications` → Notification, `auditLogs` → AuditLog.
 
 Indexes:
 
 - `@@index([status])`
 - `@@index([deletedAt])`
 - `@@index([createdAt])`
+- `@@index([updatedAt])`
 
 ### UserInvestorProfile
 
@@ -120,6 +137,7 @@ Indexes:
 
 - `@@unique([userId, investorProfileId])`
 - `@@index([investorProfileId])`
+- `@@index([updatedAt])`
 
 ### InvestorOnboarding
 
@@ -143,6 +161,7 @@ Relations: `investorProfile` → InvestorProfile.
 Indexes:
 
 - `@@index([stage])`
+- `@@index([updatedAt])`
 
 ### FpFile
 
@@ -252,6 +271,7 @@ Indexes:
 - `@@index([userId, createdAt(sort: Desc)])`
 - `@@index([investorProfileId, createdAt(sort: Desc)])`
 - `@@index([status, syncedAt])`
+- `@@index([updatedAt])`
 
 ### PreVerificationBankResult
 
@@ -416,6 +436,7 @@ Indexes:
 - `@@index([pan, createdAt(sort: Desc)])`
 - `@@index([status])`
 - `@@index([userId])`
+- `@@index([updatedAt])`
 
 ### IdentityDocument
 
@@ -491,7 +512,7 @@ POST /v2/investor_profiles — the investor's demographic record in FP.  PAN is 
 | `name` | VarChar(70)? |  |  |
 | `dateOfBirth` | Date? |  |  |
 | `gender` | Gender? |  |  |
-| `maritalStatus` | MaritalStatus? |  |  |
+| `maritalStatus` | ProfileMaritalStatus? |  |  |
 | `occupation` | Occupation? |  |  |
 | `pan` | VarChar(10)? |  | Full PAN — required by FP and the folio join key. See KycCheck.pan. |
 | `aadhaarLast4` | VarChar(4)? |  | Last 4 digits only, which is all FP holds. |
@@ -522,6 +543,7 @@ Indexes:
 - `@@index([pan])`
 - `@@index([type])`
 - `@@index([createdAt])`
+- `@@index([updatedAt])`
 
 ### TaxResidency
 
@@ -668,6 +690,7 @@ Indexes:
 
 - `@@unique([investorProfileId, accountNumberFingerprint])`
 - `@@index([investorProfileId])`
+- `@@index([updatedAt])`
 
 ### BankAccountLookup
 
@@ -901,7 +924,7 @@ One tradeable scheme plan, identified by ISIN.  ISIN is the wire identifier ever
 | `updatedAt` | DateTime |  |  |
 | `syncedAt` | DateTime |  |  |
 
-Relations: `amc` → MfAmc, `navHistory` → NavHistory, `thresholds` → MfSchemeThreshold, `watchlistedBy` → WatchlistItem, `purchases` → MfPurchase, `redemptions` → MfRedemption, `switchesOut` → MfSwitch, `switchesIn` → MfSwitch, `purchasePlans` → MfPurchasePlan, `redemptionPlans` → MfRedemptionPlan, `switchPlansOut` → MfSwitchPlan, `switchPlansIn` → MfSwitchPlan.
+Relations: `amc` → MfAmc, `navHistory` → NavHistory, `thresholds` → MfSchemeThreshold, `watchlistedBy` → WatchlistItem, `inCarts` → CartItem, `purchases` → MfPurchase, `redemptions` → MfRedemption, `switchesOut` → MfSwitch, `switchesIn` → MfSwitch, `purchasePlans` → MfPurchasePlan, `redemptionPlans` → MfRedemptionPlan, `switchPlansOut` → MfSwitchPlan, `switchPlansIn` → MfSwitchPlan.
 
 Indexes:
 
@@ -1005,13 +1028,14 @@ POST /v2/mf_investment_accounts — the container every order and folio hangs of
 | `updatedAt` | DateTime |  |  |
 | `syncedAt` | DateTime |  |  |
 
-Relations: `primaryInvestorProfile` → InvestorProfile, `secondInvestorProfile` → InvestorProfile, `thirdInvestorProfile` → InvestorProfile, `servicingPartner` → Partner, `folioDefaults` → MfFolioDefaults, `nominees` → MfInvestmentAccountNominee, `folios` → MfFolio, `holdings` → MfHolding, `purchases` → MfPurchase, `redemptions` → MfRedemption, `switches` → MfSwitch, `purchasePlans` → MfPurchasePlan, `redemptionPlans` → MfRedemptionPlan, `switchPlans` → MfSwitchPlan.
+Relations: `primaryInvestorProfile` → InvestorProfile, `secondInvestorProfile` → InvestorProfile, `thirdInvestorProfile` → InvestorProfile, `servicingPartner` → Partner, `folioDefaults` → MfFolioDefaults, `nominees` → MfInvestmentAccountNominee, `folios` → MfFolio, `holdings` → MfHolding, `purchases` → MfPurchase, `redemptions` → MfRedemption, `switches` → MfSwitch, `purchasePlans` → MfPurchasePlan, `redemptionPlans` → MfRedemptionPlan, `cartCheckouts` → CartCheckout, `switchPlans` → MfSwitchPlan.
 
 Indexes:
 
 - `@@index([primaryInvestorProfileId])`
 - `@@index([primaryInvestorPan])`
 - `@@index([holdingPattern])`
+- `@@index([updatedAt])`
 
 ### MfFolioDefaults
 
@@ -1035,6 +1059,10 @@ FP's `folio_defaults` hash: which of the investor's several addresses, phone num
 | `syncedAt` | DateTime |  |  |
 
 Relations: `mfInvestmentAccount` → MfInvestmentAccount, `communicationEmailAddress` → EmailAddress, `communicationPhoneNumber` → PhoneNumber, `communicationAddress` → Address, `overseasCommunicationAddress` → Address, `payoutBankAccount` → BankAccount, `dematAccount` → DematAccount.
+
+Indexes:
+
+- `@@index([updatedAt])`
 
 ### MfInvestmentAccountNominee
 
@@ -1264,6 +1292,7 @@ Indexes:
 - `@@index([schemeIsin])`
 - `@@index([planId])`
 - `@@index([folioNumber])`
+- `@@index([updatedAt])`
 
 ### MfRedemption
 
@@ -1415,6 +1444,11 @@ POST /v2/mf_purchase_plans — a SIP when `systematic`, otherwise a scheduled se
 | `gateway` | OrderGateway |  |  |
 | `autoGenerateInstallments` | Boolean |  | True delegates installment generation to FP. False means we call the installment API ourselves, and FP then leaves nextInstallmentDate null. |
 | `generateFirstInstallmentNow` | Boolean |  | Generates the first installment immediately, bypassing the minimum gap. Purchase plans only. No payment is auto-created for that installment. |
+| `pauseFpId` | VarChar(64)? |  | Mirror of the newest live FP skip instruction (the pause), so a list can say "paused" without one FP call per SIP — FP rate-limits that burst. Written on pause/resume and re-read by the background sync; null = none. |
+| `pauseState` | VarChar(40)? |  | FP's upper-case state: PENDING, ACTIVE, CANCELLATION_REQUESTED. |
+| `pauseFrom` | Date? |  |  |
+| `pauseTo` | Date? |  |  |
+| `pauseSyncedAt` | Timestamptz(3)? |  |  |
 | `paymentMethod` | PlanPaymentMethod? |  | Mandate that funds the installments. `paymentSourceRef` is FP's own reference to the instrument (the mandate's numeric id as a string), kept verbatim alongside our foreign key. |
 | `paymentSourceRef` | VarChar(64)? |  |  |
 | `mandateId` | Uuid? |  |  |
@@ -1884,7 +1918,8 @@ Table `audit_logs`.
 |---|---|---|---|
 | `id` | Uuid | PK |  |
 | `actorId` | Uuid? |  | Kept as SetNull so purging an actor never destroys the audit trail. |
-| `actorRole` | UserRole? |  | The actor's role at the time of the action — roles change, history must not. The admin subdomain reads this, not the current User.role. |
+| `actorStaffId` | Uuid? |  | Set instead of actorId when a staff member acted. A CHECK constraint keeps the two exclusive; neither set means the system (a job, a webhook) did. |
+| `actorRole` | UserRole? |  | The investor actor's role at the time of the action — roles change, history must not. |
 | `action` | VarChar(100) |  |  |
 | `entityType` | VarChar(60) |  |  |
 | `entityId` | VarChar(64)? |  |  |
@@ -1894,13 +1929,346 @@ Table `audit_logs`.
 | `requestId` | VarChar(64)? |  |  |
 | `createdAt` | DateTime |  |  |
 
-Relations: `actor` → User.
+Relations: `actor` → User, `actorStaff` → StaffUser.
 
 Indexes:
 
 - `@@index([actorId, createdAt])`
+- `@@index([actorStaffId, createdAt])`
 - `@@index([entityType, entityId])`
 - `@@index([action, createdAt])`
+
+### CartItem
+
+Table `cart_items`.
+
+A fund the investor means to buy, kept on the server so the cart follows them across devices. One row per fund and type: adding it again changes the amount rather than stacking a second line.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `userId` | Uuid |  |  |
+| `schemeId` | Uuid |  |  |
+| `type` | CartItemType |  |  |
+| `amount` | Decimal(14, 2) |  | The one-time amount, or the monthly SIP instalment. |
+| `createdAt` | Timestamptz(3) |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
+
+Relations: `user` → User, `scheme` → MfScheme.
+
+Indexes:
+
+- `@@unique([userId, schemeId, type])`
+- `@@index([userId])`
+
+### CartCheckout
+
+Table `cart_checkouts`.
+
+One checkout of the cart: a snapshot of its items and the FP orders and plans placed for them, confirmed together with a single transaction OTP.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `userId` | Uuid |  |  |
+| `mfInvestmentAccountId` | Uuid |  |  |
+| `mandateId` | Uuid? |  | The approved mandate every SIP in this checkout is debited by. |
+| `installmentDay` | Int? |  | Day of the month the SIPs debit on. |
+| `consentedAt` | Timestamptz(3)? |  | When the one OTP was spent and every order and plan carried its consent. |
+| `createdAt` | Timestamptz(3) |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
+
+Relations: `user` → User, `mfInvestmentAccount` → MfInvestmentAccount, `items` → CartCheckoutItem.
+
+Indexes:
+
+- `@@index([userId, createdAt])`
+
+### CartCheckoutItem
+
+Table `cart_checkout_items`.
+
+A line of a checkout, and what FP made of it.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `checkoutId` | Uuid |  |  |
+| `isin` | VarChar(12) |  |  |
+| `type` | CartItemType |  |  |
+| `amount` | Decimal(14, 2) |  |  |
+| `sourceRefId` | VarChar(64) | UK | FP's idempotency anchor for this line's order or plan. FP refuses a second create carrying it, which is what makes a retried checkout safe. |
+| `mfPurchaseId` | Uuid? | UK | Our `MfPurchase.id` for a lumpsum, once FP has created it. |
+| `mfPurchasePlanId` | Uuid? | UK | Our `MfPurchasePlan.id` for a SIP, once FP has created it. |
+| `error` | VarChar(500)? |  | Why FP refused to create this line, in its own words. |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `checkout` → CartCheckout.
+
+Indexes:
+
+- `@@index([checkoutId])`
+
+### Notification
+
+Table `notifications`.
+
+Something the investor should see about their money, raised when an order, plan or payment reaches a state that matters to them.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `userId` | Uuid |  |  |
+| `category` | NotificationCategory |  |  |
+| `title` | VarChar(160) |  |  |
+| `body` | VarChar(500) |  |  |
+| `targetType` | VarChar(20)? |  | Where tapping it goes: `order` or `plan`, and our id for it. |
+| `targetId` | Uuid? |  |  |
+| `dedupeKey` | VarChar(160) |  | One notification per event: `order:<id>:successful`. A re-sync of the same state, from a webhook, a refresh or the reconciler, raises nothing. |
+| `readAt` | Timestamptz(3)? |  |  |
+| `createdAt` | Timestamptz(3) |  | When the event happened, not when we noticed it. |
+
+Relations: `user` → User.
+
+Indexes:
+
+- `@@unique([userId, dedupeKey])`
+- `@@index([userId, createdAt])`
+
+### MarketHoliday
+
+Table `market_holidays`.
+
+A day the exchanges are shut for mutual fund business (NSE's "MF" segment holiday list). Weekends are not stored; the code knows them. An order placed on one of these days is processed at the next business day's NAV.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `date` | Date | UK |  |
+| `name` | VarChar(120) |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
+
+### StaffUser
+
+Table `staff_users`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `email` | VarChar(255) | UK | Stored lower-case; a CHECK constraint enforces it, so uniqueness is case-insensitive without citext. |
+| `fullName` | VarChar(150) |  |  |
+| `phone` | VarChar(20)? |  | Contact only. Never a credential. |
+| `status` | StaffStatus |  |  |
+| `mfaRequired` | Boolean |  | Off only for break-glass service accounts; every person keeps it on. |
+| `lastLoginAt` | Timestamptz(3)? |  |  |
+| `createdById` | Uuid? |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
+| `deactivatedAt` | Timestamptz(3)? |  |  |
+
+Relations: `createdBy` → StaffUser, `created` → StaffUser, `credential` → StaffCredential, `mfaFactors` → StaffMfaFactor, `sessions` → StaffSession, `roles` → StaffUserRole, `rolesGranted` → StaffUserRole, `loginEvents` → StaffLoginEvent, `auditLogs` → AuditLog.
+
+Indexes:
+
+- `@@index([status])`
+
+### StaffCredential
+
+Table `staff_credentials`.
+
+The password, apart from the profile so reading a staff member never loads the hash. An SSO-only account would simply have no row.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `staffUserId` | Uuid | PK |  |
+| `passwordHash` | VarChar(255) |  | Argon2id. |
+| `passwordChangedAt` | Timestamptz(3) |  |  |
+| `mustChange` | Boolean |  | Set when an operator issues a password; cleared once the owner changes it. |
+| `failedAttempts` | Int |  |  |
+| `lockedUntil` | Timestamptz(3)? |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
+
+Relations: `staffUser` → StaffUser.
+
+### StaffMfaFactor
+
+Table `staff_mfa_factors`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `staffUserId` | Uuid |  |  |
+| `type` | StaffMfaType |  |  |
+| `secretEncrypted` | Bytes |  | AES-256-GCM under STAFF_MFA_ENCRYPTION_KEY, so a database dump alone cannot mint codes. |
+| `confirmedAt` | Timestamptz(3)? |  | Null until the first code proves the authenticator was set up. |
+| `lastUsedStep` | Int? |  | The last TOTP time-step accepted; a code is never accepted twice. |
+| `lastUsedAt` | Timestamptz(3)? |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `staffUser` → StaffUser.
+
+Indexes:
+
+- `@@index([staffUserId])`
+
+### StaffSession
+
+Table `staff_sessions`.
+
+An opaque bearer token (only its SHA-256 is stored). A session starts MFA-pending and short-lived; passing MFA promotes it to a full session.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `staffUserId` | Uuid |  |  |
+| `tokenHash` | VarChar(64) | UK |  |
+| `mfaVerifiedAt` | Timestamptz(3)? |  |  |
+| `mfaFailedAttempts` | Int |  |  |
+| `lastSeenAt` | Timestamptz(3) |  | Idle timeout is measured from here. |
+| `expiresAt` | Timestamptz(3) |  | Absolute lifetime; never extended by activity. |
+| `revokedAt` | Timestamptz(3)? |  |  |
+| `revokedReason` | VarChar(40)? |  | LOGOUT \| MFA_FAILED \| PASSWORD_CHANGED |
+| `ipAddress` | VarChar(45)? |  |  |
+| `userAgent` | VarChar(300)? |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `staffUser` → StaffUser.
+
+Indexes:
+
+- `@@index([staffUserId, expiresAt])`
+
+### StaffLoginEvent
+
+Table `staff_login_events`.
+
+Every sign-in attempt, good or bad: lockout, investigation and alerting all read this. Kept even for unknown emails, which is what a credential- stuffing run looks like.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `id` | Uuid | PK |  |
+| `staffUserId` | Uuid? |  |  |
+| `email` | VarChar(255) |  |  |
+| `outcome` | StaffLoginOutcome |  |  |
+| `ipAddress` | VarChar(45)? |  |  |
+| `userAgent` | VarChar(300)? |  |  |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `staffUser` → StaffUser.
+
+Indexes:
+
+- `@@index([staffUserId, createdAt])`
+- `@@index([email, createdAt])`
+- `@@index([ipAddress, createdAt])`
+
+### Permission
+
+Table `permissions`.
+
+A capability code checks, e.g. `investors.read`. The set is fixed by code (`src/types/staff.types.ts`) and seeded by migration; roles group them.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `key` | VarChar(60) | PK |  |
+| `description` | VarChar(200) |  |  |
+
+Relations: `roles` → RolePermission.
+
+### Role
+
+Table `roles`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `key` | VarChar(40) | PK | SUPER_ADMIN, OPERATIONS, SUPPORT, READ_ONLY, or one ops defines later. |
+| `name` | VarChar(80) |  |  |
+| `description` | VarChar(200)? |  |  |
+| `isSystem` | Boolean |  | Seeded roles; the portal must not edit or delete them. |
+| `createdAt` | Timestamptz(3) |  |  |
+
+Relations: `permissions` → RolePermission, `staff` → StaffUserRole.
+
+### RolePermission
+
+Table `role_permissions`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `roleKey` | VarChar(40) |  |  |
+| `permissionKey` | VarChar(60) |  |  |
+
+Relations: `role` → Role, `permission` → Permission.
+
+### StaffUserRole
+
+Table `staff_user_roles`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `staffUserId` | Uuid |  |  |
+| `roleKey` | VarChar(40) |  |  |
+| `grantedById` | Uuid? |  |  |
+| `grantedAt` | Timestamptz(3) |  |  |
+
+Relations: `staffUser` → StaffUser, `role` → Role, `grantedBy` → StaffUser.
+
+Indexes:
+
+- `@@index([roleKey])`
+
+### InvestorJourneySnapshot
+
+Table `investor_journey_snapshots`.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `userId` | Uuid | PK |  |
+| `name` | VarChar(150)? |  |  |
+| `email` | VarChar(255)? |  |  |
+| `phone` | VarChar(20) |  |  |
+| `pan` | VarChar(10)? |  |  |
+| `userStatus` | VarChar(30) |  |  |
+| `stage` | VarChar(30) |  |  |
+| `kycStatus` | VarChar(30) |  |  |
+| `kycVia` | VarChar(20)? |  |  |
+| `kycFormStatus` | VarChar(30)? |  | The latest KYC form's state, for the next-step breakdown. |
+| `kycProofStatus` | VarChar(30)? |  |  |
+| `kycSignatureProvided` | Boolean? |  |  |
+| `kycFieldsNeeded` | VarChar(60)[] |  |  |
+| `kycMovedAt` | Timestamptz(3)? |  | When the open form last moved. "Stalled" is judged at read time against now(), because time passing changes no row. |
+| `kycCompletedAt` | Timestamptz(3)? |  |  |
+| `hasProfile` | Boolean |  |  |
+| `hasAccount` | Boolean |  |  |
+| `purchases` | Int |  |  |
+| `investedAmount` | Decimal(18, 2) |  |  |
+| `signedUpAt` | Timestamptz(3) |  |  |
+| `lastLoginAt` | Timestamptz(3)? |  |  |
+| `lastActivityAt` | Timestamptz(3) |  |  |
+| `refreshedAt` | Timestamptz(3) |  |  |
+
+Indexes:
+
+- `@@index([signedUpAt(sort: Desc), userId(sort: Desc)])`
+- `@@index([stage, signedUpAt(sort: Desc)])`
+- `@@index([kycStatus, signedUpAt(sort: Desc)])`
+- `@@index([kycCompletedAt])`
+
+### ProjectionCheckpoint
+
+Table `projection_checkpoints`.
+
+Progress and a lease for a background projection. The lease is a row, not a Postgres advisory lock, because session locks do not survive the transaction-mode pooler the app connects through.
+
+| Column | Type | Key | Notes |
+|---|---|---|---|
+| `name` | VarChar(60) | PK |  |
+| `watermark` | Timestamptz(3)? |  | Rows changed after this have not been applied yet. |
+| `lastFullAt` | Timestamptz(3)? |  |  |
+| `leaseUntil` | Timestamptz(3)? |  |  |
+| `leaseHolder` | VarChar(80)? |  |  |
+| `updatedAt` | Timestamptz(3) |  |  |
 
 ## Enums
 
@@ -1910,7 +2278,7 @@ A `@map` value means the Postgres label is FP's exact wire string, so a row read
 
 Postgres type `UserRole`. Ours.
 
-`INVESTOR`, `DISTRIBUTOR`, `ADMIN`, `SUPPORT`
+`INVESTOR`, `DISTRIBUTOR`
 
 ### UserStatus
 
@@ -2027,12 +2395,26 @@ Postgres type `gender`. Mirrors FP's wire values.
 
 ### MaritalStatus
 
+kyc_request.marital_status. FP's KYC vocabulary uses `unmarried`; the investor profile uses `single` for the same idea — see ProfileMaritalStatus. Two vocabularies, like Occupation / KycOccupationType. Do not merge them.
+
 Postgres type `marital_status`. Mirrors FP's wire values.
 
 | TypeScript | Database / FP wire |
 |---|---|
 | `MARRIED` | `married` |
 | `UNMARRIED` | `unmarried` |
+| `OTHERS` | `others` |
+
+### ProfileMaritalStatus
+
+investor_profile.marital_status. Same idea as MaritalStatus, different spelling: FP's profile object returns `single`, never `unmarried`. Mirroring a profile through the KYC enum silently dropped this field to null.
+
+Postgres type `profile_marital_status`. Mirrors FP's wire values.
+
+| TypeScript | Database / FP wire |
+|---|---|
+| `MARRIED` | `married` |
+| `SINGLE` | `single` |
 | `OTHERS` | `others` |
 
 ### Occupation
@@ -2600,4 +2982,38 @@ Postgres type `settlement_payment_type`. Mirrors FP's wire values.
 | `NACH` | `nach` |
 | `NEFT` | `neft` |
 | `RTGS` | `rtgs` |
+
+### CartItemType
+
+How a fund sits in the cart: a one-time purchase or a monthly SIP.
+
+Postgres type `CartItemType`. Ours.
+
+`LUMPSUM`, `SIP`
+
+### NotificationCategory
+
+The pill a notification carries in the list.
+
+Postgres type `NotificationCategory`. Ours.
+
+`ORDER`, `PLAN`, `PAYMENT`, `ACTION`, `ACCOUNT`, `MARKET`
+
+### StaffStatus
+
+Postgres type `StaffStatus`. Ours.
+
+`ACTIVE`, `SUSPENDED`, `DEACTIVATED`
+
+### StaffMfaType
+
+Postgres type `StaffMfaType`. Ours.
+
+`TOTP`
+
+### StaffLoginOutcome
+
+Postgres type `StaffLoginOutcome`. Ours.
+
+`SUCCESS`, `BAD_PASSWORD`, `UNKNOWN_EMAIL`, `INACTIVE`, `LOCKED`, `MFA_SUCCESS`, `MFA_FAILED`
 
