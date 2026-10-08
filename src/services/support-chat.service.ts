@@ -17,7 +17,7 @@ import { Prisma } from "../../generated/prisma/client.ts";
 import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { maskEmail, maskPan, maskTail } from "../utils/mask.ts";
-import { createTicketFromChat, reference } from "./support-ticket.service.ts";
+import { createTicketFromChat, notifyRaisedFromChat, reference } from "./support-ticket.service.ts";
 import type {
   BotReplyInput,
   ChatDetailDto,
@@ -33,6 +33,12 @@ import type { StaffPrincipal } from "../types/staff.types.ts";
 
 /** A bot-only chat idle this long is over; the investor's next message starts a new one. */
 const BOT_IDLE_MS = 12 * 60 * 60 * 1000;
+/**
+ * A chat with a person that nobody has written in for this long is abandoned —
+ * the investor gave up waiting, or the case moved to a ticket. Without this a
+ * chat nobody picked up would hold the investor away from Ri for good.
+ */
+const HUMAN_IDLE_MS = 3 * 24 * 60 * 60 * 1000;
 /** A closed chat stays on the investor's screen this long, so they see how it ended. */
 const RECENTLY_CLOSED_MS = 24 * 60 * 60 * 1000;
 const MESSAGE_LIMIT = 200;
@@ -44,10 +50,14 @@ const SYSTEM = {
   joined: (name: string) => `${name} from RiSips has joined the chat.`,
   handBack: "You're chatting with Ri again. Tap “Talk to a person” any time.",
   closed: "This chat has been closed. Send a message any time to start a new one.",
+  endedByInvestor: "You ended this chat. Send a message any time to start a new one.",
+  abandoned: "This chat was closed after 3 days without a message. Send a message any time to start a new one.",
   ticket: (ref: string) => `We've raised request ${ref} for this. You can follow it in Support → My requests.`,
 };
 
 // --- shapes ----------------------------------------------------------------------
+
+type Tx = Prisma.TransactionClient;
 
 const messageSelect = {
   id: true, sender: true, body: true, intent: true, createdAt: true, staff: { select: { fullName: true } },
@@ -98,14 +108,54 @@ async function openConversation(userId: string): Promise<{ id: string; handler: 
     select: { id: true, handler: true, lastMessageAt: true },
   });
   if (!open) return null;
-  if (open.handler === "BOT" && Date.now() - open.lastMessageAt.getTime() > BOT_IDLE_MS) {
+  const idle = Date.now() - open.lastMessageAt.getTime();
+  if (open.handler === "BOT" && idle > BOT_IDLE_MS) {
     await db.chatConversation.updateMany({
       where: { id: open.id, handler: "BOT", status: { not: "CLOSED" } },
       data: { status: "CLOSED", closedAt: new Date() },
     });
     return null;
   }
+  if (open.handler === "HUMAN" && idle > HUMAN_IDLE_MS) {
+    const now = new Date();
+    // Guarded on the same idle stamp, so a message that lands meanwhile keeps the chat open.
+    const closed = await db.chatConversation.updateMany({
+      where: { id: open.id, status: { not: "CLOSED" }, lastMessageAt: open.lastMessageAt },
+      data: { status: "CLOSED", closedAt: now, lastMessageAt: now },
+    });
+    if (closed.count) {
+      await db.chatMessage.create({ data: { conversationId: open.id, sender: "SYSTEM", body: SYSTEM.abandoned, createdAt: now } });
+      return null;
+    }
+    return openConversation(userId);
+  }
   return { id: open.id, handler: open.handler };
+}
+
+/**
+ * Lock the conversation for a write by the investor. Null when staff closed it
+ * after it was looked up — the caller starts a new one rather than writing
+ * into a chat nobody is reading.
+ */
+async function lockOpen(tx: Tx, id: string): Promise<{ handler: "BOT" | "HUMAN" } | null> {
+  const [row] = await tx.$queryRaw<{ handler: "BOT" | "HUMAN"; status: string }[]>`
+    SELECT handler::text AS handler, status::text AS status FROM chat_conversations WHERE id = ${id}::uuid FOR UPDATE`;
+  return row && row.status !== "CLOSED" ? { handler: row.handler } : null;
+}
+
+/** Run an investor write on their open conversation, starting over once if staff closed it in between. */
+async function onOpenConversation(userId: string, write: (tx: Tx, id: string, handler: "BOT" | "HUMAN") => Promise<void>): Promise<string> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const conversation = await ensureConversation(userId);
+    const done = await db.$transaction(async (tx) => {
+      const locked = await lockOpen(tx, conversation.id);
+      if (!locked) return false;
+      await write(tx, conversation.id, locked.handler);
+      return true;
+    });
+    if (done) return conversation.id;
+  }
+  throw HttpError.conflict("The chat changed while sending. Try again.");
 }
 
 /** Open or start the investor's conversation. The partial unique index settles a race between two first messages. */
@@ -147,62 +197,64 @@ async function loadMyChat(id: string): Promise<InvestorChatDto> {
  * flagged instead.
  */
 export async function sendMyMessage(userId: string, body: string, botReply?: BotReplyInput): Promise<InvestorChatDto> {
-  const conversation = await ensureConversation(userId);
-  const now = new Date();
-  await db.$transaction(async (tx) => {
-    const [locked] = await tx.$queryRaw<{ handler: "BOT" | "HUMAN" }[]>`
-      SELECT handler FROM chat_conversations WHERE id = ${conversation.id}::uuid FOR UPDATE`;
-    await tx.chatMessage.create({ data: { conversationId: conversation.id, sender: "INVESTOR", body, createdAt: now } });
-    const botAnswers = locked?.handler === "BOT" && botReply;
+  const id = await onOpenConversation(userId, async (tx, conversationId, handler) => {
+    const now = new Date();
+    await tx.chatMessage.create({ data: { conversationId, sender: "INVESTOR", body, createdAt: now } });
+    const botAnswers = handler === "BOT" && botReply;
     if (botAnswers) {
       // A millisecond later, so ordering by time can never put the answer first.
       await tx.chatMessage.create({
         data: {
-          conversationId: conversation.id, sender: "BOT", body: botReply.body,
+          conversationId, sender: "BOT", body: botReply.body,
           intent: botReply.intent ?? null, createdAt: new Date(now.getTime() + 1),
         },
       });
     }
     await tx.chatConversation.update({
-      where: { id: conversation.id },
+      where: { id: conversationId },
       data: {
         lastMessageAt: now,
         ...(botAnswers && botReply.intent && { lastIntent: botReply.intent }),
-        ...(locked?.handler === "HUMAN" && { unreadByStaff: true }),
+        ...(handler === "HUMAN" && { unreadByStaff: true }),
       },
     });
   });
-  return loadMyChat(conversation.id);
+  return loadMyChat(id);
 }
 
 /** "Talk to a person": the bot steps aside and the chat joins the staff queue. */
 export async function requestHuman(userId: string): Promise<InvestorChatDto> {
-  const conversation = await ensureConversation(userId);
-  await db.$transaction(async (tx) => {
-    const current = await tx.chatConversation.findUniqueOrThrow({
-      where: { id: conversation.id },
-      select: { handler: true, assignedStaffId: true },
-    });
+  const id = await onOpenConversation(userId, async (tx, conversationId, handler) => {
     // Already with a person: asking again changes nothing.
-    if (current.handler === "HUMAN") return;
+    if (handler === "HUMAN") return;
     const now = new Date();
-    await tx.chatMessage.create({ data: { conversationId: conversation.id, sender: "SYSTEM", body: SYSTEM.handover, createdAt: now } });
+    await tx.chatMessage.create({ data: { conversationId, sender: "SYSTEM", body: SYSTEM.handover, createdAt: now } });
     await tx.chatConversation.update({
-      where: { id: conversation.id },
+      where: { id: conversationId },
       data: {
         handler: "HUMAN", status: "WAITING_FOR_AGENT", handoverRequestedAt: now,
         assignedStaffId: null, unreadByStaff: true, lastMessageAt: now,
       },
     });
   });
-  return loadMyChat(conversation.id);
+  return loadMyChat(id);
 }
 
 /** The investor ends the chat. */
 export async function endMyChat(userId: string): Promise<InvestorChatDto | null> {
   const open = await openConversation(userId);
   if (!open) return getMyChat(userId);
-  await db.chatConversation.update({ where: { id: open.id }, data: { status: "CLOSED", closedAt: new Date() } });
+  await db.$transaction(async (tx) => {
+    // Staff may have closed it a moment ago; ending it twice changes nothing.
+    if (!(await lockOpen(tx, open.id))) return;
+    const now = new Date();
+    // A line staff can see, so a chat that vanished from the queue says why.
+    await tx.chatMessage.create({ data: { conversationId: open.id, sender: "SYSTEM", body: SYSTEM.endedByInvestor, createdAt: now } });
+    await tx.chatConversation.update({
+      where: { id: open.id },
+      data: { status: "CLOSED", closedAt: now, lastMessageAt: now, unreadByStaff: false },
+    });
+  });
   return loadMyChat(open.id);
 }
 
@@ -300,13 +352,16 @@ export async function getChat(id: string): Promise<ChatDetailDto> {
   };
 }
 
-type Tx = Prisma.TransactionClient;
-
-async function openForStaff(tx: Tx, id: string) {
+async function lockForStaff(tx: Tx, id: string) {
   const [row] = await tx.$queryRaw<{ id: string; status: string; handler: string; assignedStaffId: string | null; userId: string }[]>`
     SELECT id, status::text, handler::text, "assignedStaffId", "userId"
     FROM chat_conversations WHERE id = ${id}::uuid FOR UPDATE`;
   if (!row) throw HttpError.notFound("No chat with that id");
+  return row;
+}
+
+async function openForStaff(tx: Tx, id: string) {
+  const row = await lockForStaff(tx, id);
   if (row.status === "CLOSED") throw HttpError.conflict("This chat is closed");
   return row;
 }
@@ -373,12 +428,37 @@ export async function closeChat(id: string, _viewer: StaffPrincipal): Promise<Ch
 }
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+/** `support_ticket_messages.body` is varchar(4000). */
+const TICKET_MESSAGE_LIMIT = 4000;
 const SENDER_LABEL = { INVESTOR: "Investor", BOT: "Ri (bot)", STAFF: "Staff", SYSTEM: "System" } as const;
 
-/** Turn the chat into a ticket, with the transcript attached for whoever works it. */
+/** Keep a transcript inside a ticket message, dropping the oldest lines first: the end is what the ticket is about. */
+export function fitTranscript(lines: string[], limit: number): string {
+  const head = "Chat transcript";
+  const cut = "Chat transcript (earliest messages left out; open the chat for all of it)";
+  const full = [head, ...lines].join("\n");
+  if (full.length <= limit) return full;
+  const kept: string[] = [];
+  let size = cut.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? "";
+    if (size + 1 + line.length > limit) break;
+    kept.unshift(line);
+    size += 1 + line.length;
+  }
+  // One line longer than the whole budget: keep its end rather than nothing.
+  if (kept.length === 0) return `${cut}\n${(lines.at(-1) ?? "").slice(-(limit - cut.length - 1))}`;
+  return [cut, ...kept].join("\n");
+}
+
+/**
+ * Turn the chat into a ticket, with the transcript attached for whoever works
+ * it. A closed chat can be escalated too: closing it first and then deciding it
+ * needs follow-up is the usual order.
+ */
 export async function escalate(id: string, input: EscalateChatInput, viewer: StaffPrincipal): Promise<ChatDetailDto> {
-  await db.$transaction(async (tx) => {
-    const row = await openForStaff(tx, id);
+  const raised = await db.$transaction(async (tx) => {
+    const row = await lockForStaff(tx, id);
     const existing = await tx.supportTicket.findUnique({ where: { chatConversationId: id }, select: { id: true } });
     if (existing) throw HttpError.conflict("This chat already has a ticket");
     const messages = await tx.chatMessage.findMany({
@@ -386,13 +466,13 @@ export async function escalate(id: string, input: EscalateChatInput, viewer: Sta
       orderBy: { createdAt: "asc" },
       select: { sender: true, body: true, createdAt: true, staff: { select: { fullName: true } } },
     });
-    const transcript = [
-      "Chat transcript",
-      ...messages.map((message) => {
+    const transcript = fitTranscript(
+      messages.map((message) => {
         const at = new Date(message.createdAt.getTime() + IST_OFFSET_MS).toISOString().slice(0, 16).replace("T", " ");
         return `[${at}] ${message.staff?.fullName ?? SENDER_LABEL[message.sender]}: ${message.body}`;
       }),
-    ].join("\n");
+      TICKET_MESSAGE_LIMIT,
+    );
     const ticket = await createTicketFromChat(tx, {
       userId: row.userId, conversationId: id, subject: input.subject, category: input.category,
       priority: input.priority, transcript,
@@ -402,6 +482,9 @@ export async function escalate(id: string, input: EscalateChatInput, viewer: Sta
       data: { conversationId: id, sender: "SYSTEM", body: SYSTEM.ticket(reference(ticket.number)), createdAt: now },
     });
     await tx.chatConversation.update({ where: { id }, data: { lastMessageAt: now } });
+    return { ...ticket, userId: row.userId };
   });
+  // The chat line only reaches an investor still in the chat; this reaches the rest.
+  await notifyRaisedFromChat(raised, input.subject);
   return getChat(id);
 }

@@ -142,7 +142,11 @@ export interface InvestorTicketDto {
   category: TicketCategory;
   /** Collapsed for the investor: "Open", "Awaiting your reply", "Resolved", "Closed". */
   status: TicketStatus;
+  /** Where it was raised: the app's form, the chat, or by staff (phone, email). */
+  channel: TicketChannel;
   unread: boolean;
+  /** The newest public message, for the list. */
+  lastMessage: { author: TicketMessageDto["author"]; body: string } | null;
   lastMessageAt: string;
   createdAt: string;
 }
@@ -150,7 +154,10 @@ export interface InvestorTicketDto {
 export interface InvestorTicketDetailDto extends InvestorTicketDto {
   related: { type: TicketRelatedType; id: string } | null;
   canReply: boolean;
+  resolvedAt: string | null;
   messages: TicketMessageDto[];
+  /** The chat it was raised from, so the investor can read it back. Null for other channels. */
+  chat: { startedAt: string; messages: ChatMessageDto[] } | null;
 }
 
 export interface CreateInvestorTicketInput {

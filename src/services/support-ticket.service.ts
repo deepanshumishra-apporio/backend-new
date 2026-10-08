@@ -15,6 +15,7 @@ import { HttpError } from "../utils/http-error.ts";
 import { maskEmail, maskPan, maskTail } from "../utils/mask.ts";
 import { notify } from "./notification.service.ts";
 import type {
+  ChatMessageDto,
   CreateInvestorTicketInput,
   CreateStaffTicketInput,
   InvestorTicketDetailDto,
@@ -300,6 +301,19 @@ async function notifyReply(ticket: { id: string; number: number; userId: string;
   });
 }
 
+/** A ticket staff raised from the investor's chat. Best effort: the ticket stands if the notification fails. */
+export async function notifyRaisedFromChat(ticket: { id: string; number: number; userId: string }, subject: string) {
+  await notify({
+    userId: ticket.userId,
+    category: "ACCOUNT",
+    title: `We raised request ${reference(ticket.number)} for you`,
+    body: `${subject}. Follow it, and read your chat again, in My requests.`,
+    dedupeKey: `ticket:${ticket.id}:raised`,
+    targetType: "ticket",
+    targetId: ticket.id,
+  }).catch((error: unknown) => console.error("[support] could not notify about a chat ticket", error));
+}
+
 /** Staff raising a ticket for an investor — a phone call or an email. */
 export async function createStaffTicket(input: CreateStaffTicketInput, viewer: StaffPrincipal): Promise<TicketDetailDto> {
   const user = await db.user.findFirst({ where: { id: input.userId, role: "INVESTOR", deletedAt: null }, select: { id: true } });
@@ -408,9 +422,13 @@ export async function staffReply(id: string, input: StaffReplyInput, viewer: Sta
 // --- the investor's side ---------------------------------------------------------------
 
 const investorSelect = {
-  id: true, number: true, subject: true, category: true, status: true, unreadByInvestor: true,
+  id: true, number: true, subject: true, category: true, status: true, channel: true, unreadByInvestor: true,
   lastMessageAt: true, createdAt: true,
+  messages: { where: { internal: false }, orderBy: { createdAt: "desc" }, take: 1, select: { author: true, body: true } },
 } as const satisfies Prisma.SupportTicketSelect;
+
+/** How much of a chat a ticket replays: the whole of any real conversation. */
+const CHAT_REPLAY_LIMIT = 300;
 
 type InvestorRow = Prisma.SupportTicketGetPayload<{ select: typeof investorSelect }>;
 
@@ -420,7 +438,9 @@ const toInvestorTicket = (row: InvestorRow): InvestorTicketDto => ({
   subject: row.subject,
   category: row.category,
   status: row.status,
+  channel: row.channel,
   unread: row.unreadByInvestor,
+  lastMessage: row.messages[0] ? { author: row.messages[0].author, body: row.messages[0].body.slice(0, 160) } : null,
   lastMessageAt: row.lastMessageAt.toISOString(),
   createdAt: row.createdAt.toISOString(),
 });
@@ -440,20 +460,46 @@ export async function getMyTicket(userId: string, id: string): Promise<InvestorT
   const row = await db.supportTicket.findFirst({
     where: { id, userId },
     select: {
-      ...investorSelect, relatedType: true, relatedId: true,
+      ...investorSelect, relatedType: true, relatedId: true, resolvedAt: true,
       messages: {
         where: { internal: false },
         orderBy: { createdAt: "asc" },
         select: { id: true, author: true, body: true, createdAt: true, staff: { select: { fullName: true } } },
       },
+      chatConversation: {
+        select: {
+          createdAt: true,
+          messages: {
+            orderBy: { createdAt: "desc" },
+            take: CHAT_REPLAY_LIMIT,
+            select: { id: true, sender: true, body: true, intent: true, createdAt: true, staff: { select: { fullName: true } } },
+          },
+        },
+      },
     },
   });
   if (!row) throw HttpError.notFound("No ticket with that id");
   if (row.unreadByInvestor) await db.supportTicket.update({ where: { id }, data: { unreadByInvestor: false } });
+  const last = row.messages.at(-1);
+  const chat = row.chatConversation;
   return {
-    ...toInvestorTicket({ ...row, unreadByInvestor: false }),
+    ...toInvestorTicket({ ...row, unreadByInvestor: false, messages: last ? [last] : [] }),
     related: row.relatedType && row.relatedId ? { type: row.relatedType as TicketRelatedType, id: row.relatedId } : null,
     canReply: row.status !== "CLOSED",
+    resolvedAt: row.resolvedAt?.toISOString() ?? null,
+    chat: chat
+      ? {
+          startedAt: chat.createdAt.toISOString(),
+          messages: [...chat.messages].reverse().map((message): ChatMessageDto => ({
+            id: message.id,
+            sender: message.sender,
+            staffName: message.staff ? firstName(message.staff.fullName) : null,
+            body: message.body,
+            intent: message.intent,
+            createdAt: message.createdAt.toISOString(),
+          })),
+        }
+      : null,
     messages: row.messages.map((message): TicketMessageDto => ({
       id: message.id,
       author: message.author,
@@ -530,7 +576,7 @@ export async function createTicketFromChat(
     select: { id: true, number: true },
   });
   await tx.supportTicketMessage.create({
-    data: { ticketId: ticket.id, author: "SYSTEM", body: input.transcript.slice(0, 4000), internal: true },
+    data: { ticketId: ticket.id, author: "SYSTEM", body: input.transcript, internal: true },
   });
   await event(tx, ticket.id, viewer.staffId, "CREATED", null, "CHAT");
   return ticket;

@@ -103,3 +103,28 @@ test('a declined nomination is recorded, and is distinguishable from never asked
     'SELECT "nominationOptOutAt" FROM investor_onboardings WHERE id = $1', [asked]);
   assert.equal(reversed.nominationOptOutAt, null);
 });
+
+test('admins hold everything; sub-admins everything but Role Manager, which is a separate grant', async () => {
+  const { rows: [{ count }] } = await db.query('SELECT count(*)::int AS count FROM permissions');
+  const held = async (role) => (await db.query(
+    'SELECT "permissionKey" FROM role_permissions WHERE "roleKey" = $1', [role])).rows.map((row) => row.permissionKey);
+  assert.equal((await held('SUPER_ADMIN')).length, count);
+  const sub = await held('SUB_ADMIN');
+  assert.equal(sub.length, count - 1);
+  assert.ok(!sub.includes('roles.manage'));
+  assert.deepEqual(await held('ROLE_MANAGER'), ['roles.manage']);
+  const { rows } = await db.query(
+    `SELECT "roleKey" FROM role_permissions WHERE "permissionKey" = 'roles.manage' ORDER BY "roleKey"`);
+  assert.deepEqual(rows.map((row) => row.roleKey), ['ROLE_MANAGER', 'SUPER_ADMIN']);
+});
+
+test('a role still assigned to staff cannot be deleted', async () => {
+  await db.query(`INSERT INTO roles (key, name, "isSystem") VALUES ('BRANCH_DESK', 'Branch desk', false)`);
+  const staff = randomUUID();
+  await db.query(`INSERT INTO staff_users (id, email, "fullName", "updatedAt") VALUES ($1, $2, 'Desk', now())`,
+    [staff, `${staff}@example.test`]);
+  await db.query(`INSERT INTO staff_user_roles ("staffUserId", "roleKey") VALUES ($1, 'BRANCH_DESK')`, [staff]);
+  await assert.rejects(db.query(`DELETE FROM roles WHERE key = 'BRANCH_DESK'`));
+  await db.query(`DELETE FROM staff_user_roles WHERE "staffUserId" = $1`, [staff]);
+  await db.query(`DELETE FROM roles WHERE key = 'BRANCH_DESK'`);
+});

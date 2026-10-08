@@ -1,10 +1,12 @@
 /**
  * Every permission the code checks. The `permissions` table is seeded from
  * this list by migration; a key added here needs that migration too, or no
- * role can ever hold it.
+ * role can ever hold it. That migration should grant it to SUPER_ADMIN and
+ * SUB_ADMIN, who are meant to hold everything.
  */
 export const PERMISSIONS = [
-  "dashboard.read", "investors.read", "reports.read", "transactions.read", "support.manage", "compliance.manage", "announcements.manage", "staff.manage",
+  "dashboard.read", "investors.read", "reports.read", "transactions.read", "support.manage", "compliance.manage", "announcements.manage",
+  "portfolios.manage", "meetings.manage", "staff.manage", "roles.manage",
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
@@ -118,6 +120,25 @@ export interface CreateStaffByAdminInput {
   fullName: string;
   phone?: string;
   roleKeys: string[];
+}
+
+// --- Role Manager (the `roles.manage` permission) ---------------------------------
+
+export interface PermissionDto {
+  key: Permission;
+  description: string;
+}
+
+export interface CreateRoleInput {
+  name: string;
+  description: string | null;
+  permissions: Permission[];
+}
+
+export interface UpdateRoleInput {
+  name?: string;
+  description?: string | null;
+  permissions?: Permission[];
 }
 
 export interface UpdateStaffInput {

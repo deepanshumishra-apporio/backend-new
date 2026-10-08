@@ -5,10 +5,12 @@ import * as compliance from "../controllers/compliance.controller.ts";
 import * as reports from "../controllers/report.controller.ts";
 import * as support from "../controllers/admin-support.controller.ts";
 import * as transactions from "../controllers/admin-transaction.controller.ts";
+import * as roleAdmin from "../controllers/role-admin.controller.ts";
 import * as staffAdmin from "../controllers/staff-admin.controller.ts";
 import * as staffAuth from "../controllers/staff-auth.controller.ts";
 import {
   authenticateStaff,
+  requireAnyPermission,
   requireMfa,
   requireMfaPending,
   requirePasswordCurrent,
@@ -85,7 +87,13 @@ adminRouter.post("/support/chats/:chatId/close", manageSupport, support.closeCha
 adminRouter.post("/support/chats/:chatId/escalate", manageSupport, support.escalateChat);
 
 const manageStaff = requirePermission("staff.manage");
-adminRouter.get("/roles", manageStaff, staffAdmin.roles);
+const manageRoles = requirePermission("roles.manage");
+// Staff screens need the role list for their role picker; Role Manager needs it too.
+adminRouter.get("/roles", requireAnyPermission("staff.manage", "roles.manage"), staffAdmin.roles);
+adminRouter.get("/permissions", manageRoles, roleAdmin.permissionCatalogue);
+adminRouter.post("/roles", manageRoles, roleAdmin.create);
+adminRouter.patch("/roles/:roleKey", manageRoles, roleAdmin.update);
+adminRouter.delete("/roles/:roleKey", manageRoles, roleAdmin.remove);
 adminRouter.get("/staff", manageStaff, staffAdmin.list);
 adminRouter.post("/staff", manageStaff, staffAdmin.create);
 adminRouter.get("/staff/:staffId", manageStaff, staffAdmin.getOne);

@@ -52,7 +52,10 @@ export async function sendChatMessage(req: Request, res: Response) {
   if (body["botReply"] !== undefined && body["botReply"] !== null) {
     const reply = asBody(body["botReply"]);
     const intent = optionalString(reply, "intent", { maxLength: 60 });
-    botReply = { body: requiredString(reply, "body", { maxLength: 2000 }), ...(intent && { intent }) };
+    // Ri's answer is a record of what the app showed, not input to judge: a long
+    // list of SIPs is kept, cut to the column, rather than failing the investor's message.
+    const answer = requiredString(reply, "body", { maxLength: 20000 });
+    botReply = { body: answer.length > 2000 ? `${answer.slice(0, 1999)}…` : answer, ...(intent && { intent }) };
   }
   res.status(201).json({ data: await chats.sendMyMessage(investorId(req), text, botReply) });
 }

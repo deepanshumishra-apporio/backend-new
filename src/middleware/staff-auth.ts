@@ -5,6 +5,7 @@
 //   requireMfa            everything else: MFA passed
 //   requirePasswordCurrent  refuse data while an issued password is unchanged
 //   requirePermission(p)  the staff member holds p through one of their roles
+//   requireAnyPermission(...)  they hold at least one of these
 //
 // These are separate from `requireSession` (investors) on purpose — different
 // tables, different tokens — so neither gate can admit the other's users.
@@ -56,6 +57,14 @@ export const requirePermission = (...required: Permission[]): RequestHandler => 
   const { permissions } = staffPrincipal(req);
   if (!required.every((permission) => permissions.includes(permission))) {
     throw new HttpError(403, "FORBIDDEN", "Your role does not allow this", { required });
+  }
+  next();
+};
+
+export const requireAnyPermission = (...anyOf: Permission[]): RequestHandler => (req, _res, next) => {
+  const { permissions } = staffPrincipal(req);
+  if (!anyOf.some((permission) => permissions.includes(permission))) {
+    throw new HttpError(403, "FORBIDDEN", "Your role does not allow this", { anyOf });
   }
   next();
 };

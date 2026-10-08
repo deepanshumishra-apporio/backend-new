@@ -9,6 +9,9 @@
 //     credentials of someone holding one — if you already hold every
 //     permission that role carries. Otherwise `staff.manage` would be a way
 //     to mint a super admin.
+//   - Levels: Admin > Sub-admin > Operator (`utils/staff-hierarchy.ts`).
+//     Admins create and manage anyone; sub-admins create and manage operators
+//     only. Admin, Sub-admin and Role Manager access are an admin's to give.
 //   - Never zero super admins. Any change that would leave no ACTIVE staff
 //     member with SUPER_ADMIN is refused; there would be no one left who
 //     could manage staff at all.
@@ -21,6 +24,7 @@
 import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
 import { temporaryPassword } from "../utils/temp-password.ts";
+import { ADMIN_ONLY_ROLES, canManage, levelOf, roleSetProblem } from "../utils/staff-hierarchy.ts";
 import { passwordProblem } from "./staff-auth.service.ts";
 import type { Prisma } from "../../generated/prisma/client.ts";
 import {
@@ -77,9 +81,36 @@ function notSelf(actor: StaffPrincipal, targetId: string): void {
   }
 }
 
-/** The actor must already hold every permission of each of these roles. */
+async function actorRoles(actor: StaffPrincipal): Promise<string[]> {
+  const rows = await db.staffUserRole.findMany({ where: { staffUserId: actor.staffId }, select: { roleKey: true } });
+  return rows.map((row) => row.roleKey);
+}
+
+/** Sub-admins manage operators only; admins manage everyone. `roleKeys` are the target's. */
+async function assertOutranks(actor: StaffPrincipal, ...roleSets: string[][]): Promise<void> {
+  const mine = levelOf(await actorRoles(actor));
+  for (const roleKeys of roleSets) {
+    if (!canManage(mine, levelOf(roleKeys))) {
+      throw new HttpError(
+        403,
+        "STAFF_HIERARCHY",
+        mine === "SUB_ADMIN" ? "Sub-admins manage operators only. Ask an admin." : "Only admins and sub-admins manage staff.",
+      );
+    }
+  }
+}
+
+/**
+ * The actor must already hold every permission of each of these roles — and
+ * the roles that set a level (admin, sub-admin, Role Manager access) are
+ * handled only by an admin, since a sub-admin holds nearly the same
+ * permissions and could otherwise promote anyone, themselves included.
+ */
 async function assertCanHandle(actor: StaffPrincipal, roleKeys: string[]): Promise<void> {
   if (roleKeys.length === 0) return;
+  if (roleKeys.some((key) => ADMIN_ONLY_ROLES.includes(key)) && levelOf(await actorRoles(actor)) !== "ADMIN") {
+    throw new HttpError(403, "ROLE_ESCALATION", "Only an admin can create sub-admins, admins, or give Role Manager access");
+  }
   const grants = await db.rolePermission.findMany({
     where: { roleKey: { in: roleKeys } },
     select: { roleKey: true, permissionKey: true },
@@ -189,7 +220,10 @@ export async function getStaff(id: string): Promise<StaffDetailDto> {
 
 export async function createStaff(actor: StaffPrincipal, input: CreateStaffByAdminInput): Promise<TemporaryPasswordDto> {
   if (input.roleKeys.length === 0) throw HttpError.badRequest("Give them at least one role");
+  const problem = roleSetProblem(input.roleKeys);
+  if (problem) throw HttpError.badRequest(problem);
   await assertRolesExist(input.roleKeys);
+  await assertOutranks(actor, input.roleKeys);
   await assertCanHandle(actor, input.roleKeys);
   if (await db.staffUser.findUnique({ where: { email: input.email }, select: { id: true } })) {
     throw HttpError.conflict("A staff account with this email already exists");
@@ -215,6 +249,7 @@ export async function createStaff(actor: StaffPrincipal, input: CreateStaffByAdm
 export async function updateStaff(actor: StaffPrincipal, id: string, input: UpdateStaffInput): Promise<StaffDetailDto> {
   const target = await loadTarget(id);
   if (target.status === "DEACTIVATED") throw HttpError.conflict("A deactivated account can't be changed");
+  if (actor.staffId !== id) await assertOutranks(actor, target.roleKeys);
 
   const roleKeys = input.roleKeys ? [...new Set(input.roleKeys)] : undefined;
   const added = roleKeys?.filter((key) => !target.roleKeys.includes(key)) ?? [];
@@ -223,7 +258,10 @@ export async function updateStaff(actor: StaffPrincipal, id: string, input: Upda
   if (roleKeys) {
     notSelf(actor, id);
     if (roleKeys.length === 0) throw HttpError.badRequest("Give them at least one role");
+    const problem = roleSetProblem(roleKeys);
+    if (problem) throw HttpError.badRequest(problem);
     await assertRolesExist(roleKeys);
+    await assertOutranks(actor, roleKeys);
     await assertCanHandle(actor, [...added, ...removed]);
   }
 
@@ -257,6 +295,7 @@ export async function updateStaff(actor: StaffPrincipal, id: string, input: Upda
 export async function setStatus(actor: StaffPrincipal, id: string, status: StaffStatusValue): Promise<StaffDetailDto> {
   notSelf(actor, id);
   const target = await loadTarget(id);
+  await assertOutranks(actor, target.roleKeys);
   await assertCanHandle(actor, target.roleKeys);
   if (target.status === status) return getStaff(id);
   if (target.status === "DEACTIVATED") throw HttpError.conflict("A deactivated account can't be reactivated");
@@ -285,6 +324,7 @@ export async function resetPassword(actor: StaffPrincipal, id: string): Promise<
   notSelf(actor, id);
   const target = await loadTarget(id);
   if (target.status === "DEACTIVATED") throw HttpError.conflict("A deactivated account can't be changed");
+  await assertOutranks(actor, target.roleKeys);
   await assertCanHandle(actor, target.roleKeys);
 
   const password = issuePassword(target.email);
@@ -311,6 +351,7 @@ export async function resetMfa(actor: StaffPrincipal, id: string): Promise<Staff
   notSelf(actor, id);
   const target = await loadTarget(id);
   if (target.status === "DEACTIVATED") throw HttpError.conflict("A deactivated account can't be changed");
+  await assertOutranks(actor, target.roleKeys);
   await assertCanHandle(actor, target.roleKeys);
 
   await db.$transaction([
@@ -327,6 +368,7 @@ export async function resetMfa(actor: StaffPrincipal, id: string): Promise<Staff
 export async function revokeSessions(actor: StaffPrincipal, id: string): Promise<StaffDetailDto> {
   notSelf(actor, id);
   const target = await loadTarget(id);
+  await assertOutranks(actor, target.roleKeys);
   await assertCanHandle(actor, target.roleKeys);
   const { count } = await db.staffSession.updateMany({
     where: { staffUserId: id, revokedAt: null },

@@ -2,10 +2,13 @@ import { describe, expect, test } from 'bun:test';
 
 import { inQuietHours, personalise } from '../src/services/announcement.service.ts';
 import { nextStepOf } from '../src/services/investor-facts.service.ts';
+import { fitTranscript } from '../src/services/support-chat.service.ts';
 import { SLA_HOURS } from '../src/services/support-ticket.service.ts';
 import { guardFormula, toCsv } from '../src/utils/csv.ts';
 import { queryCursor, queryList, queryString } from '../src/utils/query.ts';
 import { maskAccountNumber, maskPan } from '../src/utils/mask.ts';
+import { roleKeyFrom } from '../src/utils/role-key.ts';
+import { canManage, levelOf, roleSetProblem } from '../src/utils/staff-hierarchy.ts';
 
 // Raw SQL hands back FP's wire values (`awaiting_esign`, `successful`), while
 // Prisma reads hand back enum names (`AWAITING_ESIGN`). Both must land on the
@@ -102,5 +105,58 @@ describe('announcements', () => {
     expect(personalise('Hi {{firstName}}, {{firstName}}!', 'Asha Rao')).toBe('Hi Asha, Asha!');
     expect(personalise('Hi {{firstName}}', null)).toBe('Hi there');
     expect(personalise('Hi {{firstName}}', '  ')).toBe('Hi there');
+  });
+});
+
+// A ticket raised from a long chat stores its transcript in a varchar(4000)
+// note. The end of the chat is what the ticket is about, so the oldest lines go.
+describe('chat transcript on a ticket', () => {
+  test('a short chat is kept whole', () => {
+    expect(fitTranscript(['a', 'b'], 4000)).toBe('Chat transcript\na\nb');
+  });
+  test('a long chat keeps its newest lines and says so', () => {
+    const fit = fitTranscript(Array.from({ length: 400 }, (_, i) => `Investor: message ${i}`), 4000);
+    expect(fit.length).toBeLessThanOrEqual(4000);
+    expect(fit.startsWith('Chat transcript (earliest')).toBe(true);
+    expect(fit.endsWith('message 399')).toBe(true);
+  });
+  test('a single line longer than the limit still fits', () => {
+    expect(fitTranscript(['x'.repeat(9000)], 4000).length).toBeLessThanOrEqual(4000);
+  });
+});
+
+describe('role keys', () => {
+  test('a role name becomes an A–Z key', () => {
+    expect(roleKeyFrom('Branch manager (North)')).toBe('BRANCH_MANAGER_NORTH');
+    expect(roleKeyFrom('  KYC desk 2 ')).toBe('KYC_DESK');
+    expect(roleKeyFrom('Réviewer')).toBe('R_VIEWER');
+    expect(roleKeyFrom('123')).toBe('');
+  });
+  test('stays within the 40-character column', () => {
+    expect(roleKeyFrom('a'.repeat(39) + ' b').length).toBeLessThanOrEqual(40);
+    expect(roleKeyFrom('a'.repeat(39) + ' b')).not.toMatch(/_$/);
+  });
+});
+
+describe('staff hierarchy', () => {
+  test('a level comes from the highest role held', () => {
+    expect(levelOf(['SUPER_ADMIN', 'SUPPORT'])).toBe('ADMIN');
+    expect(levelOf(['SUB_ADMIN', 'ROLE_MANAGER'])).toBe('SUB_ADMIN');
+    expect(levelOf(['OPERATIONS'])).toBe('OPERATOR');
+    expect(levelOf(['BRANCH_DESK'])).toBe('OPERATOR');
+  });
+  test('admins manage anyone, sub-admins operators only, operators no one', () => {
+    expect(canManage('ADMIN', 'ADMIN')).toBe(true);
+    expect(canManage('ADMIN', 'SUB_ADMIN')).toBe(true);
+    expect(canManage('SUB_ADMIN', 'OPERATOR')).toBe(true);
+    expect(canManage('SUB_ADMIN', 'SUB_ADMIN')).toBe(false);
+    expect(canManage('SUB_ADMIN', 'ADMIN')).toBe(false);
+    expect(canManage('OPERATOR', 'OPERATOR')).toBe(false);
+  });
+  test('Role Manager access goes with a sub-admin, and nobody is two levels', () => {
+    expect(roleSetProblem(['SUB_ADMIN', 'ROLE_MANAGER'])).toBeNull();
+    expect(roleSetProblem(['ROLE_MANAGER'])).not.toBeNull();
+    expect(roleSetProblem(['OPERATIONS', 'ROLE_MANAGER'])).not.toBeNull();
+    expect(roleSetProblem(['SUPER_ADMIN', 'SUB_ADMIN'])).not.toBeNull();
   });
 });
