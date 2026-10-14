@@ -1,0 +1,26 @@
+# Secrets never enter the image; the server passes them at run time.
+.env
+.env.*
+!.env.example
+
+# Rebuilt inside the image.
+node_modules
+generated
+
+# Not needed at run time.
+.git
+.github
+.claude
+.agents
+.windsurf
+deploy
+docs
+tests
+functional-tests
+scratch
+scripts/tmp
+coverage
+*.md
+*.log
+*.hm
+*.tsbuildinfo
