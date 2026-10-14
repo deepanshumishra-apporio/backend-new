@@ -1,15 +1,25 @@
-# Production deploy
+# Deploys
 
 `.github/workflows/pipeline.yml` tests every PR and every push to `main`, builds
-a Docker image tagged with the commit SHA, pushes it to GHCR, and — after a
-reviewer approves — deploys it to one Docker host over SSH with
-[`deploy.sh`](deploy.sh).
+a Docker image tagged with the commit SHA, pushes it to GHCR, and deploys it to
+a Docker host over SSH with [`deploy.sh`](deploy.sh). There are two GitHub
+environments, one server each:
+
+| environment | server | deploys |
+|---|---|---|
+| `development` | sandbox VPS (FP sandbox) | automatically, on every push to `main` |
+| `production` | real server (FP production) | only by hand, after a reviewer approves |
 
 | event | what runs |
 |---|---|
 | pull request | typecheck, unit + schema tests, migrations on a fresh Postgres, image build (no push) |
-| push to `main` | all of the above, image push, then **deploy waits for approval** |
-| *Run workflow* with `image_tag` | rollback: deploys that existing image only |
+| push to `main` | all of the above, image push, **deploy to development** |
+| *Run workflow*, environment + `image_tag` | deploys that existing image only: promote it, or roll back |
+| *Run workflow*, environment, no `image_tag` | full pipeline for `main`, then deploy |
+
+**Promoting to production** = *Actions → Backend CI/CD → Run workflow*, pick
+`production`, and paste the commit SHA that is already running on development.
+The exact image that was tested there ships; nothing rebuilds.
 
 Run one instance. Every replica runs the reconcile, compliance and announcement
 loops; they are written to be idempotent, but one server is the tested setup.
@@ -68,11 +78,14 @@ api.example.com {
 
 ### 4. GitHub
 
-**Settings → Environments → New environment → `production`:**
+**Settings → Environments**, create both:
 
-- *Required reviewers*: whoever may approve a production deploy.
-- *Deployment branches*: `main` only.
-- Environment secrets:
+- `development`: *Deployment branches* `main` only, no reviewers.
+- `production`: *Deployment branches* `main` only, *Required reviewers* =
+  whoever may approve a production deploy.
+
+Each gets the same four secrets, pointing at its own server (and its own
+deploy key — never share one key between the two):
 
 | secret | value |
 |---|---|
@@ -89,8 +102,9 @@ before merging.
 
 ## Rolling back
 
-*Actions → Backend CI/CD → Run workflow*, paste the full commit SHA of the last
-good deploy into `image_tag`. The image is reused as-is; nothing rebuilds.
+*Actions → Backend CI/CD → Run workflow*, pick the environment and paste the
+full commit SHA of the last good deploy into `image_tag`. The image is reused
+as-is; nothing rebuilds.
 
 The database is **not** rolled back. That is why migrations have to stay
 backward compatible: add a column in one release, stop using the old one in the

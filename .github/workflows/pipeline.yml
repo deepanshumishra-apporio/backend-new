@@ -4,13 +4,18 @@
 #                 migrations ┘
 #
 #   push to main ─► test ─┬─► image (build + push ghcr.io/<repo>:<sha>)
-#                 migrations ┘        └─► deploy (waits for approval on the
-#                                         "production" environment)
+#                 migrations ┘        └─► deploy to "development" (automatic)
 #
-#   Run workflow (manual) with image_tag = an older commit SHA ─► deploy that
-#   image only: the rollback path. Empty image_tag = full pipeline for main.
+#   Run workflow (manual), environment + optional image_tag:
+#     image_tag set   ─► deploy that existing image only. Promoting to
+#                        production = the SHA already running on development;
+#                        rolling back = an older SHA.
+#     image_tag empty ─► full pipeline for main, then deploy.
+#   The "production" environment has required reviewers, so it always waits
+#   for approval.
 #
-# Setup — secrets, server, env file — is in deploy/README.md.
+# Each GitHub environment holds the same four DEPLOY_* secrets for its own
+# server. Setup — secrets, server, env file — is in deploy/README.md.
 name: Backend CI/CD
 
 on:
@@ -20,8 +25,13 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      environment:
+        description: "Where to deploy"
+        type: choice
+        options: [development, production]
+        default: development
       image_tag:
-        description: "Roll back: full commit SHA of an image already in GHCR. Leave empty to build and deploy main."
+        description: "Full commit SHA of an image already in GHCR (promote or roll back). Leave empty to build and deploy main."
         required: false
         default: ""
 
@@ -139,21 +149,22 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy to production
+    name: Deploy to ${{ inputs.environment || 'development' }}
     needs: [image]
-    # Runs after a successful build on main, or alone for a rollback (when
-    # test/migrations/image were skipped). Never for pull requests.
+    # Runs after a successful build on main, or alone for a promote/rollback
+    # (when test/migrations/image were skipped). Never for pull requests.
     if: >-
       !failure() && !cancelled()
       && github.ref == 'refs/heads/main'
       && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Required reviewers on this environment make every deploy wait for a
-    # human click. Its secrets are only readable by this job.
-    environment: production
+    # A push always goes to development. The environment's secrets are only
+    # readable by this job, and production's required reviewers make it wait
+    # for a human click.
+    environment: ${{ inputs.environment || 'development' }}
     concurrency:
-      group: production-deploy
+      group: deploy-${{ inputs.environment || 'development' }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -200,4 +211,4 @@ jobs:
           exit "$status"
       - name: Summary
         if: success()
-        run: echo "Deployed \`${{ steps.target.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Deployed \`${{ steps.target.outputs.image }}\` to **${{ inputs.environment || 'development' }}**" >> "$GITHUB_STEP_SUMMARY"
