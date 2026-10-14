@@ -1,0 +1,203 @@
+# Backend CI/CD.
+#
+#   pull request ─► test ─┬─► image (build only, proves the Dockerfile)
+#                 migrations ┘
+#
+#   push to main ─► test ─┬─► image (build + push ghcr.io/<repo>:<sha>)
+#                 migrations ┘        └─► deploy (waits for approval on the
+#                                         "production" environment)
+#
+#   Run workflow (manual) with image_tag = an older commit SHA ─► deploy that
+#   image only: the rollback path. Empty image_tag = full pipeline for main.
+#
+# Setup — secrets, server, env file — is in deploy/README.md.
+name: Backend CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Roll back: full commit SHA of an image already in GHCR. Leave empty to build and deploy main."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  # Superseded PR runs are cancelled; main runs queue so no deploy is cut short.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BUN_VERSION: "1.3.13"
+
+jobs:
+  test:
+    name: Typecheck and tests
+    if: github.event_name != 'workflow_dispatch' || inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_ENV: test
+      # prisma.config.ts and src/db/client.ts both refuse an unset URL. The
+      # offline suites never connect to it.
+      DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      # test:schema runs under `node --test`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - run: bun run db:validate
+      - run: bun run db:generate
+      - run: bunx tsc --noEmit
+      # Unit + schema only. test:e2e and test:functional call the live FP
+      # sandbox and create real objects there; they are not CI jobs.
+      - run: bun run test
+
+  migrations:
+    name: Migrations apply and match the schema
+    if: github.event_name != 'workflow_dispatch' || inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile
+      # The exact command production runs, against a real Postgres.
+      - name: Apply every migration to an empty database
+        run: bun run db:migrate:deploy
+      # Catches a schema.prisma change committed without its migration, which
+      # would otherwise ship code expecting columns production never gets.
+      - name: Fail if schema.prisma has changes with no migration
+        run: bunx --bun prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+  image:
+    name: Docker image
+    needs: [test, migrations]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ref
+        # GHCR names must be lower case.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          # Tagged by commit only — no `latest`. The server always runs an
+          # exact, traceable build, and rollback names one.
+          tags: ${{ steps.ref.outputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to production
+    needs: [image]
+    # Runs after a successful build on main, or alone for a rollback (when
+    # test/migrations/image were skipped). Never for pull requests.
+    if: >-
+      !failure() && !cancelled()
+      && github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Required reviewers on this environment make every deploy wait for a
+    # human click. Its secrets are only readable by this job.
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy
+      - name: Resolve image
+        id: target
+        env:
+          ROLLBACK_TAG: ${{ inputs.image_tag }}
+        run: |
+          tag="${ROLLBACK_TAG:-$GITHUB_SHA}"
+          if ! [[ "$tag" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::image_tag must be a full 40-character commit SHA (got '$tag')"
+            exit 1
+          fi
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:$tag" >> "$GITHUB_OUTPUT"
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pinned host key: a server we cannot identify never receives the
+          # registry token or runs our migrations.
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Pull, migrate, swap
+        env:
+          SSH_TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+          IMAGE: ${{ steps.target.outputs.image }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ssh_cmd() { ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes "$SSH_TARGET" "$@"; }
+          # Token over stdin, never on a command line the server's `ps` shows.
+          # It expires with this job.
+          printf '%s\n' "$REGISTRY_TOKEN" | ssh_cmd "docker login ghcr.io -u '$GITHUB_ACTOR' --password-stdin"
+          status=0
+          ssh_cmd "bash -s -- '$IMAGE'" < deploy/deploy.sh || status=$?
+          ssh_cmd "docker logout ghcr.io" || true
+          exit "$status"
+      - name: Summary
+        if: success()
+        run: echo "Deployed \`${{ steps.target.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
