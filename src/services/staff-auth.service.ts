@@ -1,6 +1,6 @@
-// Staff authentication for the admin portal: email and password, then a TOTP
-// code. MFA is on unless STAFF_MFA_ENABLED=false, which production refuses;
-// with it off the password step returns a full session straight away.
+// Staff authentication for the admin portal: email and password, and — only
+// when STAFF_MFA_ENABLED=true — a TOTP code after it. With it off (the default,
+// by the product owner's decision) the password step returns a full session.
 //
 // With MFA on, a sign-in is two steps on one session:
 //
@@ -72,17 +72,17 @@ const mfaIssuer = () => process.env["STAFF_MFA_ISSUER"]?.trim() || "RiSips Admin
 /**
  * Whether sign-in asks for an authenticator code after the password.
  *
- * On unless STAFF_MFA_ENABLED=false, and that opt-out is refused in production
- * (see `assertStaffMfaConfig`): a password alone must never reach every
- * investor's PAN, bank and contact details. The per-account `mfaRequired` flag
- * still exempts audited service accounts created with `--no-mfa`.
+ * Off unless STAFF_MFA_ENABLED=true: staff sign in with email and password
+ * only, by the product owner's decision. Turning it on needs no code change —
+ * set the variable and restart. The per-account `mfaRequired` flag still
+ * exempts audited service accounts created with `--no-mfa` when it is on.
  */
-export const staffMfaEnabled = () => process.env["STAFF_MFA_ENABLED"]?.trim().toLowerCase() !== "false";
+export const staffMfaEnabled = () => process.env["STAFF_MFA_ENABLED"]?.trim().toLowerCase() === "true";
 
-/** Boot check: production may not switch staff MFA off. */
+/** Boot log: say plainly when staff sign-in is password-only, so it is never a surprise. */
 export function assertStaffMfaConfig(env: Record<string, string | undefined> = process.env): void {
-  if (env["NODE_ENV"] === "production" && env["STAFF_MFA_ENABLED"]?.trim().toLowerCase() === "false") {
-    throw new Error("STAFF_MFA_ENABLED=false is not allowed in production — staff sign-in must use MFA");
+  if (env["NODE_ENV"] === "production" && env["STAFF_MFA_ENABLED"]?.trim().toLowerCase() !== "true") {
+    console.warn("[staff-auth] staff MFA is off: admin sign-in is email and password only (set STAFF_MFA_ENABLED=true to require it)");
   }
 }
 
