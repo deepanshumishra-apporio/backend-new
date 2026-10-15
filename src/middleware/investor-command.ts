@@ -66,8 +66,15 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
       return;
     }
   }
-  // Stable provider reference for order/plan creates, including after response loss.
-  if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !req.body.sourceRefId) req.body.sourceRefId = id;
+  // Stable provider reference for order/plan creates, including after response
+  // loss. Derived from (user, key, request), not this attempt's command id: a
+  // failure after FP had already created the order (e.g. a sync conflict) is a
+  // 4xx, which releases the claim — and a fresh id per attempt then let the
+  // retry place a second order. The same request now always carries the same
+  // reference, which FP refuses to reuse.
+  if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !req.body.sourceRefId) {
+    req.body.sourceRefId = stableReference(userId, key, requestHash);
+  }
   res.locals["commandId"] = id;
   const send = res.json.bind(res);
   let sending = false;
@@ -113,6 +120,12 @@ export const investorCommand: RequestHandler = async (req, res, next) => {
   }) as typeof res.json;
   next();
 };
+
+/** A UUID-shaped reference, the same for the same user, key and request. */
+export function stableReference(userId: string, key: string, requestHash: string): string {
+  const hex = createHash("sha256").update(`${userId}:${key}:${requestHash}`).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
 /**
  * An error envelope whose service said the attempt created nothing upstream.

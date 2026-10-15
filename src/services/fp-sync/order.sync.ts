@@ -7,6 +7,7 @@
 //
 // These take an already-resolved local investment account id rather than
 // looking it up, so the caller controls the transaction boundary.
+import { maskTail } from "../../utils/mask.ts";
 import {
   afterSync,
   notifyPlan,
@@ -172,9 +173,26 @@ async function mirrorPurchase(
     retriedAt: fpDateTime(order.retried_at),
   };
 
-  // Not a catalogue ISIN: the row can only already exist, so update it in place.
+  // Not a catalogue ISIN (FP's failed-order placeholder): keep the scheme we
+  // already hold. An SIP installment seen for the first time already failed
+  // has no row yet, but it is always in its plan's scheme, so it is created
+  // with that — otherwise the update throws and the whole plan stops being
+  // collected, every cycle.
   if (!allIsins(order.scheme)) {
-    return db.mfPurchase.update({ where: { fpId: order.id }, data: fixedScheme(data), select: { id: true } });
+    const existing = await db.mfPurchase.findUnique({ where: { fpId: order.id }, select: { id: true } });
+    if (existing) {
+      return db.mfPurchase.update({ where: { fpId: order.id }, data: fixedScheme(data), select: { id: true } });
+    }
+    const plan = planId
+      ? await db.mfPurchasePlan.findUnique({ where: { id: planId }, select: { schemeIsin: true } })
+      : null;
+    if (!plan) throw new Error(`purchase ${order.id} has no usable scheme ("${order.scheme}") and no plan to take it from`);
+    return db.mfPurchase.upsert({
+      where: { fpId: order.id },
+      update: fixedScheme(data),
+      create: { fpId: order.id, ...data, schemeIsin: plan.schemeIsin },
+      select: { id: true },
+    });
   }
   return db.mfPurchase.upsert({
     where: { fpId: order.id },
@@ -213,7 +231,8 @@ async function mirrorRedemption(
     redeemedUnits: fpUnits(order.redeemed_units),
     redeemedPrice: fpNav(order.redeemed_price),
     redeemedNavDate: fpDate(order.redeemed_nav_date),
-    redemptionBankAccountNumber: fpText(order.redemption_bank_account_number, 20),
+    // Masked to the last four: staff only ever see that, and FP holds the rest.
+    redemptionBankAccountNumber: maskTail(fpText(order.redemption_bank_account_number, 20)),
     redemptionBankAccountIfsc: fpText(order.redemption_bank_account_ifsc_code, 11),
   };
 

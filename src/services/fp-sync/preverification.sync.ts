@@ -1,6 +1,7 @@
 import { db } from "../../db/client.ts";
 import type { FpPreVerification } from "../../integrations/fp/resources/preverification.ts";
 import { fpDate, fpDateTime, fpFlatText, bankAccountFingerprint } from "../../utils/fp-mapping.ts";
+import { maskTail } from "../../utils/mask.ts";
 
 /** Persist all results atomically; an older poll must not undo a completed check. */
 export async function syncPreVerification(result: FpPreVerification, links: { userId?: string; investorProfileId?: string } = {}) {
@@ -35,7 +36,8 @@ export async function syncPreVerification(result: FpPreVerification, links: { us
       if (result.bank_accounts?.length) await tx.preVerificationBankResult.createMany({
         data: await Promise.all(result.bank_accounts.map(async (bank, position) => ({
           preVerificationId: row.id, position, status: bank.status, code: bank.code, reason: bank.reason,
-          accountNumber: bank.value.account_number, ifscCode: bank.value.ifsc_code,
+          // Last four only: FP holds the full number and we never need it back.
+          accountNumber: maskTail(bank.value.account_number) ?? "", ifscCode: bank.value.ifsc_code,
           accountNumberFingerprint: await bankAccountFingerprint(bank.value.account_number, bank.value.ifsc_code),
           accountType: bank.value.account_type, bankAccountProofFpId: bank.value.bank_account_proof,
         }))),

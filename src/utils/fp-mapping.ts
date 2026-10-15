@@ -1,4 +1,6 @@
+import { createHmac } from "node:crypto";
 import type { Prisma } from "../../generated/prisma/client.ts";
+import { HttpError } from "./http-error.ts";
 
 // Pure helpers for turning FP wire values into database values.
 //
@@ -174,8 +176,40 @@ export function lastFour(raw: unknown): string | null {
 }
 
 /**
+ * Server-held secret that keys the bank-account fingerprint.
+ *
+ * A plain `SHA-256(accountNumber|IFSC)` is reversible from a database leak: Indian
+ * account numbers are low-entropy and IFSC codes are a public, enumerable list, so
+ * one offline table recovers every row at once — defeating the whole point of
+ * storing a fingerprint instead of the number. An HMAC under a key that lives only
+ * on the server reveals nothing to someone holding only the stored column.
+ *
+ * 32 random bytes, base64 (`openssl rand -base64 32`). Fails closed: a missing or
+ * short key stops the operation rather than silently falling back to the reversible
+ * digest. The key must be stable — rotating it changes every fingerprint, so a
+ * rotation needs a re-fingerprint pass (FP still holds the numbers; a re-sync
+ * recomputes them). Not read at boot, so the investor API starts without it; it is
+ * required only when a bank account is actually fingerprinted.
+ */
+function fingerprintKey(): Buffer {
+  const raw = process.env["BANK_FINGERPRINT_KEY"];
+  const key = raw ? Buffer.from(raw, "base64") : Buffer.alloc(0);
+  if (key.length !== 32) {
+    console.error("[fp-mapping] BANK_FINGERPRINT_KEY is missing or not 32 base64-encoded bytes");
+    throw HttpError.serviceUnavailable("Bank account handling is not configured");
+  }
+  return key;
+}
+
+/**
  * Stable fingerprint of a bank account, so we can recognise a duplicate
  * without storing the account number.
+ *
+ * A keyed HMAC-SHA256 under a server-held secret (see `fingerprintKey`), not a bare
+ * digest: the fingerprint must not be reversible by anyone who only reads the stored
+ * column. Deterministic for the same (account, IFSC), so dedup across the mirror and
+ * the pre-verification tables still works; the `(investorProfileId, fingerprint)`
+ * unique keeps dedup scoped per profile.
  *
  * Normalises first: leading zeros and case in the IFSC are not meaningful, and
  * an investor re-entering the same account should collide with the old row.
@@ -185,10 +219,7 @@ export async function bankAccountFingerprint(
   ifsc: string,
 ): Promise<string> {
   const normalised = `${accountNumber.replace(/\D/g, "").replace(/^0+/, "")}|${ifsc.trim().toUpperCase()}`;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalised));
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
+  return createHmac("sha256", fingerprintKey()).update(normalised).digest("hex");
 }
 
 /** Split "mf_purchase.successful" into its object type and its verb. */

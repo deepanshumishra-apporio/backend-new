@@ -227,7 +227,7 @@ export async function addAddress(req: Request<ProfileParams>, res: Response) {
 export async function addPhone(req: Request<ProfileParams>, res: Response) {
   const body = asBody(req.body);
   res.status(201).json({
-    data: await investorService.addPhone(req.params.profileId, {
+    data: await investorService.addOwnPhone(investorId(req), req.params.profileId, {
       isd: requiredString(body, "isd", { maxLength: 4 }),
       number: requiredString(body, "number", {
         pattern: /^[0-9-]{7,20}$/,

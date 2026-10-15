@@ -22,6 +22,22 @@ export function maskEmail(email: string | null | undefined): string | null {
   return `${local.slice(0, 2)}***@${domain}`;
 }
 
+/**
+ * Strip identifiers out of free text from a third party before a client sees it:
+ * PANs, emails, and any run of 9+ digits (bank accounts, phones, Aadhaar).
+ * FP's error messages quote back the values they were sent and can name
+ * another investor's PAN when a folio lookup collides.
+ */
+export function redactPii(text: string): string {
+  return text
+    .replace(/\b[A-Z]{5}\d{4}[A-Z]\b/gi, (pan) => maskPan(pan.toUpperCase()) ?? "")
+    .replace(/[^\s@"']+@[^\s@"']+\.[^\s@"',;]+/g, (email) => maskEmail(email) ?? "")
+    .replace(/\+?\d[\d -]{7,}\d/g, (run) => {
+      const digits = run.replace(/\D/g, "");
+      return digits.length >= 9 ? (maskTail(digits) ?? "") : run;
+    });
+}
+
 /** Last four digits of a phone or account number, e.g. XXXXXX3210. */
 export function maskTail(value: string | null | undefined, keep = 4): string | null {
   if (!value) return null;

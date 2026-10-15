@@ -99,6 +99,8 @@ export interface InvestorListQuery {
   kycStalled?: boolean;
   /** Only investors with an active SIP instalment due within this many days. */
   sipDueDays?: number;
+  /** Only the investors a stage card counts as needing attention (see `InvestorAttention`). */
+  attention?: InvestorAttention;
   cursor?: { createdAt: Date; id: string };
   limit: number;
 }
@@ -123,6 +125,47 @@ export interface InvestorListItemDto {
   signedUpAt: string;
   lastLoginAt: string | null;
   lastActivityAt: string;
+}
+
+/**
+ * The two places a journey gets stuck with something staff can do about it:
+ * - KYC    in KYC and blocked: the PAN check did not pass, the form failed or
+ *          expired, or it has not moved for longer than the stall window
+ * - SETUP  KYC is done but the investment account is not ready to transact
+ */
+export const INVESTOR_ATTENTION = ["KYC", "SETUP"] as const;
+export type InvestorAttention = (typeof INVESTOR_ATTENTION)[number];
+
+/** The investor list's header: where everyone is, and the counts behind its filters. */
+export interface InvestorOverviewDto {
+  total: number;
+  byStage: Record<JourneyStage, number>;
+  /** KYC not yet completed, in any state. */
+  kycPending: number;
+  kycStalled: number;
+  attention: Record<InvestorAttention, number>;
+  /** Active SIPs across the investors who have invested. */
+  activeSips: number;
+  /** Investors with an active SIP instalment due in the next 7 days. */
+  sipDueIn7Days: number;
+}
+
+export interface NudgeResultDto {
+  /** Notifications sent. */
+  sent: number;
+  /** Already invested, or not found: nothing to nudge them towards. */
+  skippedInvested: number;
+  /** Turned off offers and reminders in the app. */
+  skippedOptedOut: number;
+  /** Already nudged in the last 7 days. */
+  skippedRecent: number;
+}
+
+export interface InvestorExportDto {
+  filename: string;
+  csv: string;
+  rows: number;
+  truncated: boolean;
 }
 
 export interface InvestorListDto {

@@ -9,8 +9,14 @@ import { apiRouter } from "./routes/index.ts";
 import { apiRateLimit } from "./middleware/api-security.ts";
 import { browserCors } from "./middleware/cors.ts";
 import { assertOtpChannelConfig } from "./services/otp-channel.ts";
+import { assertStaffMfaConfig } from "./services/staff-auth.service.ts";
+import { runtimeEnv } from "./utils/runtime-env.ts";
 
 export function createApp(): Express {
+  // First of all: an unknown NODE_ENV would read as "not production" everywhere
+  // and quietly enable every development shortcut.
+  runtimeEnv();
+  assertStaffMfaConfig();
   // Before anything binds: an OTP channel that is half-configured, or an email
   // fallback left on in production, must stop the process rather than surface
   // as a login nobody can complete.
@@ -39,7 +45,8 @@ export function createApp(): Express {
   // A 100kb ceiling is generous for every route here and stops a large body
   // from occupying a worker. File uploads go straight to FP, not through this.
   app.use(express.json({ limit: "100kb" }));
-  app.use("/api/v1/kyc/forms/:formId/signature", express.raw({ type: ["image/png", "image/jpeg", "application/pdf"], limit: "5mb" }));
+  // The KYC signature's raw-body parser is mounted in the API router, after the
+  // session check: here it buffered 5MB for any anonymous caller.
 
   app.get("/health", (_req, res) => {
     res.json({ data: { status: "ok", uptimeSeconds: Math.round(process.uptime()) } });

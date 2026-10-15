@@ -2,10 +2,19 @@ import type { Request, Response } from "express";
 import { staffPrincipal } from "../middleware/staff-auth.ts";
 import * as dashboard from "../services/admin-dashboard.service.ts";
 import * as investors from "../services/admin-investor.service.ts";
+import * as investorActions from "../services/admin-investor-actions.service.ts";
 import * as investorItems from "../services/admin-investor-item.service.ts";
-import { JOURNEY_STAGES, KYC_STATUSES, type InvestorItemType, type SignupBucket } from "../types/admin-investor.types.ts";
+import {
+  INVESTOR_ATTENTION,
+  JOURNEY_STAGES,
+  KYC_STATUSES,
+  type InvestorAttention,
+  type InvestorItemType,
+  type InvestorListQuery,
+  type SignupBucket,
+} from "../types/admin-investor.types.ts";
 import { HttpError } from "../utils/http-error.ts";
-import { DATE_PATTERN } from "../utils/validate.ts";
+import { asBody, DATE_PATTERN, requiredStringArray } from "../utils/validate.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const USER_STATUSES = ["ACTIVE", "PENDING_VERIFICATION", "SUSPENDED", "CLOSED"] as const;
@@ -64,11 +73,8 @@ export async function signups(req: Request, res: Response) {
   res.json({ data: await dashboard.getSignupSeries(from, to, bucket) });
 }
 
-export async function list(req: Request, res: Response) {
-  const limitRaw = queryString(req, "limit");
-  const limit = limitRaw === undefined ? 25 : Number(limitRaw);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw HttpError.badRequest("limit must be between 1 and 100");
-
+/** The list's filters, shared by the list and its export. */
+function listFilters(req: Request): Omit<InvestorListQuery, "limit" | "cursor"> {
   const search = queryString(req, "search");
   if (search && search.length > 100) throw HttpError.badRequest("search must be at most 100 characters");
 
@@ -76,6 +82,36 @@ export async function list(req: Request, res: Response) {
   if (stalled !== undefined && stalled !== "true" && stalled !== "false") {
     throw HttpError.badRequest("kycStalled must be true or false");
   }
+
+  const sipDueRaw = queryString(req, "sipDueDays");
+  const sipDueDays = sipDueRaw === undefined ? undefined : Number(sipDueRaw);
+  if (sipDueDays !== undefined && (!Number.isInteger(sipDueDays) || sipDueDays < 0 || sipDueDays > 60)) {
+    throw HttpError.badRequest("sipDueDays must be a whole number of days, 0 to 60");
+  }
+
+  const attention = queryString(req, "attention")?.toUpperCase();
+  if (attention !== undefined && !(INVESTOR_ATTENTION as readonly string[]).includes(attention)) {
+    throw HttpError.badRequest(`attention must be one of: ${INVESTOR_ATTENTION.join(", ")}`);
+  }
+
+  const stage = queryList(req, "stage", JOURNEY_STAGES);
+  const kycStatus = queryList(req, "kycStatus", KYC_STATUSES);
+  const status = queryList(req, "status", USER_STATUSES);
+  return {
+    ...(search && { search }),
+    ...(stage && { stage }),
+    ...(kycStatus && { kycStatus }),
+    ...(status && { status }),
+    ...(stalled === "true" && { kycStalled: true }),
+    ...(sipDueDays !== undefined && { sipDueDays }),
+    ...(attention && { attention: attention as InvestorAttention }),
+  };
+}
+
+export async function list(req: Request, res: Response) {
+  const limitRaw = queryString(req, "limit");
+  const limit = limitRaw === undefined ? 25 : Number(limitRaw);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw HttpError.badRequest("limit must be between 1 and 100");
 
   const cursorRaw = queryString(req, "cursor");
   let cursor: { createdAt: Date; id: string } | undefined;
@@ -86,27 +122,37 @@ export async function list(req: Request, res: Response) {
     cursor = { createdAt, id };
   }
 
-  const sipDueRaw = queryString(req, "sipDueDays");
-  const sipDueDays = sipDueRaw === undefined ? undefined : Number(sipDueRaw);
-  if (sipDueDays !== undefined && (!Number.isInteger(sipDueDays) || sipDueDays < 0 || sipDueDays > 60)) {
-    throw HttpError.badRequest("sipDueDays must be a whole number of days, 0 to 60");
-  }
+  res.json({ data: await investors.listInvestors({ ...listFilters(req), limit, ...(cursor && { cursor }) }) });
+}
 
-  const stage = queryList(req, "stage", JOURNEY_STAGES);
-  const kycStatus = queryList(req, "kycStatus", KYC_STATUSES);
-  const status = queryList(req, "status", USER_STATUSES);
-  res.json({
-    data: await investors.listInvestors({
-      limit,
-      ...(search && { search }),
-      ...(stage && { stage }),
-      ...(kycStatus && { kycStatus }),
-      ...(status && { status }),
-      ...(stalled === "true" && { kycStalled: true }),
-      ...(sipDueDays !== undefined && { sipDueDays }),
-      ...(cursor && { cursor }),
-    }),
-  });
+/** Where everyone is: the stage counts and the counts behind the list's quick filters. */
+export async function overview(_req: Request, res: Response) {
+  res.json({ data: await investorActions.getInvestorOverview() });
+}
+
+/** The filtered list as a CSV file. */
+export async function exportCsv(req: Request, res: Response) {
+  const file = await investorActions.exportInvestors(listFilters(req), staffPrincipal(req));
+  res
+    .status(200)
+    .set({
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": `attachment; filename="${file.filename}"`,
+      "cache-control": "no-store",
+      "x-report-rows": String(file.rows),
+      "x-report-truncated": String(file.truncated),
+    })
+    .send(file.csv);
+}
+
+/** A reminder notification to each of these investors. */
+export async function nudge(req: Request, res: Response) {
+  const userIds = requiredStringArray(asBody(req.body), "userIds");
+  if (userIds.length > investorActions.NUDGE_BATCH_LIMIT) {
+    throw HttpError.badRequest(`userIds can name at most ${investorActions.NUDGE_BATCH_LIMIT} investors`);
+  }
+  if (userIds.some((id) => !UUID.test(id))) throw HttpError.badRequest("userIds must be investor ids");
+  res.json({ data: await investorActions.nudgeInvestors(userIds, staffPrincipal(req)) });
 }
 
 export async function getOne(req: Request<{ userId: string }>, res: Response) {

@@ -1,4 +1,5 @@
 import { HttpError } from "../../utils/http-error.ts";
+import { redactPii } from "../../utils/mask.ts";
 
 /** One field-level complaint from FP's validation error envelope. */
 export interface FpFieldError {
@@ -60,17 +61,20 @@ export class FpApiError extends Error {
       // shows. The field errors it sends alongside are the entire content of
       // the failure, and they were being carried as far as `details` and then
       // never read.
-      const detail = this.fieldErrors
-        .map((error) => `${error.field}: ${error.message}`)
-        .join("; ");
-      return HttpError.badRequest(detail === "" ? this.message : `${this.message} — ${detail}`, {
+      //
+      // Every piece of FP text is passed through `redactPii` first: FP quotes
+      // back what it was sent, and can name another investor's PAN.
+      const fields = this.fieldErrors.map((error) => ({ field: error.field, message: redactPii(error.message) }));
+      const detail = fields.map((error) => `${error.field}: ${error.message}`).join("; ");
+      const message = redactPii(this.message);
+      return HttpError.badRequest(detail === "" ? message : `${message} — ${detail}`, {
         provider: "fp",
         ...(this.code && { providerCode: this.code }),
-        ...(this.fieldErrors.length > 0 && { fields: this.fieldErrors }),
+        ...(fields.length > 0 && { fields }),
       });
     }
-    if (this.status === 404) return HttpError.notFound(this.message);
-    if (this.status === 409) return HttpError.conflict(this.message, { provider: "fp" });
+    if (this.status === 404) return HttpError.notFound(redactPii(this.message));
+    if (this.status === 409) return HttpError.conflict(redactPii(this.message), { provider: "fp" });
     if (this.status === 429) {
       return HttpError.tooManyRequests("Upstream rate limit reached, retry shortly", {
         provider: "fp",

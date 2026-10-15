@@ -14,6 +14,7 @@ import {
   usingEmailOtp,
 } from "./otp-channel.ts";
 import { EmailError } from "../integrations/email.client.ts";
+import type { OtpPurpose } from "../../generated/prisma/enums.ts";
 import type {
   ConsumedVerification,
   RequestOtpDto,
@@ -92,6 +93,13 @@ async function writeAudit(
   });
 }
 
+/** Purposes that share one lockout and send budget: anonymous vs signed-in. */
+function purposeClass(purpose: OtpPurpose): OtpPurpose[] {
+  return purpose === "TRANSACTION_APPROVAL"
+    ? ["TRANSACTION_APPROVAL"]
+    : ["LOGIN", "PHONE_VERIFICATION"];
+}
+
 /**
  * Reject if this number has burnt its send budget.
  *
@@ -100,7 +108,7 @@ async function writeAudit(
  * which its challenge started rather than the one it happened in — bounded and
  * far smaller than the window, so it does not matter in practice.
  */
-async function assertSendBudget(phone: string) {
+async function assertSendBudget(phone: string, purposes: OtpPurpose[]) {
   const now = Date.now();
   const windows = [
     { since: new Date(now - 3_600_000), cap: POLICY.maxSendsPerHour, label: "hour" },
@@ -110,7 +118,7 @@ async function assertSendBudget(phone: string) {
   for (const window of windows) {
     const { _sum } = await db.phoneVerification.aggregate({
       _sum: { sendCount: true },
-      where: { phone, createdAt: { gte: window.since } },
+      where: { phone, purpose: { in: purposes }, createdAt: { gte: window.since } },
     });
 
     if ((_sum.sendCount ?? 0) >= window.cap) {
@@ -133,8 +141,14 @@ export async function requestOtp(input: RequestOtpInput): Promise<RequestOtpDto>
   const providerPhone = toProviderFormat(phone);
   const now = new Date();
 
+  // Lockout, send budget and the one-active-challenge rule are kept per purpose
+  // *class*. Sign-in codes can be requested and guessed by anyone who knows the
+  // number; transaction codes only by the signed-in owner. Sharing one lockout
+  // let a stranger lock an investor out of approving a redemption for 30
+  // minutes, and burn the day's sends, without ever signing in.
+  const purposes = purposeClass(input.purpose);
   const latest = await db.phoneVerification.findFirst({
-    where: { phone },
+    where: { phone, purpose: { in: purposes } },
     orderBy: { createdAt: "desc" },
   });
 
@@ -147,7 +161,7 @@ export async function requestOtp(input: RequestOtpInput): Promise<RequestOtpDto>
     });
   }
 
-  await assertSendBudget(phone);
+  await assertSendBudget(phone, purposes);
 
   let active = latest?.status === "PENDING" && latest.expiresAt > now ? latest : null;
   // Older builds created transaction challenges without a resource context.

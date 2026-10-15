@@ -1,4 +1,4 @@
-import { Router } from "express";
+import express, { Router } from "express";
 import { adminRouter } from "./admin.routes.ts";
 import { investorWorkspaceRouter } from "./investor-workspace.routes.ts";
 import { requireSession, sessionRouter } from "../middleware/investor-auth.ts";
@@ -37,7 +37,14 @@ apiRouter.use("/payments/return", paymentReturnRouter);
 // never see these requests.
 apiRouter.use("/admin", adminRouter);
 
-apiRouter.use(requireSession, authorizeInputs, investorCommand);
+apiRouter.use(requireSession);
+// Signed in first, then buffer the upload — and before `investorCommand`, which
+// hashes the body so a reused Idempotency-Key with a different file is refused.
+apiRouter.use(
+  "/kyc/forms/:formId/signature",
+  express.raw({ type: ["image/png", "image/jpeg", "application/pdf"], limit: "5mb" }),
+);
+apiRouter.use(authorizeInputs, investorCommand);
 apiRouter.use(investorWorkspaceRouter);
 
 apiRouter.use("/transaction-otp", transactionOtpRouter);

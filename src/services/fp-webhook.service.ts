@@ -61,9 +61,15 @@ export async function receive(payload: unknown): Promise<ReceivedEvent> {
   // rejected here is a delivery lost for good, and the redemptions, switches
   // and SWP/STP installments it announces then move only when polled.
   if (!eventId || !/^evt_[A-Za-z0-9_-]{16,64}$/.test(eventId)) throw HttpError.badRequest("Invalid FP event identifier");
+  // A redelivery of an event we already hold needs no FP call at all.
+  const held = await db.fpWebhookEvent.findUnique({ where: { fpEventId: eventId }, select: { type: true } });
+  if (held) return { eventId, type: held.type, duplicate: true };
   // The notification is only a hint. Authenticate the event through our tenant
-  // before allowing its id to occupy the durable deduplication key.
-  const event = await fpEvents.fetchEvent(eventId).catch(fpErrorToHttpError);
+  // before allowing its id to occupy the durable deduplication key. Not retried:
+  // this route is anonymous, and retrying each made-up id multiplied the FP
+  // calls a caller could make us spend against the tenant's rate limit. FP
+  // redelivers anything that genuinely failed.
+  const event = await fpEvents.fetchEvent(eventId, undefined, { retry: false }).catch(fpErrorToHttpError);
   if (event.id !== eventId || typeof event.type !== "string") throw HttpError.badGateway("Invalid event response");
   const type = event.type;
 

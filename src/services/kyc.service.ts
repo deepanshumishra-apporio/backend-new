@@ -38,6 +38,39 @@ import type {
  * request usually comes back with readiness still null; the caller polls, or
  * re-reads when the investor returns.
  */
+/** Readiness checks one user may start per hour. Each is a paid KRA lookup. */
+const MAX_READINESS_CHECKS_PER_HOUR = 10;
+
+/**
+ * One identity per account.
+ *
+ * Without this, any signed-in user could run the check on anyone's PAN, name,
+ * date of birth and bank account and read back a verdict per field — a way to
+ * confirm a stranger's identity details and bank ownership, paid for by us.
+ * Once the account holds a profile, or has passed a check, its PAN is fixed.
+ */
+async function assertOwnIdentity(userId: string, pan: string): Promise<void> {
+  const [profile, passed, recent] = await Promise.all([
+    db.investorProfile.findFirst({
+      where: { userLinks: { some: { userId, relationship: "SELF" } }, pan: { not: null } },
+      select: { pan: true },
+    }),
+    db.preVerification.findFirst({
+      where: { userId, readinessStatus: "verified", investorIdentifier: { not: null } },
+      orderBy: { createdAt: "desc" },
+      select: { investorIdentifier: true },
+    }),
+    db.preVerification.count({ where: { userId, createdAt: { gt: new Date(Date.now() - 3_600_000) } } }),
+  ]);
+  const own = profile?.pan ?? passed?.investorIdentifier;
+  if (own && own.toUpperCase() !== pan.toUpperCase()) {
+    throw HttpError.conflict("This account is already registered to a different PAN");
+  }
+  if (recent >= MAX_READINESS_CHECKS_PER_HOUR) {
+    throw HttpError.tooManyRequests("Too many verification checks. Try again later.", { retryAfterSeconds: 3600 });
+  }
+}
+
 export async function checkReadiness(input: {
   userId: string;
   investorProfileId?: string;
@@ -49,6 +82,7 @@ export async function checkReadiness(input: {
   if (!hasPreVerifyConfig()) {
     throw HttpError.serviceUnavailable("Pre-verification is not configured");
   }
+  await assertOwnIdentity(input.userId, input.pan);
 
   try {
     const result = await fpPreVerification.createPreVerification({

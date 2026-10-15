@@ -4,6 +4,9 @@ import type { TicketInvestorDto, StaffRefDto } from "./support.types.ts";
 export const ALERT_KINDS = [
   "KYC_STALLED", "KYC_FAILED", "SIP_FAILURES", "MANDATE_REJECTED", "MANDATE_PENDING",
   "PAID_NOT_ALLOTTED", "ORDER_STUCK", "NOMINEE_MISSING",
+  "REDEMPTION_PAYOUT_PENDING", "REFUND_PENDING", "CONSENT_MISSING", "KYC_NOT_COMPLIANT",
+  "PEP_INVESTOR", "LARGE_TRANSACTION", "RAPID_ROUND_TRIP", "COMPLAINT_OVERDUE",
+  "PAYOUT_BANK_UNVERIFIED", "CONTACT_MISSING", "MONITORING_STALE",
 ] as const;
 export type AlertKind = (typeof ALERT_KINDS)[number];
 
@@ -13,7 +16,7 @@ export type AlertSeverity = (typeof ALERT_SEVERITIES)[number];
 export const ALERT_STATUSES = ["OPEN", "ACKNOWLEDGED", "RESOLVED", "DISMISSED"] as const;
 export type AlertStatus = (typeof ALERT_STATUSES)[number];
 
-export type AlertEntityType = "order" | "plan" | "mandate" | "account";
+export type AlertEntityType = "order" | "plan" | "mandate" | "account" | "ticket";
 
 /** One condition a detector found in this scan. */
 export interface Detection {

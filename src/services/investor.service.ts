@@ -293,6 +293,33 @@ export async function addAddress(
   }
 }
 
+/**
+ * Add a phone on the investor's own request (the HTTP route).
+ *
+ * Only the number this user signed in with — proved by OTP at sign-in — can be
+ * registered. The folio-defaults phone is where the SEBI transaction OTP goes
+ * for fresh purchases, SIPs and carts; letting a session register any number
+ * meant anyone holding a stolen session could point that OTP at their own
+ * phone and approve orders the investor never saw. Provisioning (from the
+ * KYC-form mobile) calls `addPhone` directly and is unaffected.
+ */
+export async function addOwnPhone(
+  userId: string,
+  investorProfileId: string,
+  input: AddPhoneInput,
+): Promise<ContactDto> {
+  const user = await db.user.findUnique({ where: { id: userId }, select: { phone: true } });
+  const requested = `+${input.isd.replace(/^\+/, "")}${input.number.replace(/\D/g, "")}`;
+  if (!user?.phone || user.phone !== requested) {
+    throw new HttpError(
+      403,
+      "PHONE_NOT_VERIFIED",
+      "Only the mobile number you signed in with can be added. To use another number, sign in with it.",
+    );
+  }
+  return addPhone(investorProfileId, input);
+}
+
 export async function addPhone(
   investorProfileId: string,
   input: AddPhoneInput,

@@ -3,8 +3,10 @@ import type { Request, RequestHandler } from "express";
 import { Router } from "express";
 import { db } from "../db/client.ts";
 import { HttpError } from "../utils/http-error.ts";
-import { asBody, requiredString } from "../utils/validate.ts";
+import { asBody, optionalString, requiredString } from "../utils/validate.ts";
 import { assertSandboxAuth } from "../utils/sandbox-auth.ts";
+import * as socialAuth from "../controllers/social-auth.controller.ts";
+import { completeSocialSignIn } from "../services/social-auth.service.ts";
 
 export const tokenHash = (token: string) => createHash("sha256").update(token).digest("hex");
 const unauthorized = () => new HttpError(401, "UNAUTHORIZED", "A valid investor session is required");
@@ -123,8 +125,17 @@ sessionRouter.post('/sandbox', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.status(201).json({ data: { accessToken, expiresAt: expiresAt.toISOString(), userId: user.id } });
 });
+// Sign in with Apple / Google: verify the provider token and hand back a
+// single-use ticket. It opens nothing by itself — see POST / below.
+sessionRouter.get("/social/providers", socialAuth.providers);
+sessionRouter.post("/social", socialAuth.start);
+
 sessionRouter.post("/", async (req, res) => {
-  const token = requiredString(asBody(req.body), "verificationToken", { maxLength: 128 });
+  const body = asBody(req.body);
+  const token = requiredString(body, "verificationToken", { maxLength: 128 });
+  // Present when the investor started with Apple or Google; spent in the same
+  // transaction as the phone proof, so one cannot be used without the other.
+  const socialToken = optionalString(body, "socialToken", { maxLength: 128 });
   const now = new Date();
   const accessToken = randomBytes(32).toString("base64url");
   const expiresAt = new Date(now.getTime() + 8 * 60 * 60 * 1000);
@@ -144,6 +155,7 @@ sessionRouter.post("/", async (req, res) => {
     if (user.status === "SUSPENDED") throw new HttpError(403, "ACCOUNT_FROZEN", "This account is frozen. Contact support to unfreeze it.");
     if (user.deletedAt || !["ACTIVE", "PENDING_VERIFICATION"].includes(user.status) || user.role !== "INVESTOR") throw unauthorized();
     await tx.user.update({ where: { id: user.id }, data: { status: "ACTIVE", lastLoginAt: now } });
+    if (socialToken) await completeSocialSignIn(tx, socialToken, user.id, now);
     await tx.investorSession.create({ data: { userId: user.id, tokenHash: tokenHash(accessToken), expiresAt } });
     return user;
   });

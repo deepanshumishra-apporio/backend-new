@@ -99,6 +99,20 @@ enum UserRole {
   // credentials and roles, so no customer-facing check can ever admit them.
 }
 
+enum SocialProvider {
+  APPLE
+  GOOGLE
+}
+
+/// Self-declared years of investing in market-linked products.
+enum InvestmentExperience {
+  NONE
+  LESS_THAN_1_YEAR
+  ONE_TO_3_YEARS
+  THREE_TO_5_YEARS
+  MORE_THAN_5_YEARS
+}
+
 enum UserStatus {
   PENDING_VERIFICATION
   ACTIVE
@@ -857,6 +871,15 @@ model User {
   /// Informational announcements and transactional notifications ignore it.
   promoOptOutAt DateTime? @db.Timestamptz(3)
 
+  /// Self-declared, from the profile screen. Ours only: FP's KYC form has no
+  /// such field, so it is never sent upstream.
+  investmentExperience          InvestmentExperience?
+  investmentExperienceUpdatedAt DateTime?             @db.Timestamptz(3)
+
+  /// Apple / Google accounts linked to this login. A link is only ever made
+  /// after the phone OTP, so a provider account alone never opens a session.
+  identities UserIdentity[]
+
   profileLinks       UserInvestorProfile[]
   uploadedFiles      FpFile[]
   kycChecks          KycCheck[]
@@ -872,6 +895,7 @@ model User {
   supportTickets     SupportTicket[]
   chatConversations  ChatConversation[]
   complianceAlerts   ComplianceAlert[]
+  reviewMeetings     ReviewMeeting[]
   announcementViews  AnnouncementView[]
 
   @@index([status])
@@ -881,11 +905,6 @@ model User {
   @@map("users")
 }
 
-/// Which investor profiles a login account may act on, and in what capacity.
-///
-/// Many-to-many on purpose. A guardian reaches their own profile plus each
-/// minor's; a joint holder reaches a profile they do not own. Both later
-/// subdomains are then a new `relationship` value and no schema change.
 model UserInvestorProfile {
   id String @id @default(uuid(7)) @db.Uuid
 
@@ -1595,8 +1614,9 @@ model BankAccount {
 
   primaryAccountHolderName String          @db.VarChar(150)
   accountNumberLast4       String          @db.VarChar(4)
-  /// SHA-256 of the normalised account number + IFSC. Lets us dedupe and
-  /// recognise a re-entered account without persisting the number.
+  /// Keyed HMAC-SHA256 (server-held BANK_FINGERPRINT_KEY) of the normalised
+  /// account number + IFSC. Lets us dedupe and recognise a re-entered account
+  /// without persisting the number, and is not reversible from this column alone.
   accountNumberFingerprint String          @db.VarChar(64)
   type                     BankAccountType
   ifscCode                 String          @db.VarChar(11)
@@ -3225,6 +3245,45 @@ model InvestorSession {
   @@map("investor_sessions")
 }
 
+/// A verified Apple or Google account linked to a login.
+model UserIdentity {
+  id         String         @id @default(uuid(7)) @db.Uuid
+  userId     String         @db.Uuid
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider   SocialProvider
+  /// The provider's stable `sub` claim. Never the email: Apple relay
+  /// addresses and Google addresses can both change.
+  subject    String         @db.VarChar(255)
+  /// The email the provider vouched for when the link was made.
+  email      String?        @db.VarChar(255)
+  createdAt  DateTime       @default(now()) @db.Timestamptz(3)
+  lastUsedAt DateTime?      @db.Timestamptz(3)
+
+  @@unique([provider, subject])
+  /// One account per provider per login: a second would be a takeover path.
+  @@unique([userId, provider])
+  @@map("user_identities")
+}
+
+/// A provider sign-in that has been verified but not yet finished: the phone
+/// OTP still has to be passed. Single use and short lived; only the hash of
+/// the ticket handed to the app is stored.
+model SocialSignIn {
+  id            String         @id @default(uuid(7)) @db.Uuid
+  tokenHash     String         @unique @db.VarChar(64)
+  provider      SocialProvider
+  subject       String         @db.VarChar(255)
+  email         String?        @db.VarChar(255)
+  /// Whether the provider says it verified `email`.
+  emailVerified Boolean        @default(false)
+  expiresAt     DateTime       @db.Timestamptz(3)
+  consumedAt    DateTime?      @db.Timestamptz(3)
+  createdAt     DateTime       @default(now()) @db.Timestamptz(3)
+
+  @@index([expiresAt])
+  @@map("social_sign_ins")
+}
+
 /// Shared between application instances; expired windows are reset atomically.
 model ApiRateLimit {
   key             String   @id @db.VarChar(64)
@@ -3530,9 +3589,11 @@ model StaffUser {
   announcementsCreated  Announcement[] @relation("AnnouncementCreator")
   announcementsApproved Announcement[] @relation("AnnouncementApprover")
 
-  complianceAssigned ComplianceAlert[]      @relation("ComplianceAssignee")
-  complianceResolved ComplianceAlert[]      @relation("ComplianceResolver")
-  complianceEvents   ComplianceAlertEvent[]
+  complianceAssigned   ComplianceAlert[]      @relation("ComplianceAssignee")
+  complianceResolved   ComplianceAlert[]      @relation("ComplianceResolver")
+  complianceEvents     ComplianceAlertEvent[]
+  reviewMeetings       ReviewMeeting[]        @relation("ReviewMeetingConductor")
+  reviewMeetingsLogged ReviewMeeting[]        @relation("ReviewMeetingRecorder")
 
   @@index([status])
   @@map("staff_users")
@@ -3970,6 +4031,28 @@ enum ComplianceAlertKind {
   PAID_NOT_ALLOTTED
   ORDER_STUCK
   NOMINEE_MISSING
+  /// A redemption succeeded but the money has not reached the investor.
+  REDEMPTION_PAYOUT_PENDING
+  /// The investor paid, the order failed, and no refund has completed.
+  REFUND_PENDING
+  /// An order or plan went ahead without the SEBI-mandated 2FA consent on record.
+  CONSENT_MISSING
+  /// An investor who has an account but whose latest KYC check no longer passes.
+  KYC_NOT_COMPLIANT
+  /// A politically exposed person, or someone related to one: enhanced due diligence (PMLA).
+  PEP_INVESTOR
+  /// A single order at or above the large-transaction threshold (PMLA monitoring).
+  LARGE_TRANSACTION
+  /// Units redeemed soon after they were bought in the same scheme (PMLA monitoring).
+  RAPID_ROUND_TRIP
+  /// An investor complaint open past the resolution timeline.
+  COMPLAINT_OVERDUE
+  /// Holdings whose payout bank account is missing or not verified.
+  PAYOUT_BANK_UNVERIFIED
+  /// Holdings with no communication email or mobile on the account.
+  CONTACT_MISSING
+  /// The data the other rules read has stopped updating, so they may be blind.
+  MONITORING_STALE
 }
 
 /// Declared most urgent first: sorting by this column puts HIGH on top.
@@ -4164,4 +4247,63 @@ model AnnouncementView {
   @@unique([announcementId, userId])
   @@index([userId])
   @@map("announcement_views")
+}
+
+// --- Review meetings -----------------------------------------------------------
+//
+// A conversation with an investor about their circumstances, and the risk
+// profile it leads to. The record is the evidence behind any change to the
+// investor's curated portfolio, so it is written once and only its status and
+// notes move afterwards; every write is also in `audit_logs`.
+
+enum ReviewMeetingMode {
+  IN_PERSON
+  VIDEO
+  PHONE
+}
+
+enum RiskProfile {
+  CONSERVATIVE
+  MODERATE
+  AGGRESSIVE
+}
+
+enum ReviewMeetingStatus {
+  /// Booked; has not happened yet.
+  SCHEDULED
+  /// Held and its notes recorded.
+  CAPTURED
+  /// The recommended profile has been applied to the investor.
+  PROFILE_UPDATED
+}
+
+model ReviewMeeting {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// The investor the meeting was with.
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Who held it.
+  conductedByStaffId String    @db.Uuid
+  conductedBy        StaffUser @relation("ReviewMeetingConductor", fields: [conductedByStaffId], references: [id], onDelete: Restrict)
+  /// Who entered it, when not the person who held it.
+  recordedByStaffId  String    @db.Uuid
+  recordedBy         StaffUser @relation("ReviewMeetingRecorder", fields: [recordedByStaffId], references: [id], onDelete: Restrict)
+
+  mode        ReviewMeetingMode
+  meetingDate DateTime          @db.Date
+
+  currentProfile     RiskProfile
+  recommendedProfile RiskProfile
+  status             ReviewMeetingStatus @default(CAPTURED)
+
+  notes String @db.VarChar(4000)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([status, meetingDate(sort: Desc)])
+  @@index([userId, meetingDate(sort: Desc)])
+  @@map("review_meetings")
 }

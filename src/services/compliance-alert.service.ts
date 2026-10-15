@@ -28,6 +28,7 @@ import { maskEmail, maskPan, maskTail } from "../utils/mask.ts";
 import { flaggedOrders } from "./admin-transaction.service.ts";
 import { acquireJobLease, intervalFromEnv, jobLastCompleted, jobLoop, releaseJobLease } from "./job-lease.ts";
 import { stalledWhere } from "./admin-investor.service.ts";
+import { projectionFreshness } from "./admin-projection.service.ts";
 import { nextStepOf } from "./investor-facts.service.ts";
 import { notify, type NotifyInput } from "./notification.service.ts";
 import {
@@ -66,7 +67,55 @@ export const ALERT_KIND_LABELS: Record<AlertKind, string> = {
   PAID_NOT_ALLOTTED: "Paid, not allotted",
   ORDER_STUCK: "Order stuck",
   NOMINEE_MISSING: "Nominee missing",
+  REDEMPTION_PAYOUT_PENDING: "Redemption not paid out",
+  REFUND_PENDING: "Refund pending",
+  CONSENT_MISSING: "2FA consent missing",
+  KYC_NOT_COMPLIANT: "KYC no longer compliant",
+  PEP_INVESTOR: "Politically exposed person",
+  LARGE_TRANSACTION: "Large transaction",
+  RAPID_ROUND_TRIP: "Quick buy and sell",
+  COMPLAINT_OVERDUE: "Complaint overdue",
+  PAYOUT_BANK_UNVERIFIED: "Payout bank unverified",
+  CONTACT_MISSING: "Contact details missing",
+  MONITORING_STALE: "Monitoring stopped",
 };
+
+/**
+ * Alerts that need a person's judgement rather than a fix: the condition is a
+ * fact about the past (a large order, a PEP), so it never "clears". The scan
+ * neither auto-resolves them nor reopens one a person has closed — the
+ * person's resolution, with its note, is the compliance record.
+ */
+const REVIEW_KINDS: ReadonlySet<AlertKind> = new Set(["CONSENT_MISSING", "PEP_INVESTOR", "LARGE_TRANSACTION", "RAPID_ROUND_TRIP"]);
+
+/** SEBI: redemption proceeds within 3 working days. 5 calendar days covers a weekend. */
+const PAYOUT_DUE_DAYS = 5;
+/** A failed, paid order not refunded after this long is waiting on someone. */
+const REFUND_DUE_DAYS = 3;
+/** SEBI's timeline for resolving an investor complaint. */
+const COMPLAINT_DUE_DAYS = 21;
+/** A redemption this soon after buying the same scheme is a round trip worth a look. */
+const ROUND_TRIP_DAYS = 30;
+/** How far back the transaction-monitoring rules look for new cases. */
+const MONITORING_LOOKBACK_DAYS = 90;
+/** The admin read model refreshes every minute; this far behind, rules reading it are blind. */
+const PROJECTION_STALE_MINUTES = 30;
+/** An FP webhook waiting this long means the processor has stopped. */
+const WEBHOOK_STALE_MINUTES = 60;
+
+/**
+ * Single-order amount that triggers a large-transaction review, in rupees.
+ * `COMPLIANCE_LARGE_TRANSACTION_INR`; ₹10 lakh by default, the PMLA reporting
+ * threshold. Set it to what the compliance officer has decided.
+ */
+function largeTransactionThreshold(): number {
+  const raw = process.env["COMPLIANCE_LARGE_TRANSACTION_INR"]?.trim();
+  const value = raw ? Number(raw) : 1_000_000;
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`COMPLIANCE_LARGE_TRANSACTION_INR must be a positive number (got "${raw}")`);
+  }
+  return value;
+}
 
 const rupees = (value: Prisma.Decimal | string | number | null | undefined) =>
   value == null ? "" : `₹${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
@@ -284,7 +333,321 @@ async function detectNominees(): Promise<Detection[]> {
   }));
 }
 
-const DETECTORS = [detectKyc, detectSipFailures, detectMandates, detectOrders, detectNominees];
+/** Accounts that currently hold units, with their investor. Shared by the account-level rules. */
+const holdingAccounts = Prisma.sql`
+  SELECT a.id, a."primaryInvestorProfileId" AS profile_id, link.user_id, sum(h."marketValue") AS value
+  FROM mf_investment_accounts a
+  JOIN mf_holdings h ON h."mfInvestmentAccountId" = a.id AND h.units > 0
+  ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}
+  GROUP BY a.id, link.user_id`;
+
+async function detectPayouts(): Promise<Detection[]> {
+  // Successful redemptions with no payout on record: no payment date, no UTR.
+  const rows = await db.$queryRaw<{ id: string; amount: Prisma.Decimal | null; succeeded: Date; scheme: string; user_id: string | null }[]>`
+    SELECT r.id, COALESCE(r."redeemedAmount", r.amount) AS amount,
+           COALESCE(r."succeededAt", r."updatedAt") AS succeeded, s.name AS scheme, link.user_id
+    FROM mf_redemptions r
+    JOIN mf_schemes s ON s.isin = r."schemeIsin"
+    JOIN mf_investment_accounts a ON a.id = r."mfInvestmentAccountId"
+    ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}
+    LEFT JOIN mf_payout_details pd ON pd."mfRedemptionId" = r.id
+    WHERE r.state = 'successful'
+      AND COALESCE(r."succeededAt", r."updatedAt") < now() - make_interval(days => ${PAYOUT_DUE_DAYS})
+      AND (pd.id IS NULL OR (pd."paidAt" IS NULL AND pd."utrNumber" IS NULL))`;
+  return rows.map((row): Detection => ({
+    kind: "REDEMPTION_PAYOUT_PENDING",
+    severity: "HIGH",
+    dedupeKey: `payout_pending:${row.id}`,
+    userId: row.user_id,
+    entityType: "order",
+    entityId: row.id,
+    title: "Redemption succeeded but not paid out",
+    detail: `${row.scheme}${row.amount ? `, ${rupees(row.amount)}` : ""}. Redeemed on ${day(row.succeeded)}, and no payout (payment date or UTR) is on record after ${PAYOUT_DUE_DAYS} days. SEBI requires redemption proceeds within 3 working days. Refresh the order from FP, then escalate with the AMC.`,
+  }));
+}
+
+async function detectRefunds(): Promise<Detection[]> {
+  // A failed order whose payment went through and has no completed refund.
+  const rows = await db.$queryRaw<{ id: string; amount: Prisma.Decimal; failed: Date; scheme: string; user_id: string | null; refund: string | null }[]>`
+    SELECT p.id, p.amount, p."updatedAt" AS failed, s.name AS scheme, link.user_id,
+           max(pay."refundStatus"::text) AS refund
+    FROM mf_purchases p
+    JOIN payment_purchases pp ON pp."mfPurchaseId" = p.id
+    JOIN payments pay ON pay.id = pp."paymentId" AND pay.status = 'SUCCESS'
+    JOIN mf_schemes s ON s.isin = p."schemeIsin"
+    JOIN mf_investment_accounts a ON a.id = p."mfInvestmentAccountId"
+    ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}
+    WHERE p.state IN ('failed', 'cancelled', 'reversed')
+      AND p."updatedAt" < now() - make_interval(days => ${REFUND_DUE_DAYS})
+      AND NOT EXISTS (
+        SELECT 1 FROM payment_purchases pp2 JOIN payments pay2 ON pay2.id = pp2."paymentId"
+        WHERE pp2."mfPurchaseId" = p.id AND pay2."refundStatus" = 'SUCCESSFUL'
+      )
+    GROUP BY p.id, s.name, link.user_id`;
+  return rows.map((row): Detection => ({
+    kind: "REFUND_PENDING",
+    severity: "HIGH",
+    dedupeKey: `refund_pending:${row.id}`,
+    userId: row.user_id,
+    entityType: "order",
+    entityId: row.id,
+    title: "Paid for an order that failed, no refund yet",
+    detail: `${row.scheme}, ${rupees(row.amount)}. The payment succeeded, the order failed on ${day(row.failed)}, and ${row.refund ? `the refund is ${row.refund.toLowerCase()}` : "no refund has been started"}. The investor's money is with us and no units are coming.`,
+  }));
+}
+
+async function detectConsent(): Promise<Detection[]> {
+  // SEBI 2FA: every order and plan that went ahead must carry consent. SIP
+  // instalments are covered by their plan's consent, so they are left out.
+  const rows = await db.$queryRaw<{ id: string; what: "order" | "plan"; label: string; amount: Prisma.Decimal | null; at: Date; user_id: string | null }[]>`
+    WITH gone_ahead AS (
+      SELECT id, 'order' AS what, 'Purchase' AS label, amount, "mfInvestmentAccountId" AS account, COALESCE("fpCreatedAt", "createdAt") AS at
+        FROM mf_purchases WHERE "planId" IS NULL AND "consentAt" IS NULL AND state IN ('confirmed', 'submitted', 'successful')
+      UNION ALL
+      SELECT id, 'order', 'Redemption', amount, "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt")
+        FROM mf_redemptions WHERE "planId" IS NULL AND "consentAt" IS NULL AND state IN ('confirmed', 'submitted', 'successful')
+      UNION ALL
+      SELECT id, 'order', 'Switch', amount, "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt")
+        FROM mf_switches WHERE "planId" IS NULL AND "consentAt" IS NULL AND state IN ('confirmed', 'submitted', 'successful')
+      UNION ALL
+      SELECT id, 'plan', 'SIP', amount, "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt")
+        FROM mf_purchase_plans WHERE "consentAt" IS NULL AND state IN ('confirmed', 'submitted', 'active')
+      UNION ALL
+      SELECT id, 'plan', 'SWP', amount, "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt")
+        FROM mf_redemption_plans WHERE "consentAt" IS NULL AND state IN ('confirmed', 'submitted', 'active')
+      UNION ALL
+      SELECT id, 'plan', 'STP', amount, "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt")
+        FROM mf_switch_plans WHERE "consentAt" IS NULL AND state IN ('confirmed', 'submitted', 'active')
+    )
+    SELECT g.id, g.what, g.label, g.amount, g.at, link.user_id
+    FROM gone_ahead g
+    JOIN mf_investment_accounts a ON a.id = g.account
+    ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}`;
+  return rows.map((row): Detection => ({
+    kind: "CONSENT_MISSING",
+    severity: "HIGH",
+    dedupeKey: `consent_missing:${row.id}`,
+    userId: row.user_id,
+    entityType: row.what,
+    entityId: row.id,
+    title: `${row.label} went ahead without 2FA consent on record`,
+    detail: `${row.label}${row.amount ? ` of ${rupees(row.amount)}` : ""} placed ${day(row.at)} is past review but has no investor consent recorded. SEBI requires two-factor consent before an order reaches the RTA. Establish how it was authorised and record the outcome.`,
+  }));
+}
+
+async function detectKycCompliance(): Promise<Detection[]> {
+  // Investors already set up to transact whose newest identity check no longer
+  // passes (the KRA put the KYC on hold, rejected it, or the PAN became inoperative).
+  const rows = await db.$queryRaw<{ id: string; user_id: string | null; verdict: string; holds: boolean }[]>`
+    SELECT a.id, link.user_id, pv."readinessStatus" AS verdict,
+           EXISTS (SELECT 1 FROM mf_holdings h WHERE h."mfInvestmentAccountId" = a.id AND h.units > 0) AS holds
+    FROM mf_investment_accounts a
+    JOIN investor_profiles ip ON ip.id = a."primaryInvestorProfileId" AND ip.pan IS NOT NULL
+    ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}
+    JOIN LATERAL (
+      SELECT v."readinessStatus" FROM pre_verifications v
+      WHERE v."investorIdentifier" = ip.pan AND v."readinessStatus" IS NOT NULL
+      ORDER BY COALESCE(v."fpCreatedAt", v."createdAt") DESC LIMIT 1
+    ) pv ON true
+    WHERE pv."readinessStatus" <> 'verified'`;
+  return rows.map((row): Detection => ({
+    kind: "KYC_NOT_COMPLIANT",
+    severity: row.holds ? "HIGH" : "MEDIUM",
+    dedupeKey: `kyc_not_compliant:${row.id}`,
+    userId: row.user_id,
+    entityType: "account",
+    entityId: row.id,
+    title: "Investor's KYC no longer passes",
+    detail: `The latest identity check on this investor came back "${row.verdict}". ${row.holds ? "They hold units, and new" : "New"} orders will be refused until their KYC is compliant again.`,
+  }));
+}
+
+async function detectPep(): Promise<Detection[]> {
+  const rows = await db.$queryRaw<{ id: string; user_id: string | null; pep: string }[]>`
+    SELECT ip.id, link.user_id, ip."pepDetails"::text AS pep
+    FROM investor_profiles ip
+    ${selfLink(Prisma.sql`ip.id`)}
+    WHERE ip."pepDetails" IN ('pep_exposed', 'pep_related')`;
+  return rows.map((row): Detection => ({
+    kind: "PEP_INVESTOR",
+    severity: "MEDIUM",
+    dedupeKey: `pep:${row.id}`,
+    userId: row.user_id,
+    entityType: null,
+    entityId: null,
+    title: row.pep === "pep_exposed" ? "Investor is a politically exposed person" : "Investor is related to a politically exposed person",
+    detail: "PMLA requires enhanced due diligence for politically exposed persons: confirm source of wealth and obtain senior approval for the relationship. Record what was checked when you close this alert.",
+  }));
+}
+
+async function detectLargeTransactions(): Promise<Detection[]> {
+  const threshold = largeTransactionThreshold();
+  const rows = await db.$queryRaw<{ id: string; label: string; amount: Prisma.Decimal; at: Date; scheme: string; user_id: string | null }[]>`
+    WITH orders AS (
+      SELECT id, 'Purchase' AS label, amount, "schemeIsin", "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt") AS at, state
+        FROM mf_purchases
+      UNION ALL
+      SELECT id, 'Redemption', COALESCE("redeemedAmount", amount), "schemeIsin", "mfInvestmentAccountId", COALESCE("fpCreatedAt", "createdAt"), state
+        FROM mf_redemptions
+    )
+    SELECT o.id, o.label, o.amount, o.at, s.name AS scheme, link.user_id
+    FROM orders o
+    JOIN mf_schemes s ON s.isin = o."schemeIsin"
+    JOIN mf_investment_accounts a ON a.id = o."mfInvestmentAccountId"
+    ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}
+    WHERE o.amount >= ${threshold}
+      AND o.state NOT IN ('failed', 'cancelled', 'reversed')
+      AND o.at > now() - make_interval(days => ${MONITORING_LOOKBACK_DAYS})`;
+  return rows.map((row): Detection => ({
+    kind: "LARGE_TRANSACTION",
+    severity: "MEDIUM",
+    dedupeKey: `large_transaction:${row.id}`,
+    userId: row.user_id,
+    entityType: "order",
+    entityId: row.id,
+    title: `${row.label} of ${rupees(row.amount)}`,
+    detail: `${row.scheme}, placed ${day(row.at)}. At or above the ${rupees(threshold)} review threshold. Check it is consistent with the investor's declared income and source of wealth; if not, consider a suspicious transaction report.`,
+  }));
+}
+
+async function detectRoundTrips(): Promise<Detection[]> {
+  // Units redeemed soon after the same investor bought the same scheme.
+  const rows = await db.$queryRaw<{ id: string; amount: Prisma.Decimal | null; bought: Date; sold: Date; scheme: string; user_id: string | null }[]>`
+    SELECT r.id, COALESCE(r."redeemedAmount", r.amount) AS amount,
+           max(COALESCE(p."succeededAt", p."createdAt")) AS bought,
+           COALESCE(r."fpCreatedAt", r."createdAt") AS sold, s.name AS scheme, link.user_id
+    FROM mf_redemptions r
+    JOIN mf_purchases p
+      ON p."mfInvestmentAccountId" = r."mfInvestmentAccountId" AND p."schemeIsin" = r."schemeIsin"
+     AND p.state = 'successful' AND p."planId" IS NULL
+     AND COALESCE(p."succeededAt", p."createdAt") <= COALESCE(r."fpCreatedAt", r."createdAt")
+     AND COALESCE(p."succeededAt", p."createdAt") > COALESCE(r."fpCreatedAt", r."createdAt") - make_interval(days => ${ROUND_TRIP_DAYS})
+    JOIN mf_schemes s ON s.isin = r."schemeIsin"
+    JOIN mf_investment_accounts a ON a.id = r."mfInvestmentAccountId"
+    ${selfLink(Prisma.sql`a."primaryInvestorProfileId"`)}
+    WHERE r.state NOT IN ('failed', 'cancelled', 'reversed')
+      AND COALESCE(r."fpCreatedAt", r."createdAt") > now() - make_interval(days => ${MONITORING_LOOKBACK_DAYS})
+    GROUP BY r.id, s.name, link.user_id`;
+  return rows.map((row): Detection => ({
+    kind: "RAPID_ROUND_TRIP",
+    severity: "LOW",
+    dedupeKey: `round_trip:${row.id}`,
+    userId: row.user_id,
+    entityType: "order",
+    entityId: row.id,
+    title: "Redeemed soon after buying",
+    detail: `${row.scheme}: bought ${day(row.bought)}, redemption${row.amount ? ` of ${rupees(row.amount)}` : ""} placed ${day(row.sold)}, within ${ROUND_TRIP_DAYS} days. Quick round trips are a common money-laundering pattern; usually there is an ordinary reason. Record it.`,
+  }));
+}
+
+async function detectComplaints(): Promise<Detection[]> {
+  const rows = await db.$queryRaw<{ id: string; number: number; subject: string; user_id: string | null; created: Date; due: Date; status: string }[]>`
+    SELECT t.id, t.number, t.subject, t."userId" AS user_id, t."createdAt" AS created, t."slaDueAt" AS due, t.status::text AS status
+    FROM support_tickets t
+    WHERE t.status IN ('OPEN', 'IN_PROGRESS', 'WAITING_ON_INVESTOR')
+      AND ((t.status <> 'WAITING_ON_INVESTOR' AND t."slaDueAt" < now())
+           OR t."createdAt" < now() - make_interval(days => ${COMPLAINT_DUE_DAYS}))`;
+  const now = Date.now();
+  return rows.map((row): Detection => {
+    const days = Math.floor((now - row.created.getTime()) / DAY_MS);
+    const pastSebi = days >= COMPLAINT_DUE_DAYS;
+    return {
+      kind: "COMPLAINT_OVERDUE",
+      severity: pastSebi ? "HIGH" : "MEDIUM",
+      dedupeKey: `complaint_overdue:${row.id}`,
+      userId: row.user_id,
+      entityType: "ticket",
+      entityId: row.id,
+      title: pastSebi ? `Complaint open ${days} days, past SEBI's ${COMPLAINT_DUE_DAYS}` : "Complaint past its response deadline",
+      detail: `Ticket #${row.number} "${row.subject}", raised ${day(row.created)}${pastSebi ? "" : `, was due ${day(row.due)}`}. SEBI expects investor complaints resolved within ${COMPLAINT_DUE_DAYS} days; unresolved ones can be escalated on SCORES.`,
+    };
+  });
+}
+
+async function detectPayoutBanks(): Promise<Detection[]> {
+  const rows = await db.$queryRaw<{ id: string; user_id: string | null; value: Prisma.Decimal | null; has_bank: boolean }[]>`
+    SELECT ha.id, ha.user_id, ha.value, b.id IS NOT NULL AS has_bank
+    FROM (${holdingAccounts}) ha
+    LEFT JOIN mf_folio_defaults fd ON fd."mfInvestmentAccountId" = ha.id
+    LEFT JOIN bank_accounts b ON b.id = fd."payoutBankAccountId"
+    WHERE b.id IS NULL
+       OR NOT (b."verificationStatus" = 'completed' AND b."verificationConfidence" IN ('high', 'very_high'))`;
+  return rows.map((row): Detection => ({
+    kind: "PAYOUT_BANK_UNVERIFIED",
+    severity: "MEDIUM",
+    dedupeKey: `payout_bank:${row.id}`,
+    userId: row.user_id,
+    entityType: "account",
+    entityId: row.id,
+    title: row.has_bank ? "Payout bank account not verified" : "No payout bank account",
+    detail: `This account holds units worth ${rupees(row.value)} but ${row.has_bank ? "its payout bank account has not passed verification" : "has no payout bank account set"}. A redemption would fail or be held until it is fixed.`,
+  }));
+}
+
+async function detectContacts(): Promise<Detection[]> {
+  const rows = await db.$queryRaw<{ id: string; user_id: string | null; value: Prisma.Decimal | null; email: boolean; phone: boolean }[]>`
+    SELECT ha.id, ha.user_id, ha.value,
+           fd."communicationEmailAddressId" IS NOT NULL AS email,
+           fd."communicationPhoneNumberId" IS NOT NULL AS phone
+    FROM (${holdingAccounts}) ha
+    LEFT JOIN mf_folio_defaults fd ON fd."mfInvestmentAccountId" = ha.id
+    WHERE fd."communicationEmailAddressId" IS NULL OR fd."communicationPhoneNumberId" IS NULL`;
+  return rows.map((row): Detection => {
+    const missing = [!row.email && "email", !row.phone && "mobile"].filter(Boolean).join(" and ");
+    return {
+      kind: "CONTACT_MISSING",
+      severity: "MEDIUM",
+      dedupeKey: `contact_missing:${row.id}`,
+      userId: row.user_id,
+      entityType: "account",
+      entityId: row.id,
+      title: `No ${missing} on the account`,
+      detail: `This account holds units worth ${rupees(row.value)} with no ${missing} for communication. SEBI requires a valid email and mobile on every folio, and transaction OTPs need the mobile.`,
+    };
+  });
+}
+
+async function detectMonitoring(): Promise<Detection[]> {
+  // The other rules read data kept fresh by background jobs. If those stop,
+  // every rule goes quiet — which looks exactly like "no problems".
+  const detections: Detection[] = [];
+  const projectionOn = process.env["ADMIN_PROJECTION_INTERVAL_MS"]?.trim() !== "0";
+  const { refreshedAt } = await projectionFreshness();
+  if (projectionOn && (!refreshedAt || Date.now() - refreshedAt.getTime() > PROJECTION_STALE_MINUTES * 60_000)) {
+    detections.push({
+      kind: "MONITORING_STALE",
+      severity: "HIGH",
+      dedupeKey: "monitoring_stale:investor_projection",
+      userId: null,
+      entityType: null,
+      entityId: null,
+      title: "Investor data for compliance checks is not updating",
+      detail: `The investor read model ${refreshedAt ? `was last refreshed ${day(refreshedAt)} at ${refreshedAt.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })}` : "has never been built"}. The KYC rules read it, so they may be missing problems. Check that the backend's background jobs are running.`,
+    });
+  }
+  const [oldest] = await db.$queryRaw<{ waiting: Date | null; count: number }[]>`
+    SELECT min("receivedAt") AS waiting, count(*)::int AS count FROM fp_webhook_events WHERE status = 'PENDING'`;
+  if (oldest?.waiting && Date.now() - oldest.waiting.getTime() > WEBHOOK_STALE_MINUTES * 60_000) {
+    detections.push({
+      kind: "MONITORING_STALE",
+      severity: "HIGH",
+      dedupeKey: "monitoring_stale:fp_webhooks",
+      userId: null,
+      entityType: null,
+      entityId: null,
+      title: "FP updates are not being processed",
+      detail: `${oldest.count} FP event${oldest.count === 1 ? "" : "s"} waiting, the oldest since ${day(oldest.waiting)}. Order, payment and mandate states are not updating, so the order rules may be missing problems.`,
+    });
+  }
+  return detections;
+}
+
+const DETECTORS = [
+  detectKyc, detectSipFailures, detectMandates, detectOrders, detectNominees,
+  detectPayouts, detectRefunds, detectConsent, detectKycCompliance, detectPep,
+  detectLargeTransactions, detectRoundTrips, detectComplaints, detectPayoutBanks, detectContacts,
+  detectMonitoring,
+];
 
 // --- the scan -----------------------------------------------------------------------
 
@@ -303,7 +666,7 @@ export async function runComplianceScan(): Promise<ScanResultDto> {
       where: {
         OR: [{ status: { in: ["OPEN", "ACKNOWLEDGED"] } }, { dedupeKey: { in: [...detections.keys()] } }],
       },
-      select: { id: true, dedupeKey: true, status: true, autoResolved: true, resolvedAt: true },
+      select: { id: true, kind: true, dedupeKey: true, status: true, autoResolved: true, resolvedAt: true },
     });
     const byKey = new Map(existing.map((alert) => [alert.dedupeKey, alert]));
     let raised = 0;
@@ -324,7 +687,8 @@ export async function runComplianceScan(): Promise<ScanResultDto> {
         raised++;
         continue;
       }
-      const reopen = current.status === "RESOLVED" &&
+      // A review alert a person closed stays closed: their decision is the record.
+      const reopen = current.status === "RESOLVED" && !REVIEW_KINDS.has(current.kind) &&
         (current.autoResolved || !current.resolvedAt || at.getTime() - current.resolvedAt.getTime() > MANUAL_RESOLVE_GRACE_MS);
       await db.complianceAlert.update({
         where: { id: current.id },
@@ -341,6 +705,9 @@ export async function runComplianceScan(): Promise<ScanResultDto> {
 
     for (const alert of existing) {
       if (detections.has(alert.dedupeKey) || (alert.status !== "OPEN" && alert.status !== "ACKNOWLEDGED")) continue;
+      // Review alerts wait for a person even when their lookback window has
+      // passed: an unreviewed large transaction has not "cleared".
+      if (REVIEW_KINDS.has(alert.kind)) continue;
       await db.complianceAlert.update({
         where: { id: alert.id },
         data: {
@@ -369,7 +736,8 @@ const listSelect = {
 
 type ListRow = Prisma.ComplianceAlertGetPayload<{ select: typeof listSelect }>;
 
-async function investorsById(userIds: (string | null)[]): Promise<Map<string, TicketInvestorDto>> {
+/** Masked investor summaries for staff screens, keyed by user id. Shared with review meetings. */
+export async function investorsById(userIds: (string | null)[]): Promise<Map<string, TicketInvestorDto>> {
   const ids = [...new Set(userIds.filter((id): id is string => Boolean(id)))];
   if (!ids.length) return new Map();
   const rows = await db.investorJourneySnapshot.findMany({
@@ -518,6 +886,17 @@ const REMINDERS: Record<AlertKind, Pick<NotifyInput, "title" | "body"> | null> =
   NOMINEE_MISSING: { title: "Add a nominee", body: "SEBI asks every investor to add a nominee or confirm they choose not to. You can do it in the app under Profile." },
   PAID_NOT_ALLOTTED: null,
   ORDER_STUCK: null,
+  KYC_NOT_COMPLIANT: { title: "Your KYC needs updating", body: "Your KYC status has changed and needs attention before you can place new orders. Open the app to see what to update." },
+  PAYOUT_BANK_UNVERIFIED: { title: "Verify your bank account", body: "The bank account your redemptions are paid into is not verified yet. Open the app to verify it so your money can be paid out." },
+  CONTACT_MISSING: { title: "Add your email and mobile", body: "Your investment account is missing an email or mobile number. Add them in the app so we can reach you about your investments." },
+  REDEMPTION_PAYOUT_PENDING: null,
+  REFUND_PENDING: null,
+  CONSENT_MISSING: null,
+  PEP_INVESTOR: null,
+  LARGE_TRANSACTION: null,
+  RAPID_ROUND_TRIP: null,
+  COMPLAINT_OVERDUE: null,
+  MONITORING_STALE: null,
 };
 
 async function assertAgent(staffId: string): Promise<void> {

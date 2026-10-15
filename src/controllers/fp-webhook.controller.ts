@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
 import * as webhookService from "../services/fp-webhook.service.ts";
 import { HttpError } from "../utils/http-error.ts";
@@ -43,7 +44,10 @@ export function requireWebhookAdminSecret(req: Request): void {
     throw HttpError.serviceUnavailable("Webhook administration is not configured");
   }
   const provided = req.headers["x-admin-secret"];
-  if (typeof provided !== "string" || provided !== expected) {
+  // Compared as fixed-length digests in constant time: `!==` returns as soon as
+  // one character differs, which leaks how much of a guess was right.
+  const digest = (value: string) => createHash("sha256").update(value).digest();
+  if (typeof provided !== "string" || !timingSafeEqual(digest(provided), digest(expected))) {
     throw new HttpError(403, "FORBIDDEN", "Not allowed");
   }
 }

@@ -16,6 +16,7 @@ import { getInvestorInvestments } from "./admin-investor-portfolio.service.ts";
 import { investorFacts, KYC_STALLED_HOURS, nextStepOf, type InvestorFactRow } from "./investor-facts.service.ts";
 import type {
   AdminKycStatus,
+  InvestorAttention,
   InvestorDetailDto,
   InvestorListDto,
   InvestorListItemDto,
@@ -28,14 +29,14 @@ import type { StaffPrincipal } from "../types/staff.types.ts";
 const money = (value: Prisma.Decimal | string | number | null | undefined) =>
   new Prisma.Decimal(value ?? 0).toFixed(2);
 
-const snapshotSelect = {
+export const snapshotSelect = {
   userId: true, name: true, email: true, phone: true, pan: true, userStatus: true, stage: true,
   kycStatus: true, kycVia: true, kycFormStatus: true, kycProofStatus: true, kycSignatureProvided: true,
   kycFieldsNeeded: true, investedAmount: true, currentValue: true, activeSips: true, sipMonthlyAmount: true,
   nextSipDate: true, signedUpAt: true, lastLoginAt: true, lastActivityAt: true,
 } as const satisfies Prisma.InvestorJourneySnapshotSelect;
 
-type SnapshotRow = Prisma.InvestorJourneySnapshotGetPayload<{ select: typeof snapshotSelect }>;
+export type SnapshotRow = Prisma.InvestorJourneySnapshotGetPayload<{ select: typeof snapshotSelect }>;
 
 function snapshotToItem(row: SnapshotRow): InvestorListItemDto {
   const kycStatus = row.kycStatus as AdminKycStatus;
@@ -105,12 +106,22 @@ export const stalledWhere = (): Prisma.InvestorJourneySnapshotWhereInput => ({
   kycMovedAt: { lt: new Date(Date.now() - KYC_STALLED_HOURS * 60 * 60 * 1000) },
 });
 
-function listWhere(query: InvestorListQuery): Prisma.InvestorJourneySnapshotWhereInput {
+/** The investors a stage card counts as needing attention; see `InvestorAttention`. */
+export function attentionWhere(attention: InvestorAttention): Prisma.InvestorJourneySnapshotWhereInput {
+  if (attention === "SETUP") return { stage: "ACCOUNT_SETUP" };
+  return {
+    stage: "KYC",
+    OR: [{ kycStatus: { in: ["PAN_CHECK_FAILED", "FAILED", "EXPIRED"] } }, stalledWhere()],
+  };
+}
+
+export function listWhere(query: Omit<InvestorListQuery, "limit">): Prisma.InvestorJourneySnapshotWhereInput {
   const and: Prisma.InvestorJourneySnapshotWhereInput[] = [];
   if (query.stage?.length) and.push({ stage: { in: query.stage } });
   if (query.kycStatus?.length) and.push({ kycStatus: { in: query.kycStatus } });
   if (query.status?.length) and.push({ userStatus: { in: query.status } });
   if (query.kycStalled) and.push(stalledWhere());
+  if (query.attention) and.push(attentionWhere(query.attention));
   if (query.sipDueDays !== undefined) {
     const today = new Date(new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10));
     const until = new Date(today.getTime() + query.sipDueDays * 24 * 60 * 60 * 1000);

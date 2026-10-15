@@ -280,3 +280,18 @@ export interface OnboardingStatusDto {
     canTransact: boolean;
   };
 }
+
+export const INVESTMENT_EXPERIENCE = [
+  "NONE",
+  "LESS_THAN_1_YEAR",
+  "ONE_TO_3_YEARS",
+  "THREE_TO_5_YEARS",
+  "MORE_THAN_5_YEARS",
+] as const;
+export type InvestmentExperienceValue = (typeof INVESTMENT_EXPERIENCE)[number];
+
+export interface InvestmentExperienceDto {
+  /** Null until the investor has answered. */
+  value: InvestmentExperienceValue | null;
+  updatedAt: string | null;
+}

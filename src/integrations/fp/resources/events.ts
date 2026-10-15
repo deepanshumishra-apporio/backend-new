@@ -13,11 +13,12 @@ export async function listEvents(
   return fpList<FpEvent>("/v2/events", query, requestId);
 }
 
-export async function fetchEvent(id: string, requestId?: string): Promise<FpEvent> {
+export async function fetchEvent(id: string, requestId?: string, options: { retry?: boolean } = {}): Promise<FpEvent> {
   return fpRequest<FpEvent>({
     method: "GET",
     path: `/v2/events/${id}`,
     ...(requestId && { requestId }),
+    ...(options.retry !== undefined && { retry: options.retry }),
   });
 }
 

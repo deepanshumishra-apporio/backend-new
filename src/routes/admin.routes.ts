@@ -42,6 +42,11 @@ adminRouter.use(requirePasswordCurrent);
 adminRouter.get("/dashboard/summary", requirePermission("dashboard.read"), adminInvestors.summary);
 adminRouter.get("/dashboard/signups", requirePermission("dashboard.read"), adminInvestors.signups);
 adminRouter.get("/investors", requirePermission("investors.read"), adminInvestors.list);
+// Before /investors/:userId, which would otherwise take these words as an id.
+adminRouter.get("/investors/overview", requirePermission("investors.read"), adminInvestors.overview);
+adminRouter.get("/investors/export", requirePermission("investors.read"), adminInvestors.exportCsv);
+// A nudge is a message to investors, so it needs the right to send them one.
+adminRouter.post("/investors/nudge", requirePermission("investors.read"), requirePermission("announcements.manage"), adminInvestors.nudge);
 adminRouter.get("/investors/:userId", requirePermission("investors.read"), adminInvestors.getOne);
 adminRouter.get("/investors/:userId/items/:type/:itemId", requirePermission("investors.read"), adminInvestors.getItem);
 
@@ -62,6 +67,11 @@ adminRouter.post("/compliance/scan", manageCompliance, compliance.scan);
 adminRouter.get("/compliance/assignees", manageCompliance, compliance.assignees);
 adminRouter.get("/compliance/alerts/:alertId", manageCompliance, compliance.getOne);
 adminRouter.post("/compliance/alerts/:alertId/actions", manageCompliance, compliance.act);
+
+// Review meetings are built (review-meeting.controller.ts / .service.ts) but
+// parked for a later release: not mounted, so the API does not expose them.
+// To enable, mount the routes here under requirePermission("meetings.manage")
+// and re-enable functional-tests/10-review-meetings.test.ts.
 
 const manageAnnouncements = requirePermission("announcements.manage");
 adminRouter.get("/announcements", manageAnnouncements, announcements.list);

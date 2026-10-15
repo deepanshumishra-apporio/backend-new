@@ -1,5 +1,6 @@
 import { Router } from "express";
 import * as investor from "../controllers/investor.controller.ts";
+import * as investmentExperience from "../controllers/investment-experience.controller.ts";
 
 export const investorRouter = Router();
 
@@ -13,6 +14,10 @@ investorRouter.get("/onboarding", investor.getOnboarding);
 // the identity journey already collected. Idempotent; called after each step.
 investorRouter.post("/provision", investor.provision);
 investorRouter.get("/profiles/:profileId", investor.getProfile);
+
+// Self-declared on the profile screen; ours only, never sent to FP.
+investorRouter.get("/investment-experience", investmentExperience.get);
+investorRouter.put("/investment-experience", investmentExperience.set);
 
 // Contact details. Each is write-once at FP, so there is no update route:
 // a correction means creating a new object and repointing folio defaults.

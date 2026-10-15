@@ -40,6 +40,8 @@ import type {
   ReportRow,
 } from "../types/report.types.ts";
 import type { StaffPrincipal } from "../types/staff.types.ts";
+import { ALERT_KIND_LABELS } from "./compliance-alert.service.ts";
+import type { AlertKind } from "../types/compliance.types.ts";
 
 /** Rows shown on screen; the count says how many more the export would carry. */
 export const PREVIEW_LIMIT = 100;
@@ -424,7 +426,8 @@ const compliance: ReportSpec = {
     ])}`,
   toRow: (r) => ({
     detectedAt: instant(r["detected_at"]),
-    kind: label(r["kind"]),
+    // The same names the Compliance screen uses ("Politically exposed person", not "Pep investor").
+    kind: ALERT_KIND_LABELS[r["kind"] as AlertKind] ?? label(r["kind"]),
     severity: label(r["severity"]),
     status: label(r["status"]),
     investor: text(r["investor"]),
@@ -448,8 +451,10 @@ export function listReports(): ReportDefinitionDto[] {
 
 /** The report's definition, or a 404 for a key that is not in the catalogue. */
 export function reportDefinition(key: string): ReportDefinitionDto {
+  // Own keys only: `constructor` or `toString` came off the prototype, passed
+  // the check, and then threw a 500.
+  if (!Object.hasOwn(REPORTS, key)) throw HttpError.notFound("No report with that name");
   const spec = REPORTS[key as ReportKey];
-  if (!spec) throw HttpError.notFound("No report with that name");
   return { key: key as ReportKey, ...spec.definition };
 }
 
